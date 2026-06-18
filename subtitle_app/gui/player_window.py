@@ -24,11 +24,12 @@ from PyQt6.QtWidgets import (
 
 from core.ai_notes import find_notes_path
 from core.ai_notes_worker import AiNotesWorker
-from core.config import CONFIG_PATH, LIVE_SYNC_FILENAME_LABEL, MEDIA_EXTENSIONS, load_config, save_config
+from core.config import CONFIG_PATH, LIVE_SYNC_FILENAME_LABEL, MEDIA_EXTENSIONS, is_deepseek_configured, load_config, save_config
 from core.live_worker import LiveTranscribeWorker
 from core.subtitle import SubtitleSegment, find_segment_index_at_time
 from core.subtitle_loader import find_subtitles_for_media, load_subtitles
 from core.subtitle_resolve import SubtitleAction, SubtitleChoice, auto_load_choice
+from gui.llm_settings_dialog import LlmSettingsDialog
 from gui.main_window import TranscribeWindow
 from gui.styles import DARK_STYLE, PLAYER_LIST_STYLE
 from gui.subtitle_choice_dialog import SubtitleChoiceDialog
@@ -103,6 +104,10 @@ class PlayerWindow(QMainWindow):
         bar.addWidget(self.media_label, stretch=1)
 
         bar.addStretch(1)
+        self.llm_settings_btn = QPushButton("大模型配置")
+        self.llm_settings_btn.clicked.connect(self._open_llm_settings)
+        bar.addWidget(self.llm_settings_btn)
+
         self.view_notes_btn = QPushButton("查看笔记")
         self.view_notes_btn.clicked.connect(self._view_ai_notes)
         self.view_notes_btn.setEnabled(False)
@@ -644,6 +649,30 @@ class PlayerWindow(QMainWindow):
                 self.subtitle_combo.setCurrentIndex(0)
                 self._load_subtitle_at_index(0)
 
+    def _open_llm_settings(self) -> None:
+        self._config = load_config()
+        updated = LlmSettingsDialog.open_settings(self._config, self)
+        if updated is not None:
+            self._config = updated
+
+    def _ensure_llm_configured(self) -> bool:
+        self._config = load_config()
+        if is_deepseek_configured(self._config):
+            return True
+        answer = QMessageBox.question(
+            self,
+            "未配置大模型",
+            "AI 笔记需要配置 DeepSeek API Key。\n是否现在打开「大模型配置」？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        updated = LlmSettingsDialog.open_settings(self._config, self)
+        if updated is None:
+            return False
+        self._config = updated
+        return is_deepseek_configured(self._config)
+
     def _generate_ai_notes(self) -> None:
         if not self._media_path:
             QMessageBox.information(self, "提示", "请先打开媒体文件。")
@@ -651,8 +680,9 @@ class PlayerWindow(QMainWindow):
         if self._ai_notes_worker and self._ai_notes_worker.isRunning():
             QMessageBox.information(self, "提示", "AI 笔记正在生成中，请稍候。")
             return
+        if not self._ensure_llm_configured():
+            return
 
-        self._config = load_config()
         self.ai_notes_btn.setEnabled(False)
         self._update_live_status("AI 笔记：准备中…")
 

@@ -8,16 +8,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from core.config import AppConfig, CONFIG_PATH
+from core.config import AppConfig, CONFIG_PATH, is_deepseek_api_key_configured
 from core.subtitle import SubtitleSegment, load_subtitle_file
 from core.subtitle_loader import find_subtitles_for_media
-
-API_KEY_PLACEHOLDERS = (
-    "请在此填写 DeepSeek API Key",
-    "YOUR_DEEPSEEK_API_KEY",
-    "在此填写你的 DeepSeek API Key",
-    "<在此填写 DeepSeek API Key>",
-)
 
 MAX_CORPUS_CHARS = 120_000
 NOTES_FILENAME_SUFFIX = "AI笔记"
@@ -32,16 +25,7 @@ class SubtitleCorpusItem:
 
 
 def is_api_key_configured(api_key: str) -> bool:
-    value = api_key.strip()
-    if not value:
-        return False
-    if value in API_KEY_PLACEHOLDERS:
-        return False
-    if value.startswith("请") and "填写" in value:
-        return False
-    if value.startswith("<") and value.endswith(">"):
-        return False
-    return True
+    return is_deepseek_api_key_configured(api_key)
 
 
 def collect_valid_subtitle_corpus(media_path: Path) -> list[SubtitleCorpusItem]:

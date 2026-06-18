@@ -53,12 +53,14 @@ pip install -r requirements.txt
 首次配置.bat
 ```
 
-将 `config.json.example` 复制为 `config.json`，然后编辑：
+将 `config.json.example` 复制为 `config.json`，然后编辑 Whisper 模型路径等。
+
+**AI 笔记（DeepSeek）** 可在播放器内点击 **「大模型配置」** 填写 API Key，无需手动编辑 JSON。
 
 | 字段 | 说明 |
 |------|------|
 | `model_path` | Whisper `.bin` 模型绝对路径 |
-| `deepseek_api_key` | [DeepSeek API Key](https://platform.deepseek.com/api_keys)（AI 笔记功能需要） |
+| `deepseek_api_key` | 可在软件「大模型配置」中填写 |
 | `deepseek_model` | 默认 `deepseek-v4-flash`，可改为 `deepseek-v4-pro` |
 
 > **注意**：`config.json` 含私密信息，已在 `.gitignore` 中排除，请勿提交到 Git。
@@ -114,9 +116,9 @@ subtitle-player/
 
 ### AI 笔记
 
+- 首次使用请点击 **「大模型配置」** 填写 DeepSeek API Key
 - 收集同目录所有有效字幕作为语料
 - 生成 Markdown 笔记保存至视频同目录
-- 需配置 DeepSeek API Key
 
 ## 技术栈
 

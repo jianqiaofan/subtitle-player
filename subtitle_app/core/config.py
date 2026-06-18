@@ -52,6 +52,41 @@ LANGUAGE_FILENAME_LABELS = {
 # 边播边转输出文件名后缀（视频名_同步.srt）
 LIVE_SYNC_FILENAME_LABEL = "同步"
 
+DEEPSEEK_API_KEY_PLACEHOLDERS = (
+    "请在此填写 DeepSeek API Key",
+    "YOUR_DEEPSEEK_API_KEY",
+    "在此填写你的 DeepSeek API Key",
+    "请填写 Whisper GGML 模型路径，例如 ../win系统模型中等.bin",
+)
+
+DEEPSEEK_MODEL_OPTIONS = [
+    ("deepseek-v4-flash（较快）", "deepseek-v4-flash"),
+    ("deepseek-v4-pro（效果更好）", "deepseek-v4-pro"),
+]
+
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+
+def is_deepseek_api_key_configured(api_key: str) -> bool:
+    value = api_key.strip()
+    if not value:
+        return False
+    if value in DEEPSEEK_API_KEY_PLACEHOLDERS:
+        return False
+    if value.startswith("请") and "填写" in value:
+        return False
+    if value.startswith("<") and value.endswith(">"):
+        return False
+    return True
+
+
+def is_deepseek_configured(config: "AppConfig") -> bool:
+    return (
+        is_deepseek_api_key_configured(config.deepseek_api_key)
+        and bool(config.deepseek_base_url.strip())
+        and bool(config.deepseek_model.strip())
+    )
+
 
 @dataclass
 class AppConfig:

@@ -1,0 +1,53 @@
+# 用户配置（含 API Key、本地路径）
+subtitle_app/config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# 临时与生成文件
+*.partial
+*.srt.partial
+*_AI笔记.md
+
+# Whisper 模型（体积过大，勿提交）
+*.bin
+
+# 媒体与个人学习资料
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wmv
+*.flv
+*.webm
+*.m4v
+*.mp3
+*.wav
+*.flac
+*.aac
+*.ogg
+*.m4a
+
+# 示例/个人字幕（仓库内请使用 examples/ 下的 demo）
+*.srt
+*.vtt
+!examples/**/*.srt
+!examples/**/*.vtt
+
+# IDE / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store

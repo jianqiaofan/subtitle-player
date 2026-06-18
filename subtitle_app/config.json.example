@@ -1,0 +1,11 @@
+{
+  "output_dir": "",
+  "language": "zh",
+  "output_format": "srt",
+  "model_path": "请填写 Whisper GGML 模型路径，例如 ../win系统模型中等.bin",
+  "n_threads": 0,
+  "deepseek_api_key": "请在此填写 DeepSeek API Key",
+  "deepseek_base_url": "https://api.deepseek.com",
+  "deepseek_model": "deepseek-v4-flash",
+  "last_media_dir": ""
+}

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, Qt, QUrl
+from PyQt6.QtCore import QEvent, Qt, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -29,6 +29,7 @@ from core.live_worker import LiveTranscribeWorker
 from core.subtitle import SubtitleSegment, find_segment_index_at_time
 from core.subtitle_loader import find_subtitles_for_media, load_subtitles
 from core.subtitle_resolve import SubtitleAction, SubtitleChoice, auto_load_choice
+from gui.ai_notes_progress_dialog import AiNotesProgressDialog
 from gui.llm_settings_dialog import LlmSettingsDialog
 from gui.main_window import TranscribeWindow
 from gui.styles import DARK_STYLE, PLAYER_LIST_STYLE
@@ -48,6 +49,8 @@ class PlayerWindow(QMainWindow):
         self._transcribe_window: TranscribeWindow | None = None
         self._live_worker: LiveTranscribeWorker | None = None
         self._ai_notes_worker: AiNotesWorker | None = None
+        self._ai_notes_progress: AiNotesProgressDialog | None = None
+        self._pending_notes_output = ""
         self._live_mode = False
         self._transcribed_until = 0.0
         self._config = load_config()
@@ -685,6 +688,7 @@ class PlayerWindow(QMainWindow):
 
         self.ai_notes_btn.setEnabled(False)
         self._update_live_status("AI 笔记：准备中…")
+        self._show_ai_notes_progress()
 
         self._ai_notes_worker = AiNotesWorker(self._media_path, self._config)
         self._ai_notes_worker.status_changed.connect(self._on_ai_notes_status)
@@ -692,19 +696,51 @@ class PlayerWindow(QMainWindow):
         self._ai_notes_worker.failed.connect(self._on_ai_notes_failed)
         self._ai_notes_worker.start()
 
+    def _show_ai_notes_progress(self) -> None:
+        self._close_ai_notes_progress()
+        if not self._media_path:
+            return
+        self._ai_notes_progress = AiNotesProgressDialog(self._media_path.name, self)
+        self._ai_notes_progress.start()
+        self._ai_notes_progress.show()
+
+    def _close_ai_notes_progress(self) -> None:
+        if self._ai_notes_progress is not None:
+            self._ai_notes_progress.close()
+            self._ai_notes_progress.deleteLater()
+            self._ai_notes_progress = None
+
     def _on_ai_notes_status(self, message: str) -> None:
         self._update_live_status(f"AI 笔记：{message}")
+        if self._ai_notes_progress is not None:
+            self._ai_notes_progress.set_status(message)
 
     def _on_ai_notes_finished(self, output_path: str) -> None:
         self.ai_notes_btn.setEnabled(True)
         self._ai_notes_worker = None
         self._update_live_status("")
         self._update_notes_buttons()
-        QMessageBox.information(
-            self,
-            "AI 笔记已生成",
-            f"笔记已保存至：\n{output_path}",
-        )
+        if self._ai_notes_progress is not None:
+            self._ai_notes_progress.finish_success()
+            QTimer.singleShot(700, self._close_ai_notes_progress_and_notify_success)
+            self._pending_notes_output = output_path
+        else:
+            QMessageBox.information(
+                self,
+                "AI 笔记已生成",
+                f"笔记已保存至：\n{output_path}",
+            )
+
+    def _close_ai_notes_progress_and_notify_success(self) -> None:
+        output_path = self._pending_notes_output
+        self._pending_notes_output = ""
+        self._close_ai_notes_progress()
+        if output_path:
+            QMessageBox.information(
+                self,
+                "AI 笔记已生成",
+                f"笔记已保存至：\n{output_path}",
+            )
 
     def _on_ai_notes_failed(self, message: str) -> None:
         self.ai_notes_btn.setEnabled(True)
@@ -713,7 +749,20 @@ class PlayerWindow(QMainWindow):
         hint = ""
         if "API Key" in message:
             hint = f"\n\n请编辑配置文件填写密钥：\n{CONFIG_PATH}"
-        QMessageBox.warning(self, "AI 笔记生成失败", f"{message}{hint}")
+        full_message = f"{message}{hint}"
+        if self._ai_notes_progress is not None:
+            self._ai_notes_progress.finish_failure(message)
+            self._pending_notes_output = full_message
+            QTimer.singleShot(500, self._close_ai_notes_progress_and_notify_failure)
+        else:
+            QMessageBox.warning(self, "AI 笔记生成失败", full_message)
+
+    def _close_ai_notes_progress_and_notify_failure(self) -> None:
+        message = self._pending_notes_output
+        self._pending_notes_output = ""
+        self._close_ai_notes_progress()
+        if message:
+            QMessageBox.warning(self, "AI 笔记生成失败", message)
 
     def _stop_ai_notes_worker(self) -> None:
         if self._ai_notes_worker and self._ai_notes_worker.isRunning():
@@ -721,6 +770,7 @@ class PlayerWindow(QMainWindow):
             self._ai_notes_worker.wait(3000)
         self._ai_notes_worker = None
         self.ai_notes_btn.setEnabled(True)
+        self._close_ai_notes_progress()
 
     def _on_player_error(self, error: QMediaPlayer.Error, message: str = "") -> None:
         if error == QMediaPlayer.Error.NoError:

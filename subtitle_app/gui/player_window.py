@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QEvent, Qt, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
-from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PyQt6.QtMultimedia import QAudioDevice, QAudioOutput, QMediaDevices, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core.ai_notes import find_notes_path
+from core.ai_notes import build_notes_output_path, find_notes_path
 from core.ai_notes_worker import AiNotesWorker
 from core.config import CONFIG_PATH, LIVE_SYNC_FILENAME_LABEL, MEDIA_EXTENSIONS, is_deepseek_configured, load_config, save_config
 from core.live_worker import LiveTranscribeWorker
@@ -36,6 +36,80 @@ from gui.styles import DARK_STYLE, PLAYER_LIST_STYLE
 from gui.subtitle_choice_dialog import SubtitleChoiceDialog
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".opus"}
+
+
+class ClickableVideoWidget(QVideoWidget):
+    """视频区域：单击切换播放/暂停，双击最大化或还原窗口。"""
+
+    _SINGLE_CLICK_MS = 250
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._toggle_callback = None
+        self._double_click_callback = None
+        self._single_click_timer = QTimer(self)
+        self._single_click_timer.setSingleShot(True)
+        self._single_click_timer.setInterval(self._SINGLE_CLICK_MS)
+        self._single_click_timer.timeout.connect(self._emit_single_click)
+        self._click_layer = QWidget(self)
+        self._click_layer.setStyleSheet("background: transparent;")
+        self._click_layer.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._click_layer.installEventFilter(self)
+
+    def set_toggle_callback(self, callback) -> None:
+        self._toggle_callback = callback
+
+    def set_double_click_callback(self, callback) -> None:
+        self._double_click_callback = callback
+
+    def _emit_single_click(self) -> None:
+        if self._toggle_callback is not None:
+            self._toggle_callback()
+
+    def _schedule_single_click(self) -> None:
+        self._single_click_timer.start()
+
+    def _cancel_single_click(self) -> None:
+        self._single_click_timer.stop()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._click_layer.setGeometry(self.rect())
+        self._click_layer.raise_()
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._click_layer:
+            if (
+                event.type() == QEvent.Type.MouseButtonDblClick
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                self._cancel_single_click()
+                if self._double_click_callback is not None:
+                    self._double_click_callback()
+                return True
+            if (
+                event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                self._schedule_single_click()
+                return True
+        return super().eventFilter(obj, event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._cancel_single_click()
+            if self._double_click_callback is not None:
+                self._double_click_callback()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._schedule_single_click()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class PlayerWindow(QMainWindow):
@@ -54,6 +128,10 @@ class PlayerWindow(QMainWindow):
         self._live_mode = False
         self._transcribed_until = 0.0
         self._config = load_config()
+        self._media_area_click_timer = QTimer(self)
+        self._media_area_click_timer.setSingleShot(True)
+        self._media_area_click_timer.setInterval(ClickableVideoWidget._SINGLE_CLICK_MS)
+        self._media_area_click_timer.timeout.connect(self._on_deferred_media_area_click)
 
         self.setWindowTitle("字幕播放器")
         self.setMinimumSize(1000, 640)
@@ -62,9 +140,12 @@ class PlayerWindow(QMainWindow):
         self.setStyleSheet(DARK_STYLE + PLAYER_LIST_STYLE)
 
         self._player = QMediaPlayer()
+        self._media_devices = QMediaDevices()
+        self._media_devices.audioOutputsChanged.connect(self._refresh_audio_devices)
         self._audio_output = QAudioOutput()
         self._audio_output.setVolume(1.0)
         self._player.setAudioOutput(self._audio_output)
+        self._sync_audio_output_device()
         self._player.positionChanged.connect(self._on_position_changed)
         self._player.durationChanged.connect(self._on_duration_changed)
         self._player.playbackStateChanged.connect(self._on_playback_state_changed)
@@ -129,9 +210,11 @@ class PlayerWindow(QMainWindow):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        self._video_widget = QVideoWidget()
+        self._video_widget = ClickableVideoWidget()
         self._video_widget.setMinimumSize(480, 270)
         self._video_widget.setAutoFillBackground(False)
+        self._video_widget.set_toggle_callback(self.toggle_playback_from_video)
+        self._video_widget.set_double_click_callback(self.toggle_maximize_from_video)
         self._player.setVideoOutput(self._video_widget)
         left_layout.addWidget(self._video_widget, stretch=1)
 
@@ -165,6 +248,8 @@ class PlayerWindow(QMainWindow):
         splitter.addWidget(self._subtitle_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
+
+        self._audio_placeholder.installEventFilter(self)
         return splitter
 
     def _build_controls(self) -> QHBoxLayout:
@@ -193,6 +278,13 @@ class PlayerWindow(QMainWindow):
         self.speed_combo.setCurrentIndex(2)  # 1.0x
         self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         bar.addWidget(self.speed_combo)
+
+        bar.addWidget(QLabel("输出"))
+        self.audio_device_combo = QComboBox()
+        self.audio_device_combo.setMinimumWidth(160)
+        self.audio_device_combo.currentIndexChanged.connect(self._on_audio_device_changed)
+        bar.addWidget(self.audio_device_combo)
+        self._refresh_audio_devices()
 
         self.mute_btn = QPushButton("静音")
         self.mute_btn.setCheckable(True)
@@ -249,6 +341,7 @@ class PlayerWindow(QMainWindow):
         self._audio_placeholder.setVisible(is_audio)
         if not is_audio:
             self._player.setVideoOutput(self._video_widget)
+        self._sync_audio_output_device()
 
         self.subtitle_list.clear()
         self._segments.clear()
@@ -408,7 +501,7 @@ class PlayerWindow(QMainWindow):
         self._live_worker.start()
 
         if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            self._player.play()
+            self._play_media()
 
     def _start_live_transcribe_manual(self) -> None:
         if not self._media_path:
@@ -542,13 +635,28 @@ class PlayerWindow(QMainWindow):
         self._seeking = False
         self._notify_live_seek(float(start))
         if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            self._player.play()
+            self._play_media()
+
+    def toggle_playback_from_video(self) -> None:
+        if self._media_path is None:
+            return
+        self._toggle_play()
+
+    def toggle_maximize_from_video(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def _on_deferred_media_area_click(self) -> None:
+        if self._media_path is not None:
+            self._toggle_play()
 
     def _toggle_play(self) -> None:
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._player.pause()
         else:
-            self._player.play()
+            self._play_media()
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         self.play_btn.setText("暂停" if state == QMediaPlayer.PlaybackState.PlayingState else "播放")
@@ -588,7 +696,23 @@ class PlayerWindow(QMainWindow):
         self.subtitle_list.blockSignals(False)
 
     def eventFilter(self, obj, event) -> bool:
-        if obj is self._subtitle_panel:
+        if obj in (self._audio_placeholder,):
+            if (
+                event.type() == QEvent.Type.MouseButtonDblClick
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                self._media_area_click_timer.stop()
+                self.toggle_maximize_from_video()
+                return True
+            if (
+                event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton
+                and self._media_path is not None
+            ):
+                self._media_area_click_timer.start()
+                return True
+        subtitle_panel = getattr(self, "_subtitle_panel", None)
+        if subtitle_panel is not None and obj is subtitle_panel:
             if event.type() == QEvent.Type.Enter:
                 self._subtitle_auto_follow = False
             elif event.type() == QEvent.Type.Leave:
@@ -616,6 +740,53 @@ class PlayerWindow(QMainWindow):
         rate = self.speed_combo.itemData(index)
         if rate is not None:
             self._player.setPlaybackRate(float(rate))
+
+    def _refresh_audio_devices(self) -> None:
+        current_id = self.audio_device_combo.currentData() if hasattr(self, "audio_device_combo") else None
+        if not hasattr(self, "audio_device_combo"):
+            return
+
+        self.audio_device_combo.blockSignals(True)
+        self.audio_device_combo.clear()
+        devices = self._media_devices.audioOutputs()
+        default_device = self._media_devices.defaultAudioOutput()
+        selected_index = 0
+        for index, device in enumerate(devices):
+            label = device.description()
+            if device.isDefault():
+                label = f"{label}（系统默认）"
+            self.audio_device_combo.addItem(label, device.id())
+            if current_id is not None and device.id() == current_id:
+                selected_index = index
+            elif current_id is None and device.id() == default_device.id():
+                selected_index = index
+        self.audio_device_combo.setCurrentIndex(selected_index if devices else -1)
+        self.audio_device_combo.blockSignals(False)
+        self._sync_audio_output_device()
+
+    def _selected_audio_device(self) -> QAudioDevice | None:
+        if not hasattr(self, "audio_device_combo"):
+            return self._media_devices.defaultAudioOutput()
+        device_id = self.audio_device_combo.currentData()
+        if device_id is None:
+            return self._media_devices.defaultAudioOutput()
+        for device in self._media_devices.audioOutputs():
+            if device.id() == device_id:
+                return device
+        return self._media_devices.defaultAudioOutput()
+
+    def _sync_audio_output_device(self) -> None:
+        device = self._selected_audio_device()
+        if device.isNull():
+            return
+        self._audio_output.setDevice(device)
+
+    def _on_audio_device_changed(self, _index: int) -> None:
+        self._sync_audio_output_device()
+
+    def _play_media(self) -> None:
+        self._sync_audio_output_device()
+        self._player.play()
 
     def _on_volume_changed(self, value: int) -> None:
         self._audio_output.setVolume(value / 100.0)
@@ -684,6 +855,28 @@ class PlayerWindow(QMainWindow):
             QMessageBox.information(self, "提示", "AI 笔记正在生成中，请稍候。")
             return
         if not self._ensure_llm_configured():
+            return
+
+        notes_path = build_notes_output_path(self._media_path)
+        overwrite_hint = (
+            f"\n\n注意：将覆盖已有笔记文件「{notes_path.name}」。"
+            if notes_path.is_file()
+            else ""
+        )
+        answer = QMessageBox.question(
+            self,
+            "确认生成 AI 笔记",
+            (
+                f"即将为「{self._media_path.name}」生成 AI 笔记。\n"
+                f"• 将调用 DeepSeek API（可能产生费用）\n"
+                f"• 保存至：{notes_path.name}"
+                f"{overwrite_hint}\n\n"
+                "是否继续？"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
             return
 
         self.ai_notes_btn.setEnabled(False)

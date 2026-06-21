@@ -17,20 +17,56 @@ _last_language_mode: str | None = None
 SAMPLE_RATE = 16000
 
 
+def _site_packages_dir() -> Path:
+    import site
+
+    for entry in site.getsitepackages() + [site.getusersitepackages()]:
+        root = Path(entry)
+        if (root / "pywhispercpp").is_dir() or any(root.glob("ggml*.dll")):
+            return root
+    return Path(site.getsitepackages()[-1])
+
+
+def _cuda_backend_label() -> str:
+    root = _site_packages_dir()
+    if any(root.glob("ggml-cuda*.dll")):
+        return "CUDA (GPU)"
+    if any(root.glob("ggml-cpu*.dll")):
+        return "CPU"
+    return "未知"
+
+
 def _setup_windows_dll_paths() -> None:
     if sys.platform != "win32":
         return
     import os
     import site
 
-    candidates: list[Path] = []
+    candidates: list[Path] = [_site_packages_dir()]
     for entry in site.getsitepackages() + [site.getusersitepackages()]:
-        pkg = Path(entry) / "pywhispercpp"
+        root = Path(entry)
+        pkg = root / "pywhispercpp"
         if pkg.is_dir():
             candidates.append(pkg)
+
+    for cuda_root in (
+        Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"),
+        Path(os.environ.get("CUDA_PATH", "")),
+    ):
+        if cuda_root.is_dir():
+            versions = sorted(cuda_root.glob("v*/bin"), reverse=True)
+            candidates.extend(versions[:1])
+
+    seen: set[str] = set()
     for path in candidates:
+        if not path.is_dir():
+            continue
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
         try:
-            os.add_dll_directory(str(path))
+            os.add_dll_directory(key)
         except (OSError, AttributeError):
             pass
 
@@ -53,6 +89,7 @@ def get_whisper_model(config: AppConfig, on_log: ProgressCallback | None = None)
 
     if on_log:
         on_log(f"正在加载模型: {model_path.name}")
+        on_log(f"推理后端: {_cuda_backend_label()}")
         on_log(f"推理线程数: {config.resolved_n_threads()}")
 
     model = Model(str(model_path), n_threads=config.resolved_n_threads())

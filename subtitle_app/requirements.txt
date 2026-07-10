@@ -1,2 +1,11 @@
-PyQt6>=6.6.0
+# Python 3.10 ~ 3.14（Windows 64 位）
+# 升级 Python 后请重新运行「安装依赖.bat」
+PyQt6>=6.11.0
 pywhispercpp>=1.5.0
+jieba>=0.42.1
+janome>=0.5.0
+jamdict>=0.1a11
+pronouncing>=0.2.0
+nltk>=3.8.0
+jaconv>=0.4.0
+opencc-python-reimplemented>=0.1.7

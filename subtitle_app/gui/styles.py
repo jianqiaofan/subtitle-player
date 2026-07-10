@@ -62,6 +62,42 @@ QPushButton#primaryButton {
 QPushButton#primaryButton:hover {
     background-color: #7d4fbd;
 }
+QToolButton#toolbarMenuButton {
+    color: #b980ff;
+    background-color: #212121;
+    border: 1px solid #555555;
+    border-radius: 4px;
+    padding: 6px 10px;
+    min-height: 18px;
+}
+QToolButton#toolbarMenuButton:hover {
+    border: 1px solid #b980ff;
+    background-color: rgba(185, 128, 255, 0.08);
+}
+QToolButton#toolbarMenuButton:pressed {
+    background-color: #1a1a1a;
+}
+QMenu {
+    background-color: #2b2b2b;
+    color: #ffffff;
+    border: 1px solid #555555;
+    border-radius: 4px;
+    padding: 4px 0;
+}
+QMenu::item {
+    padding: 8px 28px 8px 16px;
+}
+QMenu::item:selected {
+    background-color: rgba(185, 128, 255, 0.28);
+}
+QMenu::item:disabled {
+    color: #666666;
+}
+QMenu::separator {
+    height: 1px;
+    background-color: rgba(255, 255, 255, 0.12);
+    margin: 4px 8px;
+}
 QComboBox, QLineEdit, QSpinBox {
     background-color: #2b2b2b;
     color: white;

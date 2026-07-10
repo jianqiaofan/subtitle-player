@@ -27,12 +27,14 @@ from PyQt6.QtWidgets import (
 )
 
 from core.config import (
+    INFERENCE_DEVICE_OPTIONS,
     LANGUAGE_OPTIONS,
     MEDIA_EXTENSIONS,
     OUTPUT_OPTIONS,
     load_config,
     save_config,
 )
+from core.transcriber import is_cuda_available
 from core.worker import TranscribeWorker
 from gui.styles import DARK_STYLE
 
@@ -92,6 +94,22 @@ class TranscribeWindow(QMainWindow):
         self.threads_spin.setToolTip("0 表示自动使用 CPU 核心数")
         row_model.addWidget(self.threads_spin)
         layout.addLayout(row_model)
+
+        row_device = QHBoxLayout()
+        row_device.addWidget(QLabel("推理设备"))
+        self.inference_combo = QComboBox()
+        for label, value in INFERENCE_DEVICE_OPTIONS:
+            self.inference_combo.addItem(label, value)
+        self.inference_combo.setToolTip(
+            "自动：检测到 CUDA 版 pywhispercpp 时使用 GPU，否则 CPU。\n"
+            "GPU 需先运行「安装CUDA推理.bat」。"
+        )
+        self.inference_combo.currentIndexChanged.connect(lambda _: self._refresh_inference_status())
+        row_device.addWidget(self.inference_combo)
+        self.inference_status = QLabel()
+        self.inference_status.setObjectName("hintLabel")
+        row_device.addWidget(self.inference_status, stretch=1)
+        layout.addLayout(row_device)
 
         row_opts = QHBoxLayout()
         row_opts.addWidget(QLabel("语言"))
@@ -196,6 +214,11 @@ class TranscribeWindow(QMainWindow):
         self.model_edit.setText(self.config.model_path)
         self.threads_spin.setValue(self.config.n_threads)
 
+        idx = self.inference_combo.findData(self.config.inference_device)
+        if idx >= 0:
+            self.inference_combo.setCurrentIndex(idx)
+        self._refresh_inference_status()
+
         idx = self.lang_combo.findData(self.config.language)
         if idx >= 0:
             self.lang_combo.setCurrentIndex(idx)
@@ -207,10 +230,19 @@ class TranscribeWindow(QMainWindow):
     def _save_settings_from_ui(self) -> None:
         self.config.model_path = self.model_edit.text().strip()
         self.config.n_threads = self.threads_spin.value()
+        self.config.inference_device = self.inference_combo.currentData()
         self.config.language = self.lang_combo.currentData()
         self.config.output_format = self.format_combo.currentData()
         self.config.output_dir = self.output_edit.text().strip()
         save_config(self.config)
+
+    def _refresh_inference_status(self) -> None:
+        if is_cuda_available():
+            self.inference_status.setText("当前环境：已安装 CUDA 版 pywhispercpp，可选 GPU。")
+        else:
+            self.inference_status.setText(
+                "当前环境：仅 CPU 版 pywhispercpp；要用 GPU 请运行「安装CUDA推理.bat」。"
+            )
 
     def _browse_model(self) -> None:
         path, _ = QFileDialog.getOpenFileName(

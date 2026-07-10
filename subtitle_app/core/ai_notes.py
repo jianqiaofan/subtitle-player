@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from core.ai_notes_templates import (
+    DEFAULT_AI_NOTES_TEMPLATE_ID,
+    get_ai_notes_template,
+    normalize_ai_notes_template_id,
+)
+from core.ai_notes_subtitle_types import get_subtitle_type
 from core.config import AppConfig, CONFIG_PATH, is_deepseek_api_key_configured
 from core.subtitle import SubtitleSegment, load_subtitle_file
 from core.subtitle_loader import find_subtitles_for_media
@@ -111,26 +117,66 @@ def find_notes_path(media_path: Path) -> Path | None:
         return None
     return path
 
-def build_notes_prompt(media_name: str, corpus_text: str) -> list[dict[str, str]]:
-    system = (
-        "你是一位专业的学习笔记整理助手。"
-        "请根据用户提供的视频字幕语料，整理一份结构清晰、便于复习的 Markdown 学习笔记。"
-        "要求：\n"
-        "1. 使用中文撰写（保留原文中的外语词汇或例句时可双语对照）；\n"
-        "2. 包含：课程概述、核心知识点、重点词汇/表达、例句或要点、学习建议等；\n"
-        "3. 适当使用 Markdown 标题、列表、表格；\n"
-        "4. 不要编造字幕中未出现的内容；\n"
-        "5. 只输出 Markdown 正文，不要输出 JSON 或额外解释。"
-    )
-    user = (
-        f"视频文件名：{media_name}\n\n"
-        f"以下为该视频的全部有效字幕语料：\n\n"
-        f"{corpus_text}"
-    )
+def build_notes_prompt(
+    media_name: str,
+    corpus_text: str,
+    template_id: str = DEFAULT_AI_NOTES_TEMPLATE_ID,
+    *,
+    subcategory: str = "",
+    user_context: str = "",
+) -> list[dict[str, str]]:
+    template = get_ai_notes_template(normalize_ai_notes_template_id(template_id))
     return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
+        {"role": "system", "content": template.system_prompt},
+        {
+            "role": "user",
+            "content": template.build_user_content(
+                media_name,
+                corpus_text,
+                subcategory=subcategory,
+                user_context=user_context,
+            ),
+        },
     ]
+
+
+_PROMPT_SECTION_RE = re.compile(r"^=== (system|user) ===\s*$", re.MULTILINE)
+
+
+def format_messages_for_edit(messages: list[dict[str, str]]) -> str:
+    """将 API messages 格式化为可编辑的完整 Prompt 文本。"""
+    parts: list[str] = []
+    for message in messages:
+        role = message.get("role", "").strip()
+        content = str(message.get("content", "")).strip()
+        parts.append(f"=== {role} ===\n{content}")
+    return "\n\n".join(parts)
+
+
+def parse_messages_from_edit(text: str) -> list[dict[str, str]]:
+    """从编辑后的 Prompt 文本解析回 API messages。"""
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError("提示词不能为空。")
+
+    matches = list(_PROMPT_SECTION_RE.finditer(stripped))
+    if len(matches) < 2:
+        raise ValueError("提示词格式不正确：需包含「=== system ===」与「=== user ===」两个区块。")
+
+    messages: list[dict[str, str]] = []
+    for index, match in enumerate(matches):
+        role = match.group(1)
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(stripped)
+        content = stripped[start:end].strip()
+        if not content:
+            raise ValueError(f"提示词中 {role} 区块内容不能为空。")
+        messages.append({"role": role, "content": content})
+
+    roles = {message["role"] for message in messages}
+    if "system" not in roles or "user" not in roles:
+        raise ValueError("提示词须同时包含 system 与 user 区块。")
+    return messages
 
 
 def call_deepseek_chat(
@@ -194,37 +240,68 @@ def compose_notes_markdown(
     model_content: str,
     *,
     model_name: str,
+    template_id: str = DEFAULT_AI_NOTES_TEMPLATE_ID,
+    subcategory: str = "",
     generated_at: datetime | None = None,
 ) -> str:
     when = generated_at or datetime.now()
     time_str = when.strftime("%Y-%m-%d %H:%M:%S")
     subtitle_sources = "、".join(f"{item.label}({item.filename})" for item in corpus_items)
     body = _strip_markdown_fence(model_content)
+    template = get_ai_notes_template(normalize_ai_notes_template_id(template_id))
+    category = get_subtitle_type(template.id)
+    subtitle_type_line = f"> 字幕类型：{template.name}"
+    if subcategory.strip() and category.has_subcategory() and category.subcategory_label:
+        subtitle_type_line += f"（{category.subcategory_label}：{subcategory.strip()}）"
 
     return (
         f"---\n"
-        f"title: {media_path.stem} 学习笔记\n"
+        f"title: {media_path.stem} — {template.name}\n"
         f"source_media: {media_path.name}\n"
+        f"subtitle_type: {template.name}\n"
+        f"subtitle_template: {template.id}\n"
+        f"subtitle_subcategory: {subcategory.strip()}\n"
         f"subtitle_sources: {subtitle_sources}\n"
         f"generated_at: {time_str}\n"
         f"model: {model_name}\n"
         f"---\n\n"
-        f"# {media_path.stem} — AI 学习笔记\n\n"
+        f"# {media_path.stem} — {template.notes_title_suffix}\n\n"
         f"> 生成时间：{time_str}  \n"
         f"> 源视频：{media_path.name}  \n"
+        f"{subtitle_type_line}  \n"
         f"> 字幕来源：{subtitle_sources}  \n"
         f"> 模型：{model_name}\n\n"
         f"{body}\n"
     )
 
 
-def generate_ai_notes(media_path: Path, config: AppConfig) -> Path:
+def generate_ai_notes(
+    media_path: Path,
+    config: AppConfig,
+    *,
+    messages: list[dict[str, str]] | None = None,
+    template_id: str | None = None,
+    subcategory: str = "",
+) -> Path:
+    resolved_template_id = normalize_ai_notes_template_id(
+        config.ai_notes_subtitle_type if template_id is None else template_id
+    )
     corpus_items = collect_valid_subtitle_corpus(media_path)
-    if not corpus_items:
-        raise RuntimeError("未找到有效字幕文件，无法生成笔记。")
+    if messages is None:
+        if not corpus_items:
+            raise RuntimeError("未找到有效字幕文件，无法生成笔记。")
+        corpus_text = corpus_to_text(corpus_items)
+        resolved_subcategory = subcategory.strip() or config.get_ai_notes_subcategory(resolved_template_id)
+        messages = build_notes_prompt(
+            media_path.name,
+            corpus_text,
+            template_id=resolved_template_id,
+            subcategory=resolved_subcategory,
+            user_context=config.get_ai_notes_user_context(resolved_template_id),
+        )
+    elif not messages:
+        raise RuntimeError("提示词为空，无法生成笔记。")
 
-    corpus_text = corpus_to_text(corpus_items)
-    messages = build_notes_prompt(media_path.name, corpus_text)
     model_name = config.deepseek_model.strip() or "deepseek-v4-flash"
     model_content = call_deepseek_chat(config, messages)
 
@@ -234,6 +311,8 @@ def generate_ai_notes(media_path: Path, config: AppConfig) -> Path:
         corpus_items,
         model_content,
         model_name=model_name,
+        template_id=resolved_template_id,
+        subcategory=subcategory.strip() or config.get_ai_notes_subcategory(resolved_template_id),
     )
     output_path.write_text(content, encoding="utf-8")
     return output_path

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -33,6 +33,12 @@ OUTPUT_OPTIONS = [
     ("SRT 字幕", "srt"),
     ("VTT 字幕", "vtt"),
     ("纯文本 TXT", "txt"),
+]
+
+INFERENCE_DEVICE_OPTIONS = [
+    ("自动", "auto"),
+    ("CPU", "cpu"),
+    ("GPU (CUDA)", "gpu"),
 ]
 
 # 字幕文件名中的语种后缀（视频名_后缀.扩展名）
@@ -94,11 +100,51 @@ class AppConfig:
     language: str = "zh"
     output_format: str = "srt"
     model_path: str = ""
+    inference_device: str = "auto"
     n_threads: int = 0
     deepseek_api_key: str = "请在此填写 DeepSeek API Key"
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash"
+    ai_notes_subtitle_type: str = "learning"
+    ai_notes_subcategory: dict[str, str] = field(default_factory=dict)
+    ai_notes_user_context: dict[str, str] = field(default_factory=dict)
+    ai_notes_template: str = "learning"
+    ecdict_db_path: str = ""
     last_media_dir: str = ""
+
+    def get_ai_notes_user_context(self, subtitle_type: str) -> str:
+        return str(self.ai_notes_user_context.get(subtitle_type, "") or "").strip()
+
+    def set_ai_notes_user_context(self, subtitle_type: str, context: str) -> None:
+        value = context.strip()
+        if value:
+            self.ai_notes_user_context[subtitle_type] = value
+        elif subtitle_type in self.ai_notes_user_context:
+            del self.ai_notes_user_context[subtitle_type]
+
+    def get_ai_notes_subcategory(self, subtitle_type: str) -> str:
+        from core.ai_notes_subtitle_types import normalize_subcategory, normalize_subtitle_type_id
+
+        type_id = normalize_subtitle_type_id(subtitle_type)
+        return normalize_subcategory(type_id, str(self.ai_notes_subcategory.get(type_id, "") or ""))
+
+    def set_ai_notes_subcategory(self, subtitle_type: str, subcategory: str) -> None:
+        from core.ai_notes_subtitle_types import (
+            get_subtitle_type,
+            normalize_subcategory,
+            normalize_subtitle_type_id,
+        )
+
+        type_id = normalize_subtitle_type_id(subtitle_type)
+        category = get_subtitle_type(type_id)
+        if not category.has_subcategory():
+            self.ai_notes_subcategory.pop(type_id, None)
+            return
+        value = normalize_subcategory(type_id, subcategory) if subcategory.strip() else ""
+        if value:
+            self.ai_notes_subcategory[type_id] = value
+        elif type_id in self.ai_notes_subcategory:
+            del self.ai_notes_subcategory[type_id]
 
     def resolved_last_media_dir(self) -> Path:
         if self.last_media_dir.strip():
@@ -170,6 +216,37 @@ def load_config() -> AppConfig:
         data["model_path"] = data.get("engine_model") or data.get("whisper_cpp_model") or ""
 
     cfg = AppConfig(**{k: v for k, v in data.items() if k in AppConfig.__dataclass_fields__})
+    if not isinstance(cfg.ai_notes_user_context, dict):
+        cfg.ai_notes_user_context = {}
+    if not isinstance(cfg.ai_notes_subcategory, dict):
+        cfg.ai_notes_subcategory = {}
+
+    from core.ai_notes_subtitle_types import (
+        LEGACY_TEMPLATE_IDS,
+        normalize_subtitle_type_id,
+    )
+
+    if not str(getattr(cfg, "ai_notes_subtitle_type", "") or "").strip():
+        legacy = str(data.get("ai_notes_template") or cfg.ai_notes_template or "learning")
+        cfg.ai_notes_subtitle_type = normalize_subtitle_type_id(
+            LEGACY_TEMPLATE_IDS.get(legacy, legacy)
+        )
+    cfg.ai_notes_subtitle_type = normalize_subtitle_type_id(cfg.ai_notes_subtitle_type)
+    cfg.ai_notes_template = cfg.ai_notes_subtitle_type
+
+    migrated_context: dict[str, str] = {}
+    for key, value in cfg.ai_notes_user_context.items():
+        new_key = normalize_subtitle_type_id(LEGACY_TEMPLATE_IDS.get(key, key))
+        if str(value or "").strip():
+            migrated_context[new_key] = str(value).strip()
+    cfg.ai_notes_user_context = migrated_context
+
+    migrated_subcategory: dict[str, str] = {}
+    for key, value in cfg.ai_notes_subcategory.items():
+        new_key = normalize_subtitle_type_id(LEGACY_TEMPLATE_IDS.get(key, key))
+        if str(value or "").strip():
+            migrated_subcategory[new_key] = str(value).strip()
+    cfg.ai_notes_subcategory = migrated_subcategory
     if not cfg.model_path and (ROOT_DIR / "win系统模型中等.bin").exists():
         cfg.model_path = str(ROOT_DIR / "win系统模型中等.bin")
     return cfg

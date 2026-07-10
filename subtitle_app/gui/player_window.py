@@ -1,39 +1,64 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from PyQt6.QtCore import QEvent, Qt, QTimer, QUrl
-from PyQt6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import (
+    QAction,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QGuiApplication,
+    QIcon,
+)
 from PyQt6.QtMultimedia import QAudioDevice, QAudioOutput, QMediaDevices, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSlider,
     QSplitter,
+    QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
-from core.ai_notes import build_notes_output_path, find_notes_path
+from core.ai_notes import (
+    build_notes_output_path,
+    collect_valid_subtitle_corpus,
+    corpus_to_text,
+    find_notes_path,
+)
 from core.ai_notes_worker import AiNotesWorker
-from core.config import CONFIG_PATH, LIVE_SYNC_FILENAME_LABEL, MEDIA_EXTENSIONS, is_deepseek_configured, load_config, save_config
+from core.subtitle_text_export import export_plain_text_markdown
+from core.vocabulary_worker import VocabularyWorker
+from core.config import CONFIG_PATH, INFERENCE_DEVICE_OPTIONS, LIVE_SYNC_FILENAME_LABEL, MEDIA_EXTENSIONS, is_deepseek_configured, load_config, save_config
+from core.transcriber import clear_model_cache, is_cuda_available
 from core.live_worker import LiveTranscribeWorker
-from core.subtitle import SubtitleSegment, find_segment_index_at_time
+from core.subtitle import SubtitleSegment, find_segment_index_at_time, write_subtitle_file
 from core.subtitle_loader import find_subtitles_for_media, load_subtitles
 from core.subtitle_resolve import SubtitleAction, SubtitleChoice, auto_load_choice
+from core.sync_subtitle import sync_subtitle_paths
+from gui.ai_notes_corpus_dialog import AiNotesCorpusDialog
 from gui.ai_notes_progress_dialog import AiNotesProgressDialog
 from gui.llm_settings_dialog import LlmSettingsDialog
 from gui.main_window import TranscribeWindow
 from gui.styles import DARK_STYLE, PLAYER_LIST_STYLE
-from gui.subtitle_choice_dialog import SubtitleChoiceDialog
+from gui.subtitle_edit_dialog import SubtitleEditDialog
+from gui.subtitle_text_dialog import SubtitleTextDialog
+from gui.vocabulary_dialog import VocabularyDialog
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".opus"}
 
@@ -120,11 +145,13 @@ class PlayerWindow(QMainWindow):
         self._current_subtitle_row = -1
         self._seeking = False
         self._subtitle_auto_follow = True
+        self._subtitle_menu_open = False
         self._transcribe_window: TranscribeWindow | None = None
         self._live_worker: LiveTranscribeWorker | None = None
         self._ai_notes_worker: AiNotesWorker | None = None
         self._ai_notes_progress: AiNotesProgressDialog | None = None
         self._pending_notes_output = ""
+        self._vocabulary_worker: VocabularyWorker | None = None
         self._live_mode = False
         self._transcribed_until = 0.0
         self._config = load_config()
@@ -132,6 +159,10 @@ class PlayerWindow(QMainWindow):
         self._media_area_click_timer.setSingleShot(True)
         self._media_area_click_timer.setInterval(ClickableVideoWidget._SINGLE_CLICK_MS)
         self._media_area_click_timer.timeout.connect(self._on_deferred_media_area_click)
+        self._study_countdown_remaining = 0
+        self._study_countdown_timer = QTimer(self)
+        self._study_countdown_timer.setInterval(1000)
+        self._study_countdown_timer.timeout.connect(self._on_study_countdown_tick)
 
         self.setWindowTitle("字幕播放器")
         self.setMinimumSize(1000, 640)
@@ -161,8 +192,25 @@ class PlayerWindow(QMainWindow):
         root.addWidget(self._build_main_splitter(), stretch=1)
         root.addLayout(self._build_controls())
 
+    def _create_toolbar_menu_button(
+        self,
+        text: str,
+        icon: QIcon,
+        tooltip: str,
+    ) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName("toolbarMenuButton")
+        button.setText(text)
+        button.setIcon(icon)
+        button.setToolTip(tooltip)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        button.setAutoRaise(False)
+        return button
+
     def _build_toolbar(self) -> QHBoxLayout:
         bar = QHBoxLayout()
+        style = self.style()
 
         open_btn = QPushButton("打开媒体")
         open_btn.clicked.connect(self._open_media)
@@ -174,33 +222,82 @@ class PlayerWindow(QMainWindow):
         self.subtitle_combo.currentIndexChanged.connect(self._on_subtitle_selected)
         bar.addWidget(self.subtitle_combo, stretch=1)
 
-        transcribe_btn = QPushButton("音视频转字幕")
-        transcribe_btn.setObjectName("primaryButton")
-        transcribe_btn.clicked.connect(self._open_transcribe_tool)
-        bar.addWidget(transcribe_btn)
-
-        live_btn = QPushButton("边播边转")
-        live_btn.clicked.connect(self._start_live_transcribe_manual)
-        bar.addWidget(live_btn)
-
         self.media_label = QLabel("未加载媒体文件")
         self.media_label.setObjectName("hintLabel")
         bar.addWidget(self.media_label, stretch=1)
 
         bar.addStretch(1)
-        self.llm_settings_btn = QPushButton("大模型配置")
-        self.llm_settings_btn.clicked.connect(self._open_llm_settings)
-        bar.addWidget(self.llm_settings_btn)
 
-        self.view_notes_btn = QPushButton("查看笔记")
-        self.view_notes_btn.clicked.connect(self._view_ai_notes)
-        self.view_notes_btn.setEnabled(False)
-        bar.addWidget(self.view_notes_btn)
+        tools_menu = QMenu(self)
+        action_transcribe = tools_menu.addAction("音视频转字幕")
+        action_transcribe.triggered.connect(self._open_transcribe_tool)
+        action_live = tools_menu.addAction("边播边转")
+        action_live.triggered.connect(self._start_live_transcribe_manual)
+        tools_menu.addSeparator()
+        self._action_ai_notes = tools_menu.addAction("AI笔记")
+        self._action_ai_notes.triggered.connect(self._generate_ai_notes)
+        self._action_view_notes = tools_menu.addAction("查看笔记")
+        self._action_view_notes.setEnabled(False)
+        self._action_view_notes.triggered.connect(self._view_ai_notes)
+        tools_menu.addSeparator()
+        self._action_vocabulary = tools_menu.addAction("生词表")
+        self._action_vocabulary.triggered.connect(self._generate_vocabulary_list)
+        action_plain_text = tools_menu.addAction("纯文字")
+        action_plain_text.triggered.connect(self._export_plain_text)
 
-        self.ai_notes_btn = QPushButton("AI笔记")
-        self.ai_notes_btn.setObjectName("primaryButton")
-        self.ai_notes_btn.clicked.connect(self._generate_ai_notes)
-        bar.addWidget(self.ai_notes_btn)
+        tools_btn = self._create_toolbar_menu_button(
+            "工具",
+            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
+            "转写、笔记与字幕工具",
+        )
+        tools_btn.setMenu(tools_menu)
+        bar.addWidget(tools_btn)
+
+        settings_menu = QMenu(self)
+        action_llm_settings = settings_menu.addAction("大模型配置")
+        action_llm_settings.triggered.connect(self._open_llm_settings)
+        settings_menu.addSeparator()
+
+        inference_widget = QWidget()
+        inference_layout = QHBoxLayout(inference_widget)
+        inference_layout.setContentsMargins(12, 6, 12, 6)
+        inference_layout.addWidget(QLabel("推理设备"))
+        self.inference_combo = QComboBox()
+        self.inference_combo.setMinimumWidth(180)
+        for label, value in INFERENCE_DEVICE_OPTIONS:
+            self.inference_combo.addItem(label, value)
+        idx = self.inference_combo.findData(self._config.inference_device)
+        if idx >= 0:
+            self.inference_combo.setCurrentIndex(idx)
+        self.inference_combo.setToolTip(
+            "Whisper 推理设备。GPU 需安装 CUDA 版 pywhispercpp。"
+        )
+        self.inference_combo.currentIndexChanged.connect(self._on_inference_device_changed)
+        inference_layout.addWidget(self.inference_combo, stretch=1)
+        inference_action = QWidgetAction(self)
+        inference_action.setDefaultWidget(inference_widget)
+        settings_menu.addAction(inference_action)
+
+        output_widget = QWidget()
+        output_layout = QHBoxLayout(output_widget)
+        output_layout.setContentsMargins(12, 6, 12, 6)
+        output_layout.addWidget(QLabel("输出设备"))
+        self.audio_device_combo = QComboBox()
+        self.audio_device_combo.setMinimumWidth(220)
+        self.audio_device_combo.currentIndexChanged.connect(self._on_audio_device_changed)
+        output_layout.addWidget(self.audio_device_combo, stretch=1)
+        output_action = QWidgetAction(self)
+        output_action.setDefaultWidget(output_widget)
+        settings_menu.addAction(output_action)
+        self._refresh_audio_devices()
+
+        settings_btn = self._create_toolbar_menu_button(
+            "设置",
+            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView),
+            "应用与模型设置",
+        )
+        settings_btn.setMenu(settings_menu)
+        bar.addWidget(settings_btn)
         return bar
 
     def _build_main_splitter(self) -> QSplitter:
@@ -240,9 +337,11 @@ class PlayerWindow(QMainWindow):
         right_layout.addLayout(header)
 
         self.subtitle_list = QListWidget()
+        self.subtitle_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.subtitle_list.customContextMenuRequested.connect(self._on_subtitle_context_menu)
         self.subtitle_list.itemClicked.connect(self._on_subtitle_clicked)
         right_layout.addWidget(self.subtitle_list)
-        self._subtitle_panel.installEventFilter(self)
+        self.subtitle_list.installEventFilter(self)
 
         splitter.addWidget(left)
         splitter.addWidget(self._subtitle_panel)
@@ -279,12 +378,13 @@ class PlayerWindow(QMainWindow):
         self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         bar.addWidget(self.speed_combo)
 
-        bar.addWidget(QLabel("输出"))
-        self.audio_device_combo = QComboBox()
-        self.audio_device_combo.setMinimumWidth(160)
-        self.audio_device_combo.currentIndexChanged.connect(self._on_audio_device_changed)
-        bar.addWidget(self.audio_device_combo)
-        self._refresh_audio_devices()
+        self.study_countdown_btn = QPushButton("倒计时")
+        self.study_countdown_btn.setMinimumWidth(72)
+        self.study_countdown_btn.setToolTip(
+            "点击设置学习倒计时。仅在本窗口激活且位于屏幕最前时读秒。"
+        )
+        self.study_countdown_btn.clicked.connect(self._on_study_countdown_clicked)
+        bar.addWidget(self.study_countdown_btn)
 
         self.mute_btn = QPushButton("静音")
         self.mute_btn.setCheckable(True)
@@ -304,6 +404,73 @@ class PlayerWindow(QMainWindow):
         self.volume_label.setMinimumWidth(36)
         bar.addWidget(self.volume_label)
         return bar
+
+    def _study_countdown_is_foreground(self) -> bool:
+        if sys.platform != "win32":
+            return self.isActiveWindow()
+        try:
+            import ctypes
+
+            foreground = ctypes.windll.user32.GetForegroundWindow()
+            return bool(foreground) and int(self.winId()) == foreground
+        except (AttributeError, OSError, ValueError):
+            return self.isActiveWindow()
+
+    def _study_countdown_should_tick(self) -> bool:
+        if not self.isVisible() or self.isMinimized() or self.isHidden():
+            return False
+        if not self.isActiveWindow():
+            return False
+        return self._study_countdown_is_foreground()
+
+    @staticmethod
+    def _format_study_countdown(seconds: int) -> str:
+        minutes, secs = divmod(max(0, seconds), 60)
+        return f"{minutes}:{secs:02d}"
+
+    def _update_study_countdown_button(self) -> None:
+        if self._study_countdown_remaining > 0:
+            self.study_countdown_btn.setText(
+                self._format_study_countdown(self._study_countdown_remaining)
+            )
+        else:
+            self.study_countdown_btn.setText("倒计时")
+
+    def _reset_study_countdown(self) -> None:
+        self._study_countdown_timer.stop()
+        self._study_countdown_remaining = 0
+        self._update_study_countdown_button()
+
+    def _on_study_countdown_clicked(self) -> None:
+        default_minutes = 10
+        if self._study_countdown_remaining > 0:
+            default_minutes = max(1, (self._study_countdown_remaining + 59) // 60)
+        minutes, ok = QInputDialog.getInt(
+            self,
+            "学习倒计时",
+            "倒计时（分钟）：",
+            value=default_minutes,
+            min=1,
+            max=600,
+        )
+        if not ok:
+            return
+        self._study_countdown_remaining = minutes * 60
+        self._update_study_countdown_button()
+        if not self._study_countdown_timer.isActive():
+            self._study_countdown_timer.start()
+
+    def _on_study_countdown_tick(self) -> None:
+        if self._study_countdown_remaining <= 0:
+            self._reset_study_countdown()
+            return
+        if not self._study_countdown_should_tick():
+            return
+        self._study_countdown_remaining -= 1
+        if self._study_countdown_remaining <= 0:
+            self._reset_study_countdown()
+            return
+        self._update_study_countdown_button()
 
     def _open_media(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -364,9 +531,9 @@ class PlayerWindow(QMainWindow):
 
     def _update_notes_buttons(self) -> None:
         if not self._media_path:
-            self.view_notes_btn.setEnabled(False)
+            self._action_view_notes.setEnabled(False)
             return
-        self.view_notes_btn.setEnabled(find_notes_path(self._media_path) is not None)
+        self._action_view_notes.setEnabled(find_notes_path(self._media_path) is not None)
 
     def _view_ai_notes(self) -> None:
         if not self._media_path:
@@ -484,6 +651,7 @@ class PlayerWindow(QMainWindow):
             self._update_live_status("准备中…")
 
         self._config.language = "mixed"
+        self._config.inference_device = self.inference_combo.currentData() or "auto"
         self._live_worker = LiveTranscribeWorker(
             self._media_path,
             get_playhead=lambda: self._player.position() / 1000.0,
@@ -507,12 +675,33 @@ class PlayerWindow(QMainWindow):
         if not self._media_path:
             QMessageBox.information(self, "提示", "请先打开媒体文件。")
             return
+        if not self._confirm_live_transcribe():
+            return
         choice = SubtitleChoiceDialog.ask(self._media_path, self)
         if choice is None:
             return
         if choice.action == SubtitleAction.LIVE_TRANSCRIBE:
             self._stop_live_transcribe()
         self._apply_subtitle_choice(choice)
+
+    def _confirm_live_transcribe(self) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle("确认边播边转")
+        box.setText(
+            "确定要开始边播边转吗？\n\n"
+            "该功能会在播放时实时转写字幕，并占用 CPU/GPU 资源。"
+        )
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+        )
+        ok_btn = box.button(QMessageBox.StandardButton.Ok)
+        cancel_btn = box.button(QMessageBox.StandardButton.Cancel)
+        if ok_btn:
+            ok_btn.setText("确定")
+        if cancel_btn:
+            cancel_btn.setText("取消")
+        return box.exec() == QMessageBox.StandardButton.Ok
 
     def _stop_live_transcribe(self) -> None:
         if self._live_worker and self._live_worker.isRunning():
@@ -571,9 +760,17 @@ class PlayerWindow(QMainWindow):
             seg.index = index
         for seg in new_segments:
             row = self._find_subtitle_insert_row(seg.start)
-            item = QListWidgetItem(self._format_subtitle_item(seg))
-            item.setData(Qt.ItemDataRole.UserRole, seg.start)
-            self.subtitle_list.insertItem(row, item)
+            self.subtitle_list.insertItem(row, QListWidgetItem(self._format_subtitle_item(seg)))
+        self._refresh_subtitle_list_texts()
+
+    def _refresh_subtitle_list_texts(self) -> None:
+        if self.subtitle_list.count() != len(self._segments):
+            self._populate_subtitle_list()
+            return
+        for row, seg in enumerate(self._segments):
+            item = self.subtitle_list.item(row)
+            if item is not None:
+                item.setText(self._format_subtitle_item(seg))
 
     def _find_subtitle_insert_row(self, start: float) -> int:
         for row in range(self.subtitle_list.count()):
@@ -605,9 +802,7 @@ class PlayerWindow(QMainWindow):
     def _populate_subtitle_list(self) -> None:
         self.subtitle_list.clear()
         for seg in self._segments:
-            item = QListWidgetItem(self._format_subtitle_item(seg))
-            item.setData(Qt.ItemDataRole.UserRole, seg.start)
-            self.subtitle_list.addItem(item)
+            self.subtitle_list.addItem(QListWidgetItem(self._format_subtitle_item(seg)))
         self._current_subtitle_row = -1
 
     @staticmethod
@@ -615,7 +810,7 @@ class PlayerWindow(QMainWindow):
         start = PlayerWindow._format_clock(seg.start)
         end = PlayerWindow._format_clock(seg.end)
         text = seg.text.replace("\n", " / ")
-        return f"[{start} → {end}] {text}"
+        return f"{seg.index}. [{start} → {end}] {text}"
 
     @staticmethod
     def _format_clock(seconds: float) -> str:
@@ -627,15 +822,132 @@ class PlayerWindow(QMainWindow):
         return f"{minutes:02d}:{secs:02d}"
 
     def _on_subtitle_clicked(self, item: QListWidgetItem) -> None:
-        start = item.data(Qt.ItemDataRole.UserRole)
-        if start is None:
+        row = self.subtitle_list.row(item)
+        if row < 0 or row >= len(self._segments):
             return
+        start = self._segments[row].start
         self._seeking = True
-        self._player.setPosition(int(float(start) * 1000))
+        self._player.setPosition(int(start * 1000))
         self._seeking = False
-        self._notify_live_seek(float(start))
+        self._notify_live_seek(start)
         if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
             self._play_media()
+
+    def _pause_subtitle_auto_follow(self) -> None:
+        self._subtitle_auto_follow = False
+
+    def _resume_subtitle_auto_follow(self) -> None:
+        self._subtitle_auto_follow = True
+        self._current_subtitle_row = -1
+        if self._player.duration() > 0:
+            self._sync_subtitle_highlight(self._player.position() / 1000.0, force=True)
+
+    def _maybe_resume_subtitle_auto_follow(self) -> None:
+        if self._subtitle_menu_open or self.subtitle_list.underMouse():
+            return
+        self._resume_subtitle_auto_follow()
+
+    def _on_subtitle_context_menu(self, pos) -> None:
+        self._pause_subtitle_auto_follow()
+        self._subtitle_menu_open = True
+        try:
+            item = self.subtitle_list.itemAt(pos)
+            if item is None:
+                return
+            row = self.subtitle_list.row(item)
+            if row < 0 or row >= len(self._segments):
+                return
+
+            menu = QMenu(self)
+            copy_action = menu.addAction("复制")
+            edit_action = menu.addAction("编辑")
+            edit_action.setEnabled(self._subtitle_editing_allowed())
+            chosen = menu.exec(self.subtitle_list.mapToGlobal(pos))
+            if chosen == copy_action:
+                self._copy_subtitle_text(row)
+            elif chosen == edit_action:
+                self._edit_subtitle_text(row)
+        finally:
+            self._subtitle_menu_open = False
+            QTimer.singleShot(0, self._maybe_resume_subtitle_auto_follow)
+
+    def _subtitle_editing_allowed(self) -> bool:
+        if self._live_worker and self._live_worker.isRunning():
+            return False
+        if self._live_mode:
+            return False
+        index = self.subtitle_combo.currentIndex()
+        if index >= 0 and self.subtitle_combo.itemData(index) == "__live__":
+            return False
+        save_path = self._current_subtitle_save_path()
+        if save_path is not None and save_path.name.lower().endswith(".partial"):
+            return False
+        return True
+
+    def _copy_subtitle_text(self, row: int) -> None:
+        if row < 0 or row >= len(self._segments):
+            return
+        QGuiApplication.clipboard().setText(self._segments[row].text)
+
+    def _edit_subtitle_text(self, row: int) -> None:
+        if row < 0 or row >= len(self._segments):
+            return
+        if not self._subtitle_editing_allowed():
+            QMessageBox.information(
+                self,
+                "提示",
+                "边播边转尚未完成，暂不可编辑字幕。请等待转写结束后再修改。",
+            )
+            return
+        seg = self._segments[row]
+        result = SubtitleEditDialog.edit_segment(seg, self)
+        if result is None:
+            return
+        new_start, new_text = result
+        if new_start == seg.start and new_text == seg.text:
+            return
+        self._segments[row] = SubtitleSegment(seg.index, new_start, seg.end, new_text)
+        item = self.subtitle_list.item(row)
+        if item is not None:
+            item.setText(self._format_subtitle_item(self._segments[row]))
+        self._persist_subtitle_edits()
+
+    def _current_subtitle_save_path(self) -> Path | None:
+        if not self._media_path:
+            return None
+        if self._live_mode:
+            _output_path, partial_path = sync_subtitle_paths(self._media_path, self._config)
+            return partial_path
+        index = self.subtitle_combo.currentIndex()
+        if index < 0:
+            return None
+        path_value = self.subtitle_combo.itemData(index)
+        if not path_value or path_value == "__live__":
+            return None
+        return Path(str(path_value))
+
+    def _subtitle_format_for_path(self, path: Path) -> str:
+        name = path.name.lower()
+        if name.endswith(".srt.partial"):
+            return "srt"
+        if name.endswith(".vtt.partial"):
+            return "vtt"
+        suffix = path.suffix.lower().lstrip(".")
+        if suffix in {"srt", "vtt", "txt"}:
+            return suffix
+        return self._config.output_format or "srt"
+
+    def _persist_subtitle_edits(self) -> None:
+        path = self._current_subtitle_save_path()
+        if path is None:
+            QMessageBox.information(self, "提示", "当前没有可保存的字幕文件。")
+            return
+        fmt = self._subtitle_format_for_path(path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_subtitle_file(self._segments, path, fmt)
+        except OSError as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
 
     def toggle_playback_from_video(self) -> None:
         if self._media_path is None:
@@ -711,15 +1023,19 @@ class PlayerWindow(QMainWindow):
             ):
                 self._media_area_click_timer.start()
                 return True
-        subtitle_panel = getattr(self, "_subtitle_panel", None)
-        if subtitle_panel is not None and obj is subtitle_panel:
-            if event.type() == QEvent.Type.Enter:
-                self._subtitle_auto_follow = False
-            elif event.type() == QEvent.Type.Leave:
-                self._subtitle_auto_follow = True
-                self._current_subtitle_row = -1
-                if self._player.duration() > 0:
-                    self._sync_subtitle_highlight(self._player.position() / 1000.0, force=True)
+        subtitle_list = getattr(self, "subtitle_list", None)
+        if subtitle_list is not None and obj is subtitle_list:
+            event_type = event.type()
+            if event_type == QEvent.Type.Enter:
+                self._pause_subtitle_auto_follow()
+            elif event_type == QEvent.Type.Leave:
+                QTimer.singleShot(0, self._maybe_resume_subtitle_auto_follow)
+            elif event_type in (
+                QEvent.Type.Wheel,
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.Scroll,
+            ):
+                self._pause_subtitle_auto_follow()
         return super().eventFilter(obj, event)
 
     def _on_slider_pressed(self) -> None:
@@ -823,6 +1139,21 @@ class PlayerWindow(QMainWindow):
                 self.subtitle_combo.setCurrentIndex(0)
                 self._load_subtitle_at_index(0)
 
+    def _on_inference_device_changed(self, _index: int) -> None:
+        value = self.inference_combo.currentData()
+        if not value or value == self._config.inference_device:
+            return
+        self._config.inference_device = value
+        save_config(self._config)
+        clear_model_cache()
+        if value == "gpu" and not is_cuda_available():
+            QMessageBox.information(
+                self,
+                "GPU 不可用",
+                "当前未安装 CUDA 版 pywhispercpp。\n"
+                "请先运行 subtitle_app/安装CUDA推理.bat，否则将自动使用 CPU。",
+            )
+
     def _open_llm_settings(self) -> None:
         self._config = load_config()
         updated = LlmSettingsDialog.open_settings(self._config, self)
@@ -871,6 +1202,7 @@ class PlayerWindow(QMainWindow):
                 f"• 将调用 DeepSeek API（可能产生费用）\n"
                 f"• 保存至：{notes_path.name}"
                 f"{overwrite_hint}\n\n"
+                "下一步可在弹出窗口中选择字幕类型并确认 Prompt。\n\n"
                 "是否继续？"
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -879,15 +1211,147 @@ class PlayerWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        self.ai_notes_btn.setEnabled(False)
+        corpus_items = collect_valid_subtitle_corpus(self._media_path)
+        if not corpus_items:
+            QMessageBox.warning(self, "无法生成", "未找到有效字幕文件，无法生成笔记。")
+            return
+
+        corpus_text = corpus_to_text(corpus_items)
+        edit_result = AiNotesCorpusDialog.edit_prompt(
+            self._media_path.name,
+            corpus_text,
+            self._config.ai_notes_subtitle_type,
+            subcategories=dict(self._config.ai_notes_subcategory),
+            user_contexts=dict(self._config.ai_notes_user_context),
+            parent=self,
+        )
+        if edit_result is None:
+            return
+
+        self._config.ai_notes_subtitle_type = edit_result.subtitle_type
+        self._config.ai_notes_subcategory = dict(edit_result.subcategory_by_type)
+        self._config.ai_notes_user_context = dict(edit_result.user_context_by_type)
+        self._config.ai_notes_template = edit_result.subtitle_type
+        save_config(self._config)
+
+        self._action_ai_notes.setEnabled(False)
         self._update_live_status("AI 笔记：准备中…")
         self._show_ai_notes_progress()
 
-        self._ai_notes_worker = AiNotesWorker(self._media_path, self._config)
+        self._ai_notes_worker = AiNotesWorker(
+            self._media_path,
+            self._config,
+            messages=edit_result.messages,
+            template_id=edit_result.subtitle_type,
+            subcategory=edit_result.subcategory_by_type.get(edit_result.subtitle_type, ""),
+        )
         self._ai_notes_worker.status_changed.connect(self._on_ai_notes_status)
         self._ai_notes_worker.finished_ok.connect(self._on_ai_notes_finished)
         self._ai_notes_worker.failed.connect(self._on_ai_notes_failed)
         self._ai_notes_worker.start()
+
+    def _current_subtitle_source(self) -> tuple[str, str] | None:
+        if self.subtitle_combo.count() <= 0:
+            return None
+        index = self.subtitle_combo.currentIndex()
+        if index < 0:
+            return None
+        label = self.subtitle_combo.currentText()
+        path_value = self.subtitle_combo.itemData(index)
+        if path_value == "__live__":
+            filename = f"{self._media_path.stem}.srt.partial" if self._media_path else "live.srt.partial"
+            return label, filename
+        if path_value:
+            return label, Path(str(path_value)).name
+        return label, label
+
+    def _export_plain_text(self) -> None:
+        if not self._media_path:
+            QMessageBox.information(self, "提示", "请先打开媒体文件。")
+            return
+        if not self._segments:
+            QMessageBox.information(self, "提示", "当前没有可导出的字幕。请先加载或生成字幕。")
+            return
+
+        source = self._current_subtitle_source()
+        subtitle_label = source[0] if source else "字幕"
+        subtitle_filename = source[1] if source else "subtitle.srt"
+
+        options = SubtitleTextDialog.get_options(subtitle_label, self)
+        if options is None:
+            return
+
+        try:
+            media_duration = self._player.duration() / 1000.0
+            if media_duration <= 0:
+                media_duration = None
+            output_path = export_plain_text_markdown(
+                self._media_path,
+                self._segments,
+                subtitle_label=subtitle_label,
+                subtitle_filename=subtitle_filename,
+                options=options,
+                media_duration_seconds=media_duration,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "纯文字导出失败", str(exc))
+            return
+
+        QMessageBox.information(
+            self,
+            "纯文字版已生成",
+            f"Markdown：\n{output_path}",
+        )
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(output_path.resolve())))
+
+    def _generate_vocabulary_list(self) -> None:
+        if not self._media_path:
+            QMessageBox.information(self, "提示", "请先打开媒体文件。")
+            return
+        if self._vocabulary_worker and self._vocabulary_worker.isRunning():
+            QMessageBox.information(self, "提示", "生词表正在生成中，请稍候。")
+            return
+
+        options = VocabularyDialog.get_options(self)
+        if options is None:
+            return
+
+        self._action_vocabulary.setEnabled(False)
+        self._update_live_status("生词表：分析中…")
+
+        self._vocabulary_worker = VocabularyWorker(self._media_path, options, self._config)
+        self._vocabulary_worker.status_changed.connect(self._on_vocabulary_status)
+        self._vocabulary_worker.finished_ok.connect(self._on_vocabulary_finished)
+        self._vocabulary_worker.failed.connect(self._on_vocabulary_failed)
+        self._vocabulary_worker.start()
+
+    def _on_vocabulary_status(self, message: str) -> None:
+        self._update_live_status(f"生词表：{message}")
+
+    def _on_vocabulary_finished(self, markdown_path: str, csv_path: str) -> None:
+        self._action_vocabulary.setEnabled(True)
+        self._vocabulary_worker = None
+        self._update_live_status("")
+        QMessageBox.information(
+            self,
+            "生词表已生成",
+            f"Markdown：\n{markdown_path}\n\nCSV：\n{csv_path}",
+        )
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(markdown_path).resolve())))
+
+    def _on_vocabulary_failed(self, message: str) -> None:
+        self._action_vocabulary.setEnabled(True)
+        self._vocabulary_worker = None
+        self._update_live_status("")
+        QMessageBox.warning(self, "生词表生成失败", message)
+
+    def _stop_vocabulary_worker(self) -> None:
+        if self._vocabulary_worker and self._vocabulary_worker.isRunning():
+            self._vocabulary_worker.cancel()
+            self._vocabulary_worker.wait(3000)
+        self._vocabulary_worker = None
+        if hasattr(self, "_action_vocabulary"):
+            self._action_vocabulary.setEnabled(True)
 
     def _show_ai_notes_progress(self) -> None:
         self._close_ai_notes_progress()
@@ -909,7 +1373,7 @@ class PlayerWindow(QMainWindow):
             self._ai_notes_progress.set_status(message)
 
     def _on_ai_notes_finished(self, output_path: str) -> None:
-        self.ai_notes_btn.setEnabled(True)
+        self._action_ai_notes.setEnabled(True)
         self._ai_notes_worker = None
         self._update_live_status("")
         self._update_notes_buttons()
@@ -936,7 +1400,7 @@ class PlayerWindow(QMainWindow):
             )
 
     def _on_ai_notes_failed(self, message: str) -> None:
-        self.ai_notes_btn.setEnabled(True)
+        self._action_ai_notes.setEnabled(True)
         self._ai_notes_worker = None
         self._update_live_status("")
         hint = ""
@@ -962,7 +1426,7 @@ class PlayerWindow(QMainWindow):
             self._ai_notes_worker.cancel()
             self._ai_notes_worker.wait(3000)
         self._ai_notes_worker = None
-        self.ai_notes_btn.setEnabled(True)
+        self._action_ai_notes.setEnabled(True)
         self._close_ai_notes_progress()
 
     def _on_player_error(self, error: QMediaPlayer.Error, message: str = "") -> None:
@@ -992,9 +1456,11 @@ class PlayerWindow(QMainWindow):
         event.acceptProposedAction()
 
     def closeEvent(self, event) -> None:
+        self._study_countdown_timer.stop()
         self._persist_last_media_dir()
         self._stop_live_transcribe()
         self._stop_ai_notes_worker()
+        self._stop_vocabulary_worker()
         self._player.stop()
         if self._transcribe_window is not None:
             self._transcribe_window.close()

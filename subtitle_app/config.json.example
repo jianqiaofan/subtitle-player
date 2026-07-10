@@ -3,9 +3,18 @@
   "language": "zh",
   "output_format": "srt",
   "model_path": "请填写 Whisper GGML 模型路径，例如 ../win系统模型中等.bin",
+  "inference_device": "auto",
   "n_threads": 0,
   "deepseek_api_key": "请在此填写 DeepSeek API Key",
   "deepseek_base_url": "https://api.deepseek.com",
   "deepseek_model": "deepseek-v4-flash",
+  "ai_notes_subtitle_type": "learning",
+  "ai_notes_subcategory": {
+    "learning": "英语",
+    "movie": "中文原文"
+  },
+  "ai_notes_user_context": {},
+  "ai_notes_template": "learning",
+  "ecdict_db_path": "",
   "last_media_dir": ""
 }

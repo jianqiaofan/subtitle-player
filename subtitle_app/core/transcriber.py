@@ -13,6 +13,7 @@ ProgressCallback = Callable[[str], None]
 
 _model_cache: dict[str, object] = {}
 _last_language_mode: str | None = None
+_last_inference_device: str | None = None
 
 SAMPLE_RATE = 16000
 
@@ -27,13 +28,44 @@ def _site_packages_dir() -> Path:
     return Path(site.getsitepackages()[-1])
 
 
+def is_cuda_available() -> bool:
+    return any(_site_packages_dir().glob("ggml-cuda*.dll"))
+
+
 def _cuda_backend_label() -> str:
-    root = _site_packages_dir()
-    if any(root.glob("ggml-cuda*.dll")):
+    if is_cuda_available():
         return "CUDA (GPU)"
-    if any(root.glob("ggml-cpu*.dll")):
+    if any(_site_packages_dir().glob("ggml-cpu*.dll")):
         return "CPU"
     return "未知"
+
+
+def resolve_inference_backend(config: AppConfig) -> tuple[bool, str]:
+    """根据配置解析是否启用 GPU，返回 (use_gpu, 日志显示标签)。"""
+    pref = (config.inference_device or "auto").strip().lower()
+    cuda_ok = is_cuda_available()
+
+    if pref == "cpu":
+        return False, "CPU"
+    if pref == "gpu":
+        if cuda_ok:
+            return True, "CUDA (GPU)"
+        return False, "CPU（未检测到 CUDA 版 pywhispercpp，已回退）"
+    if cuda_ok:
+        return True, "CUDA (GPU)"
+    return False, "CPU"
+
+
+def clear_model_cache() -> None:
+    global _last_language_mode, _last_inference_device
+    _model_cache.clear()
+    _last_language_mode = None
+    _last_inference_device = None
+
+
+def _model_cache_key(config: AppConfig, use_gpu: bool) -> str:
+    model_path = config.validate_model()
+    return f"{model_path.resolve()}|gpu={use_gpu}|threads={config.resolved_n_threads()}"
 
 
 def _setup_windows_dll_paths() -> None:
@@ -72,27 +104,47 @@ def _setup_windows_dll_paths() -> None:
 
 
 def get_whisper_model(config: AppConfig, on_log: ProgressCallback | None = None):
-    global _last_language_mode
+    global _last_language_mode, _last_inference_device
+    device_pref = (config.inference_device or "auto").strip().lower()
     if _last_language_mode is not None and _last_language_mode != config.language:
-        _model_cache.clear()
+        clear_model_cache()
         if on_log:
             on_log("语种模式已变更，重新加载模型...")
+    if _last_inference_device is not None and _last_inference_device != device_pref:
+        clear_model_cache()
+        if on_log:
+            on_log("推理设备已变更，重新加载模型...")
     _last_language_mode = config.language
+    _last_inference_device = device_pref
 
     _setup_windows_dll_paths()
     from pywhispercpp.model import Model
 
-    model_path = config.validate_model()
-    key = str(model_path.resolve())
+    use_gpu, backend_label = resolve_inference_backend(config)
+    key = _model_cache_key(config, use_gpu)
     if key in _model_cache:
         return _model_cache[key]
 
+    model_path = config.validate_model()
     if on_log:
         on_log(f"正在加载模型: {model_path.name}")
-        on_log(f"推理后端: {_cuda_backend_label()}")
+        on_log(f"推理设备: {backend_label}")
+        if device_pref == "gpu" and not use_gpu:
+            on_log("提示: 请运行 subtitle_app/安装CUDA推理.bat 编译 CUDA 版 pywhispercpp。")
         on_log(f"推理线程数: {config.resolved_n_threads()}")
+        installed = _cuda_backend_label()
+        if installed != backend_label.split("（")[0]:
+            on_log(f"已安装后端库: {installed}")
 
-    model = Model(str(model_path), n_threads=config.resolved_n_threads())
+    context_params = {"use_gpu": use_gpu}
+    if use_gpu:
+        context_params["flash_attn"] = False
+
+    model = Model(
+        str(model_path),
+        n_threads=config.resolved_n_threads(),
+        context_params=context_params,
+    )
     _model_cache[key] = model
     if on_log:
         on_log("模型加载完成")
@@ -123,7 +175,8 @@ def _language_mode_label(config: AppConfig) -> str:
     return labels.get(config.language, config.language)
 
 
-def _segments_from_raw(raw_segments, time_offset_cs: int = 0) -> list[SubtitleSegment]:
+def _segments_from_raw(raw_segments, time_offset_sec: float = 0.0) -> list[SubtitleSegment]:
+    offset_ms = round(time_offset_sec * 1000)
     segments: list[SubtitleSegment] = []
     for seg in raw_segments:
         text = (seg.text or "").strip()
@@ -132,8 +185,8 @@ def _segments_from_raw(raw_segments, time_offset_cs: int = 0) -> list[SubtitleSe
         segments.append(
             SubtitleSegment(
                 0,
-                (seg.t0 + time_offset_cs) / 100.0,
-                (seg.t1 + time_offset_cs) / 100.0,
+                (seg.t0 * 10 + offset_ms) / 1000.0,
+                (seg.t1 * 10 + offset_ms) / 1000.0,
                 text,
             )
         )
@@ -183,8 +236,8 @@ def transcribe_mixed(
             detect_language=False,
             translate=False,
         )
-        time_offset_cs = int(region.start_sec * 100)
-        merged.extend(_segments_from_raw(raw_segments, time_offset_cs))
+        time_offset_sec = region.start_sec
+        merged.extend(_segments_from_raw(raw_segments, time_offset_sec))
 
         if on_log:
             on_log(f"  本分片字幕 {len(raw_segments)} 条")
@@ -234,8 +287,8 @@ def transcribe_region_mixed(
         detect_language=False,
         translate=False,
     )
-    time_offset_cs = int(region.start_sec * 100)
-    return _segments_from_raw(raw_segments, time_offset_cs)
+    time_offset_sec = region.start_sec
+    return _segments_from_raw(raw_segments, time_offset_sec)
 
 
 def transcribe(

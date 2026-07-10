@@ -18,6 +18,9 @@ build/
 *.partial
 *.srt.partial
 *_AI笔记.md
+*_生词表_*.md
+*_生词表_*.csv
+*_纯文字*.md
 
 # Whisper 模型（体积过大，勿提交）
 *.bin

@@ -13,13 +13,65 @@ class SubtitleSegment:
 
 
 def format_timestamp(seconds: float, vtt: bool = False) -> str:
-    millis = int(round(seconds * 1000))
+    millis = int(round(seconds * 1000 + 1e-9))
     hours, rem = divmod(millis, 3_600_000)
     minutes, rem = divmod(rem, 60_000)
     secs, ms = divmod(rem, 1000)
     if vtt:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def _normalize_timestamp_token(value: str) -> str:
+    return value.strip().split()[0]
+
+
+def _fraction_to_millis(fraction: str) -> int:
+    digits = "".join(ch for ch in fraction if ch.isdigit())
+    if not digits:
+        return 0
+    if len(digits) <= 3:
+        return int(digits.ljust(3, "0"))
+    return int(digits[:3])
+
+
+def _parse_timestamp_core(value: str) -> float | None:
+    value = _normalize_timestamp_token(value.replace(",", "."))
+    if not value:
+        return None
+
+    parts = value.split(":")
+    if len(parts) == 2:
+        hours = 0
+        minutes_part, seconds_part = parts
+    elif len(parts) == 3:
+        hours_part, minutes_part, seconds_part = parts
+        hours = int(hours_part)
+    else:
+        return None
+
+    try:
+        minutes = int(minutes_part)
+        sec_parts = seconds_part.split(".", 1)
+        seconds = int(sec_parts[0])
+        millis = _fraction_to_millis(sec_parts[1]) if len(sec_parts) > 1 else 0
+    except ValueError:
+        return None
+
+    if minutes < 0 or minutes >= 60 or seconds < 0 or seconds >= 60:
+        return None
+    if millis < 0 or millis >= 1000:
+        return None
+    return hours * 3600 + minutes * 60 + seconds + millis / 1000
+
+
+def parse_timestamp(value: str) -> float:
+    parsed = _parse_timestamp_core(value)
+    return parsed if parsed is not None else 0.0
+
+
+def try_parse_timestamp(value: str) -> float | None:
+    return _parse_timestamp_core(value)
 
 
 def segments_to_srt(segments: list[SubtitleSegment]) -> str:
@@ -55,19 +107,6 @@ def write_subtitle_file(segments: list[SubtitleSegment], output_path: Path, fmt:
         content = segments_to_txt(segments)
     output_path.write_text(content, encoding="utf-8")
     return output_path
-
-
-def parse_timestamp(value: str) -> float:
-    value = value.replace(",", ".").strip()
-    parts = value.split(":")
-    if len(parts) != 3:
-        return 0.0
-    hours = int(parts[0])
-    minutes = int(parts[1])
-    sec_parts = parts[2].split(".")
-    seconds = int(sec_parts[0])
-    millis = int(sec_parts[1]) if len(sec_parts) > 1 else 0
-    return hours * 3600 + minutes * 60 + seconds + millis / 1000
 
 
 def load_subtitle_file(path: Path) -> list[SubtitleSegment]:

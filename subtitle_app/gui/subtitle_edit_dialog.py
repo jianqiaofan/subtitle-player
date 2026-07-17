@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -49,17 +50,22 @@ class SubtitleEditDialog(QDialog):
         self.minute_edit = self._make_time_edit(f"{minutes:02d}", 2, "分")
         self.second_edit = self._make_time_edit(f"{seconds:02d}", 2, "秒")
         self.millis_edit = self._make_time_edit(f"{millis:03d}", 3, "毫秒")
+        second_stepper = self._make_second_stepper(self.second_edit)
 
         time_row = QHBoxLayout()
         time_row.setSpacing(6)
+        time_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         for label_text, edit in (
             ("时", self.hour_edit),
             ("分", self.minute_edit),
-            ("秒", self.second_edit),
-            ("毫秒", self.millis_edit),
         ):
             time_row.addWidget(QLabel(label_text))
             time_row.addWidget(edit)
+        time_row.addWidget(QLabel("秒"))
+        time_row.addWidget(self.second_edit)
+        time_row.addWidget(second_stepper)
+        time_row.addWidget(QLabel("毫秒"))
+        time_row.addWidget(self.millis_edit)
         time_row.addStretch()
 
         time_widget = QWidget()
@@ -94,6 +100,48 @@ class SubtitleEditDialog(QDialog):
         edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
         edit.setToolTip(tooltip)
         return edit
+
+    def _make_second_stepper(self, second_edit: QLineEdit) -> QWidget:
+        edit_height = max(second_edit.sizeHint().height(), 24)
+        half_height = edit_height // 2
+        btn_width = 22
+
+        up_btn = QToolButton()
+        up_btn.setText("+")
+        up_btn.setToolTip("秒 +1")
+        up_btn.setFixedSize(btn_width, half_height)
+        up_btn.setAutoRaise(False)
+        up_btn.clicked.connect(lambda: self._nudge_seconds(1))
+
+        down_btn = QToolButton()
+        down_btn.setText("−")
+        down_btn.setToolTip("秒 -1")
+        down_btn.setFixedSize(btn_width, edit_height - half_height)
+        down_btn.setAutoRaise(False)
+        down_btn.clicked.connect(lambda: self._nudge_seconds(-1))
+
+        for btn in (up_btn, down_btn):
+            btn.setStyleSheet(
+                "QToolButton { padding: 0; margin: 0; font-size: 11px; }"
+            )
+
+        stepper = QWidget()
+        stepper.setFixedSize(btn_width, edit_height)
+        column = QVBoxLayout(stepper)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        column.addWidget(up_btn)
+        column.addWidget(down_btn)
+        return stepper
+
+    def _nudge_seconds(self, delta: int) -> None:
+        text = self.second_edit.text().strip()
+        try:
+            value = int(text) if text else 0
+        except ValueError:
+            value = 0
+        value = max(0, min(59, value + delta))
+        self.second_edit.setText(f"{value:02d}")
 
     def _parse_start_seconds(self) -> float | None:
         fields = (

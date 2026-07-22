@@ -56,7 +56,7 @@ def find_valid_subtitles(media_path: Path) -> list[tuple[Path, str]]:
 
 
 def auto_load_choice(media_path: Path) -> SubtitleChoice | None:
-    """打开媒体时：完整同步字幕直接加载；未完成则续转；否则加载其它有效字幕。"""
+    """打开媒体时：完整/未完成同步字幕与其它有效字幕均仅加载，不自动开始边播边转。"""
     sync = assess_sync_subtitle(media_path, load_config())
 
     if sync.status == SyncSubtitleStatus.COMPLETE and sync.subtitle_path:
@@ -68,7 +68,7 @@ def auto_load_choice(media_path: Path) -> SubtitleChoice | None:
 
     if sync.status == SyncSubtitleStatus.INCOMPLETE and sync.subtitle_path:
         return SubtitleChoice(
-            SubtitleAction.RESUME_LIVE_TRANSCRIBE,
+            SubtitleAction.USE_EXISTING,
             subtitle_path=sync.subtitle_path,
             label=LIVE_SYNC_FILENAME_LABEL,
         )
@@ -95,11 +95,11 @@ def auto_load_choice(media_path: Path) -> SubtitleChoice | None:
 
 
 def default_subtitle_choice(media_path: Path) -> SubtitleChoice:
-    """无交互时的默认策略：有可用字幕则用，否则边播边转。"""
+    """无交互时的默认策略：有可用字幕则加载，否则不做任何转写。"""
     auto = auto_load_choice(media_path)
     if auto is not None:
         return auto
-    return SubtitleChoice(SubtitleAction.LIVE_TRANSCRIBE, label=LIVE_SYNC_FILENAME_LABEL)
+    return SubtitleChoice(SubtitleAction.NONE)
 
 
 def has_preferred_subtitle(media_path: Path, label: str = LIVE_DEFAULT_LABEL) -> bool:

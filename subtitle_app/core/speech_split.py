@@ -123,15 +123,16 @@ def build_speech_regions_for_media(
     media_path: Path,
     work_dir: Path,
     *,
-    long_video_threshold_sec: float = 1800.0,
+    # 2 小时内整段提取一次，避免边播边转时反复打开源文件与播放器抢句柄。
+    long_video_threshold_sec: float = 7200.0,
     window_sec: float = 600.0,
     on_progress: Callable[[str], None] | None = None,
     on_regions_batch: Callable[[list[SpeechRegion]], None] | None = None,
 ) -> list[SpeechRegion]:
     """
     为媒体构建语音分片列表。
-    短视频：提取完整 WAV 后一次性分析；
-    长视频（>=30min）：按窗口逐段提取并分析，避免长时间等待与过高内存占用。
+    常规时长：提取完整 WAV 后一次性分析；
+    超长视频（默认 >=2h）：按窗口逐段提取并分析，避免长时间等待与过高内存占用。
     """
     all_regions: list[SpeechRegion] = []
     for batch in iter_speech_regions_for_media(
@@ -151,7 +152,8 @@ def iter_speech_regions_for_media(
     media_path: Path,
     work_dir: Path,
     *,
-    long_video_threshold_sec: float = 1800.0,
+    # 2 小时内整段提取一次，避免边播边转时反复打开源文件与播放器抢句柄。
+    long_video_threshold_sec: float = 7200.0,
     window_sec: float = 600.0,
     on_progress: Callable[[str], None] | None = None,
 ):

@@ -40,39 +40,27 @@ class SubtitleEditDialog(QDialog):
         self.setStyleSheet(DARK_STYLE)
 
         layout = QVBoxLayout(self)
-        end_label = format_timestamp(segment.end)
-        layout.addWidget(
-            QLabel(f"第 {segment.index} 条 · 结束时间 {end_label}")
-        )
+        layout.addWidget(QLabel(f"第 {segment.index} 条"))
 
-        hours, minutes, seconds, millis = _seconds_to_parts(segment.start)
-        self.hour_edit = self._make_time_edit(f"{hours:02d}", 3, "时")
-        self.minute_edit = self._make_time_edit(f"{minutes:02d}", 2, "分")
-        self.second_edit = self._make_time_edit(f"{seconds:02d}", 2, "秒")
-        self.millis_edit = self._make_time_edit(f"{millis:03d}", 3, "毫秒")
-        second_stepper = self._make_second_stepper(self.second_edit)
+        (
+            self.hour_edit,
+            self.minute_edit,
+            self.second_edit,
+            self.millis_edit,
+            start_widget,
+        ) = self._make_time_row(segment.start)
 
-        time_row = QHBoxLayout()
-        time_row.setSpacing(6)
-        time_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
-        for label_text, edit in (
-            ("时", self.hour_edit),
-            ("分", self.minute_edit),
-        ):
-            time_row.addWidget(QLabel(label_text))
-            time_row.addWidget(edit)
-        time_row.addWidget(QLabel("秒"))
-        time_row.addWidget(self.second_edit)
-        time_row.addWidget(second_stepper)
-        time_row.addWidget(QLabel("毫秒"))
-        time_row.addWidget(self.millis_edit)
-        time_row.addStretch()
-
-        time_widget = QWidget()
-        time_widget.setLayout(time_row)
+        (
+            self.end_hour_edit,
+            self.end_minute_edit,
+            self.end_second_edit,
+            self.end_millis_edit,
+            end_widget,
+        ) = self._make_time_row(segment.end)
 
         form = QFormLayout()
-        form.addRow("起始时间", time_widget)
+        form.addRow("起始时间", start_widget)
+        form.addRow("终止时间", end_widget)
 
         self.text_edit = QPlainTextEdit(segment.text)
         self.text_edit.setMinimumHeight(120)
@@ -80,7 +68,7 @@ class SubtitleEditDialog(QDialog):
 
         layout.addLayout(form)
 
-        hint = QLabel("修改起始时间后，结束时间保持不变。")
+        hint = QLabel("若起始时间不早于终止时间，终止时间将自动调整为起始时间 +1 秒。")
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -91,6 +79,44 @@ class SubtitleEditDialog(QDialog):
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+        for edit in (
+            self.hour_edit,
+            self.minute_edit,
+            self.second_edit,
+            self.millis_edit,
+        ):
+            edit.textChanged.connect(self._ensure_end_after_start)
+
+    def _make_time_row(
+        self, seconds: float
+    ) -> tuple[QLineEdit, QLineEdit, QLineEdit, QLineEdit, QWidget]:
+        hours, minutes, secs, millis = _seconds_to_parts(seconds)
+        hour_edit = self._make_time_edit(f"{hours:02d}", 3, "时")
+        minute_edit = self._make_time_edit(f"{minutes:02d}", 2, "分")
+        second_edit = self._make_time_edit(f"{secs:02d}", 2, "秒")
+        millis_edit = self._make_time_edit(f"{millis:03d}", 3, "毫秒")
+        second_stepper = self._make_second_stepper(second_edit)
+
+        time_row = QHBoxLayout()
+        time_row.setSpacing(6)
+        time_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        for label_text, edit in (
+            ("时", hour_edit),
+            ("分", minute_edit),
+        ):
+            time_row.addWidget(QLabel(label_text))
+            time_row.addWidget(edit)
+        time_row.addWidget(QLabel("秒"))
+        time_row.addWidget(second_edit)
+        time_row.addWidget(second_stepper)
+        time_row.addWidget(QLabel("毫秒"))
+        time_row.addWidget(millis_edit)
+        time_row.addStretch()
+
+        time_widget = QWidget()
+        time_widget.setLayout(time_row)
+        return hour_edit, minute_edit, second_edit, millis_edit, time_widget
 
     @staticmethod
     def _make_time_edit(value: str, max_length: int, tooltip: str) -> QLineEdit:
@@ -111,14 +137,14 @@ class SubtitleEditDialog(QDialog):
         up_btn.setToolTip("秒 +1")
         up_btn.setFixedSize(btn_width, half_height)
         up_btn.setAutoRaise(False)
-        up_btn.clicked.connect(lambda: self._nudge_seconds(1))
+        up_btn.clicked.connect(lambda: self._nudge_seconds(second_edit, 1))
 
         down_btn = QToolButton()
         down_btn.setText("−")
         down_btn.setToolTip("秒 -1")
         down_btn.setFixedSize(btn_width, edit_height - half_height)
         down_btn.setAutoRaise(False)
-        down_btn.clicked.connect(lambda: self._nudge_seconds(-1))
+        down_btn.clicked.connect(lambda: self._nudge_seconds(second_edit, -1))
 
         for btn in (up_btn, down_btn):
             btn.setStyleSheet(
@@ -134,21 +160,27 @@ class SubtitleEditDialog(QDialog):
         column.addWidget(down_btn)
         return stepper
 
-    def _nudge_seconds(self, delta: int) -> None:
-        text = self.second_edit.text().strip()
+    def _nudge_seconds(self, second_edit: QLineEdit, delta: int) -> None:
+        text = second_edit.text().strip()
         try:
             value = int(text) if text else 0
         except ValueError:
             value = 0
         value = max(0, min(59, value + delta))
-        self.second_edit.setText(f"{value:02d}")
+        second_edit.setText(f"{value:02d}")
 
-    def _parse_start_seconds(self) -> float | None:
+    @staticmethod
+    def _parse_time_fields(
+        hour_edit: QLineEdit,
+        minute_edit: QLineEdit,
+        second_edit: QLineEdit,
+        millis_edit: QLineEdit,
+    ) -> float | None:
         fields = (
-            self.hour_edit.text().strip(),
-            self.minute_edit.text().strip(),
-            self.second_edit.text().strip(),
-            self.millis_edit.text().strip(),
+            hour_edit.text().strip(),
+            minute_edit.text().strip(),
+            second_edit.text().strip(),
+            millis_edit.text().strip(),
         )
         if not all(fields):
             return None
@@ -159,6 +191,37 @@ class SubtitleEditDialog(QDialog):
         if minutes >= 60 or seconds >= 60 or millis >= 1000:
             return None
         return _parts_to_seconds(hours, minutes, seconds, millis)
+
+    def _parse_start_seconds(self) -> float | None:
+        return self._parse_time_fields(
+            self.hour_edit,
+            self.minute_edit,
+            self.second_edit,
+            self.millis_edit,
+        )
+
+    def _parse_end_seconds(self) -> float | None:
+        return self._parse_time_fields(
+            self.end_hour_edit,
+            self.end_minute_edit,
+            self.end_second_edit,
+            self.end_millis_edit,
+        )
+
+    def _set_end_seconds(self, seconds: float) -> None:
+        hours, minutes, secs, millis = _seconds_to_parts(seconds)
+        self.end_hour_edit.setText(f"{hours:02d}")
+        self.end_minute_edit.setText(f"{minutes:02d}")
+        self.end_second_edit.setText(f"{secs:02d}")
+        self.end_millis_edit.setText(f"{millis:03d}")
+
+    def _ensure_end_after_start(self) -> None:
+        start = self._parse_start_seconds()
+        end = self._parse_end_seconds()
+        if start is None or end is None:
+            return
+        if start >= end:
+            self._set_end_seconds(start + 1.0)
 
     def _on_accept(self) -> None:
         new_start = self._parse_start_seconds()
@@ -173,22 +236,40 @@ class SubtitleEditDialog(QDialog):
         if new_start < 0:
             QMessageBox.warning(self, "格式错误", "起始时间不能为负数。")
             return
-        if new_start >= self._segment.end:
+
+        self._ensure_end_after_start()
+
+        new_end = self._parse_end_seconds()
+        if new_end is None:
             QMessageBox.warning(
                 self,
                 "格式错误",
-                f"起始时间必须早于结束时间（{format_timestamp(self._segment.end)}）。",
+                "请填写完整的终止时间，时/分/秒/毫秒均须为整数。\n"
+                "分、秒范围为 0～59，毫秒范围为 0～999。",
+            )
+            return
+        if new_end < 0:
+            QMessageBox.warning(self, "格式错误", "终止时间不能为负数。")
+            return
+        if new_start >= new_end:
+            QMessageBox.warning(
+                self,
+                "格式错误",
+                f"起始时间必须早于终止时间（{format_timestamp(new_end)}）。",
             )
             return
         self.accept()
 
-    def values(self) -> tuple[float, str]:
+    def values(self) -> tuple[float, float, str]:
         start = self._parse_start_seconds()
-        assert start is not None
-        return start, self.text_edit.toPlainText()
+        end = self._parse_end_seconds()
+        assert start is not None and end is not None
+        return start, end, self.text_edit.toPlainText()
 
     @staticmethod
-    def edit_segment(segment: SubtitleSegment, parent=None) -> tuple[float, str] | None:
+    def edit_segment(
+        segment: SubtitleSegment, parent=None
+    ) -> tuple[float, float, str] | None:
         dialog = SubtitleEditDialog(segment, parent)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None

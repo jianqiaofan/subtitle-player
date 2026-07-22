@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import QEvent, Qt, QTimer, QUrl
@@ -34,6 +35,14 @@ from PyQt6.QtWidgets import (
     QWidget,
     QWidgetAction,
 )
+
+_RECOVERABLE_PLAYBACK_MARKERS = (
+    "demuxing failed",
+    "failed to seek",
+    "permission denied",
+)
+_MAX_PLAYBACK_RECOVERY_ATTEMPTS = 2
+_ERROR_DIALOG_COOLDOWN_SEC = 4.0
 
 from core.ai_notes import (
     build_notes_output_path,
@@ -163,6 +172,14 @@ class PlayerWindow(QMainWindow):
         self._study_countdown_timer = QTimer(self)
         self._study_countdown_timer.setInterval(1000)
         self._study_countdown_timer.timeout.connect(self._on_study_countdown_tick)
+        self._pending_seek_ms: int | None = None
+        self._pending_play_after_seek = False
+        self._awaiting_reload_seek = False
+        self._recovering_playback = False
+        self._playback_recovery_attempts = 0
+        self._last_good_position_ms = 0
+        self._error_dialog_suppressed_until = 0.0
+        self._saved_playback_rate = 1.0
 
         self.setWindowTitle("字幕播放器")
         self.setMinimumSize(1000, 640)
@@ -180,6 +197,7 @@ class PlayerWindow(QMainWindow):
         self._player.positionChanged.connect(self._on_position_changed)
         self._player.durationChanged.connect(self._on_duration_changed)
         self._player.playbackStateChanged.connect(self._on_playback_state_changed)
+        self._player.mediaStatusChanged.connect(self._on_media_status_changed)
         self._player.errorOccurred.connect(self._on_player_error)
 
         central = QWidget()
@@ -501,6 +519,13 @@ class PlayerWindow(QMainWindow):
         self._media_path = media_path
         self._persist_last_media_dir(media_path)
         self.media_label.setText(media_path.name)
+        self._pending_seek_ms = None
+        self._pending_play_after_seek = False
+        self._awaiting_reload_seek = False
+        self._recovering_playback = False
+        self._playback_recovery_attempts = 0
+        self._last_good_position_ms = 0
+        self._recreate_audio_output()
         self._player.setSource(QUrl.fromLocalFile(str(media_path)))
 
         is_audio = media_path.suffix.lower() in AUDIO_EXTENSIONS
@@ -508,7 +533,6 @@ class PlayerWindow(QMainWindow):
         self._audio_placeholder.setVisible(is_audio)
         if not is_audio:
             self._player.setVideoOutput(self._video_widget)
-        self._sync_audio_output_device()
 
         self.subtitle_list.clear()
         self._segments.clear()
@@ -571,29 +595,11 @@ class PlayerWindow(QMainWindow):
             self._update_notes_buttons()
             return
 
-        if choice.action == SubtitleAction.LIVE_TRANSCRIBE:
-            self._begin_live_transcribe()
-            self._update_notes_buttons()
-            return
-
-        if choice.action == SubtitleAction.RESUME_LIVE_TRANSCRIBE:
-            resume_segments: list[SubtitleSegment] = []
-            if choice.subtitle_path:
-                try:
-                    resume_segments = load_subtitles(choice.subtitle_path)
-                except Exception as exc:
-                    QMessageBox.warning(self, "字幕加载失败", str(exc))
-            self._begin_live_transcribe(resume_segments=resume_segments)
-            self._update_notes_buttons()
-            return
-
         self._live_mode = False
         self._refresh_subtitle_options()
         if self.subtitle_combo.count() > 0:
             self.subtitle_combo.setCurrentIndex(0)
             self._load_subtitle_at_index(0)
-        else:
-            self._begin_live_transcribe()
         self._update_notes_buttons()
 
     def _select_subtitle_path(self, path: Path) -> None:
@@ -682,6 +688,19 @@ class PlayerWindow(QMainWindow):
             return
         if choice.action == SubtitleAction.LIVE_TRANSCRIBE:
             self._stop_live_transcribe()
+            self._begin_live_transcribe()
+            self._update_notes_buttons()
+            return
+        if choice.action == SubtitleAction.RESUME_LIVE_TRANSCRIBE:
+            resume_segments: list[SubtitleSegment] = []
+            if choice.subtitle_path:
+                try:
+                    resume_segments = load_subtitles(choice.subtitle_path)
+                except Exception as exc:
+                    QMessageBox.warning(self, "字幕加载失败", str(exc))
+            self._begin_live_transcribe(resume_segments=resume_segments)
+            self._update_notes_buttons()
+            return
         self._apply_subtitle_choice(choice)
 
     def _confirm_live_transcribe(self) -> bool:
@@ -825,13 +844,7 @@ class PlayerWindow(QMainWindow):
         row = self.subtitle_list.row(item)
         if row < 0 or row >= len(self._segments):
             return
-        start = self._segments[row].start
-        self._seeking = True
-        self._player.setPosition(int(start * 1000))
-        self._seeking = False
-        self._notify_live_seek(start)
-        if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            self._play_media()
+        self._seek_to(self._segments[row].start, play=True)
 
     def _pause_subtitle_auto_follow(self) -> None:
         self._subtitle_auto_follow = False
@@ -903,10 +916,10 @@ class PlayerWindow(QMainWindow):
         result = SubtitleEditDialog.edit_segment(seg, self)
         if result is None:
             return
-        new_start, new_text = result
-        if new_start == seg.start and new_text == seg.text:
+        new_start, new_end, new_text = result
+        if new_start == seg.start and new_end == seg.end and new_text == seg.text:
             return
-        self._segments[row] = SubtitleSegment(seg.index, new_start, seg.end, new_text)
+        self._segments[row] = SubtitleSegment(seg.index, new_start, new_end, new_text)
         item = self.subtitle_list.item(row)
         if item is not None:
             item.setText(self._format_subtitle_item(self._segments[row]))
@@ -982,6 +995,10 @@ class PlayerWindow(QMainWindow):
             self.position_slider.blockSignals(True)
             self.position_slider.setValue(position_ms)
             self.position_slider.blockSignals(False)
+            if position_ms >= 0:
+                self._last_good_position_ms = position_ms
+                if self._playback_recovery_attempts and not self._recovering_playback:
+                    self._playback_recovery_attempts = 0
         self._update_time_label(position_ms, self._player.duration())
         self._sync_subtitle_highlight(position_ms / 1000.0)
 
@@ -1042,9 +1059,11 @@ class PlayerWindow(QMainWindow):
         self._seeking = True
 
     def _on_slider_released(self) -> None:
-        self._player.setPosition(self.position_slider.value())
         self._seeking = False
-        self._notify_live_seek(self.position_slider.value() / 1000.0)
+        was_playing = (
+            self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        self._seek_to(self.position_slider.value() / 1000.0, play=was_playing)
 
     def _on_slider_moved(self, value: int) -> None:
         if self._seeking:
@@ -1055,7 +1074,147 @@ class PlayerWindow(QMainWindow):
             return
         rate = self.speed_combo.itemData(index)
         if rate is not None:
-            self._player.setPlaybackRate(float(rate))
+            self._saved_playback_rate = float(rate)
+            self._player.setPlaybackRate(self._saved_playback_rate)
+
+    def _clamp_position_ms(self, position_ms: int) -> int:
+        position_ms = max(0, int(position_ms))
+        duration = self._player.duration()
+        if duration > 0:
+            position_ms = min(position_ms, max(0, duration - 1))
+        return position_ms
+
+    def _seek_to(self, seconds: float, *, play: bool | None = None) -> None:
+        if self._media_path is None:
+            return
+
+        position_ms = self._clamp_position_ms(int(round(float(seconds) * 1000)))
+        was_playing = (
+            self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        should_play = was_playing if play is None else play
+        self._pending_seek_ms = position_ms
+        self._pending_play_after_seek = should_play
+
+        status = self._player.mediaStatus()
+        needs_reload = (
+            self._recovering_playback
+            or self._player.error() != QMediaPlayer.Error.NoError
+            or status
+            in (
+                QMediaPlayer.MediaStatus.NoMedia,
+                QMediaPlayer.MediaStatus.InvalidMedia,
+            )
+        )
+        if needs_reload:
+            self._reload_media_at_position(position_ms, should_play)
+            return
+
+        self._seeking = True
+        if was_playing:
+            self._player.pause()
+        self._player.setPosition(position_ms)
+        self._seeking = False
+        self.position_slider.blockSignals(True)
+        self.position_slider.setValue(position_ms)
+        self.position_slider.blockSignals(False)
+        self._update_time_label(position_ms, self._player.duration())
+        self._notify_live_seek(position_ms / 1000.0)
+        if should_play:
+            QTimer.singleShot(0, self._play_media)
+
+    def _recreate_audio_output(self) -> None:
+        volume = self._audio_output.volume()
+        muted = self._audio_output.isMuted()
+        self._audio_output = QAudioOutput()
+        self._audio_output.setVolume(volume)
+        self._audio_output.setMuted(muted)
+        self._player.setAudioOutput(self._audio_output)
+        self._sync_audio_output_device()
+
+    def _reload_media_at_position(self, position_ms: int, should_play: bool) -> None:
+        if self._media_path is None:
+            return
+
+        self._recovering_playback = True
+        self._awaiting_reload_seek = True
+        self._pending_seek_ms = self._clamp_position_ms(position_ms)
+        self._pending_play_after_seek = should_play
+        self._saved_playback_rate = (
+            float(self.speed_combo.currentData() or 1.0)
+            if hasattr(self, "speed_combo")
+            else self._player.playbackRate() or 1.0
+        )
+
+        is_audio = self._media_path.suffix.lower() in AUDIO_EXTENSIONS
+        self._recreate_audio_output()
+        self._player.stop()
+        self._player.setSource(QUrl())
+        self._player.setSource(QUrl.fromLocalFile(str(self._media_path)))
+        if not is_audio:
+            self._player.setVideoOutput(self._video_widget)
+
+    def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
+        if not self._awaiting_reload_seek:
+            return
+        if status not in (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        ):
+            if status == QMediaPlayer.MediaStatus.InvalidMedia:
+                self._awaiting_reload_seek = False
+                self._recovering_playback = False
+            return
+
+        self._awaiting_reload_seek = False
+        position_ms = self._clamp_position_ms(
+            self._pending_seek_ms
+            if self._pending_seek_ms is not None
+            else self._last_good_position_ms
+        )
+        should_play = self._pending_play_after_seek
+        self._player.setPlaybackRate(self._saved_playback_rate)
+        self._seeking = True
+        self._player.setPosition(position_ms)
+        self._seeking = False
+        self.position_slider.blockSignals(True)
+        self.position_slider.setValue(position_ms)
+        self.position_slider.blockSignals(False)
+        self._update_time_label(position_ms, self._player.duration())
+        self._notify_live_seek(position_ms / 1000.0)
+        self._recovering_playback = False
+        if should_play:
+            QTimer.singleShot(0, self._play_media)
+
+    @staticmethod
+    def _is_recoverable_playback_error(detail: str) -> bool:
+        text = detail.lower()
+        return any(marker in text for marker in _RECOVERABLE_PLAYBACK_MARKERS)
+
+    def _try_recover_playback(self, detail: str) -> bool:
+        if self._media_path is None:
+            return False
+        if not self._is_recoverable_playback_error(detail):
+            return False
+        if self._recovering_playback or self._awaiting_reload_seek:
+            return True
+        if self._playback_recovery_attempts >= _MAX_PLAYBACK_RECOVERY_ATTEMPTS:
+            return False
+
+        self._playback_recovery_attempts += 1
+        target_ms = (
+            self._pending_seek_ms
+            if self._pending_seek_ms is not None
+            else self._last_good_position_ms
+        )
+        should_play = self._pending_play_after_seek
+        if (
+            self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            or should_play
+        ):
+            should_play = True
+        self._reload_media_at_position(target_ms, should_play)
+        return True
 
     def _refresh_audio_devices(self) -> None:
         current_id = self.audio_device_combo.currentData() if hasattr(self, "audio_device_combo") else None
@@ -1433,12 +1592,19 @@ class PlayerWindow(QMainWindow):
         if error == QMediaPlayer.Error.NoError:
             return
         detail = message or self._player.errorString() or "未知错误"
+        if self._try_recover_playback(detail):
+            return
+        now = time.monotonic()
+        if now < self._error_dialog_suppressed_until:
+            return
+        self._error_dialog_suppressed_until = now + _ERROR_DIALOG_COOLDOWN_SEC
         QMessageBox.warning(
             self,
             "媒体播放失败",
             f"无法播放该文件：\n{detail}\n\n"
-            "若为视频黑屏，请确认已安装 Windows「HEVC 视频扩展」或「媒体功能包」，"
-            "或尝试将视频转为 H.264 编码后再播放。",
+            "可尝试：重新打开该媒体文件后再点击字幕跳转；"
+            "若正在边播边转，请稍等转写释放文件后再试。\n"
+            "若为视频黑屏，请确认已安装 Windows「HEVC 视频扩展」或「媒体功能包」。",
         )
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:

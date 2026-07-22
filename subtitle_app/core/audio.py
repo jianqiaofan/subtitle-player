@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -93,6 +94,7 @@ def extract_audio_segment(
 
     cmd = [
         find_ffmpeg(),
+        "-nostdin",
         "-y",
         "-ss",
         f"{start_sec:.3f}",
@@ -109,15 +111,20 @@ def extract_audio_segment(
         "pcm_s16le",
         str(output_path),
     ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"音频分片提取失败：\n{result.stderr[-2000:]}")
+    last_stderr = ""
+    for attempt in range(3):
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        last_stderr = result.stderr or ""
+        if result.returncode == 0 and output_path.exists() and output_path.stat().st_size >= 512:
+            return output_path
+        # Windows 上播放器 seek 时偶发共享冲突，短暂重试
+        time.sleep(0.15 * (attempt + 1))
     if not output_path.exists() or output_path.stat().st_size < 512:
-        raise RuntimeError(f"音频分片过小或为空：{output_path.name}")
-    return output_path
+        raise RuntimeError(f"音频分片过小或为空：{output_path.name}\n{last_stderr[-2000:]}")
+    raise RuntimeError(f"音频分片提取失败：\n{last_stderr[-2000:]}")

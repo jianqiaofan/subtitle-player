@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QPushButton,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -35,6 +36,7 @@ class SubtitleEditDialog(QDialog):
     def __init__(self, segment: SubtitleSegment, parent=None) -> None:
         super().__init__(parent)
         self._segment = segment
+        self._focused_time_edit: QLineEdit | None = None
         self.setWindowTitle("编辑字幕")
         self.setMinimumWidth(480)
         self.setStyleSheet(DARK_STYLE)
@@ -58,7 +60,26 @@ class SubtitleEditDialog(QDialog):
             end_widget,
         ) = self._make_time_row(segment.end)
 
+        self._time_edits = (
+            self.hour_edit,
+            self.minute_edit,
+            self.second_edit,
+            self.millis_edit,
+            self.end_hour_edit,
+            self.end_minute_edit,
+            self.end_second_edit,
+            self.end_millis_edit,
+        )
+        self._millis_edits = {self.millis_edit, self.end_millis_edit}
+        self._minute_second_edits = {
+            self.minute_edit,
+            self.second_edit,
+            self.end_minute_edit,
+            self.end_second_edit,
+        }
+
         form = QFormLayout()
+        form.addRow(self._make_focus_nudge_row())
         form.addRow("起始时间", start_widget)
         form.addRow("终止时间", end_widget)
 
@@ -80,6 +101,13 @@ class SubtitleEditDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        for edit in self._time_edits:
+            edit.installEventFilter(self)
+        self.text_edit.installEventFilter(self)
+        buttons.installEventFilter(self)
+        for child in buttons.findChildren(QWidget):
+            child.installEventFilter(self)
+
         for edit in (
             self.hour_edit,
             self.minute_edit,
@@ -87,6 +115,39 @@ class SubtitleEditDialog(QDialog):
             self.millis_edit,
         ):
             edit.textChanged.connect(self._ensure_end_after_start)
+
+        self.second_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.second_edit.selectAll()
+        self._focused_time_edit = self.second_edit
+
+    def _make_focus_nudge_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        increase_btn = QPushButton("增加")
+        increase_btn.setToolTip("对当前焦点时间框 +1（毫秒为 +100）")
+        increase_btn.clicked.connect(lambda: self._nudge_focused_time_field(1))
+
+        decrease_btn = QPushButton("减少")
+        decrease_btn.setToolTip("对当前焦点时间框 -1（毫秒为 -100）")
+        decrease_btn.clicked.connect(lambda: self._nudge_focused_time_field(-1))
+
+        self._nudge_buttons = {increase_btn, decrease_btn}
+        for btn in (increase_btn, decrease_btn):
+            btn.installEventFilter(self)
+            layout.addWidget(btn)
+        layout.addStretch()
+        return row
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.FocusIn:
+            if obj in self._time_edits:
+                self._focused_time_edit = obj
+            elif obj not in getattr(self, "_nudge_buttons", ()):
+                self._focused_time_edit = None
+        return super().eventFilter(obj, event)
 
     def _make_time_row(
         self, seconds: float
@@ -168,6 +229,30 @@ class SubtitleEditDialog(QDialog):
             value = 0
         value = max(0, min(59, value + delta))
         second_edit.setText(f"{value:02d}")
+
+    def _nudge_focused_time_field(self, direction: int) -> None:
+        edit = self._focused_time_edit
+        if edit is None or edit not in self._time_edits:
+            return
+
+        text = edit.text().strip()
+        try:
+            value = int(text) if text else 0
+        except ValueError:
+            value = 0
+
+        if edit in self._millis_edits:
+            value = max(0, min(999, value + direction * 100))
+            edit.setText(f"{value:03d}")
+        elif edit in self._minute_second_edits:
+            value = max(0, min(59, value + direction))
+            edit.setText(f"{value:02d}")
+        else:
+            value = max(0, min(999, value + direction))
+            edit.setText(f"{value:02d}")
+
+        edit.setFocus(Qt.FocusReason.OtherFocusReason)
+        edit.selectAll()
 
     @staticmethod
     def _parse_time_fields(

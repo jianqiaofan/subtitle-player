@@ -4,20 +4,27 @@ import sys
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, Qt, QTimer, QUrl
+from PyQt6.QtCore import QEvent, QRectF, QSizeF, Qt, QTimer, QUrl
 from PyQt6.QtGui import (
     QAction,
+    QBrush,
+    QColor,
     QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
     QGuiApplication,
     QIcon,
+    QPen,
 )
 from PyQt6.QtMultimedia import QAudioDevice, QAudioOutput, QMediaDevices, QMediaPlayer
-from PyQt6.QtMultimediaWidgets import QVideoWidget
+from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
+    QFrame,
+    QGraphicsRectItem,
+    QGraphicsScene,
+    QGraphicsView,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -43,6 +50,7 @@ _RECOVERABLE_PLAYBACK_MARKERS = (
 )
 _MAX_PLAYBACK_RECOVERY_ATTEMPTS = 2
 _ERROR_DIALOG_COOLDOWN_SEC = 4.0
+_SUBTITLE_REPEAT_GAP_MS = 500
 
 from core.ai_notes import (
     build_notes_output_path,
@@ -72,8 +80,8 @@ from gui.vocabulary_dialog import VocabularyDialog
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".opus"}
 
 
-class ClickableVideoWidget(QVideoWidget):
-    """视频区域：单击切换播放/暂停，双击最大化或还原窗口。"""
+class VideoDisplayHost(QGraphicsView):
+    """用场景渲染视频，并在同一场景叠亮度遮罩（可避开原生视频层盖住普通控件的问题）。"""
 
     _SINGLE_CLICK_MS = 250
 
@@ -81,20 +89,89 @@ class ClickableVideoWidget(QVideoWidget):
         super().__init__(parent)
         self._toggle_callback = None
         self._double_click_callback = None
+        self._brightness = 100
         self._single_click_timer = QTimer(self)
         self._single_click_timer.setSingleShot(True)
         self._single_click_timer.setInterval(self._SINGLE_CLICK_MS)
         self._single_click_timer.timeout.connect(self._emit_single_click)
-        self._click_layer = QWidget(self)
-        self._click_layer.setStyleSheet("background: transparent;")
-        self._click_layer.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._click_layer.installEventFilter(self)
+
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setBackgroundBrush(QBrush(QColor("#000000")))
+        self.setStyleSheet("background: #000; border: none;")
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+
+        self.video_item = QGraphicsVideoItem()
+        self._scene.addItem(self.video_item)
+        self.video_item.nativeSizeChanged.connect(self._sync_video_geometry)
+
+        self._brightness_item = QGraphicsRectItem()
+        self._brightness_item.setPen(QPen(Qt.PenStyle.NoPen))
+        self._brightness_item.setZValue(10)
+        self._brightness_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._brightness_item.hide()
+        self._scene.addItem(self._brightness_item)
 
     def set_toggle_callback(self, callback) -> None:
         self._toggle_callback = callback
 
     def set_double_click_callback(self, callback) -> None:
         self._double_click_callback = callback
+
+    def set_brightness(self, value: int) -> None:
+        self._brightness = max(0, min(200, int(value)))
+        self._update_brightness_overlay()
+
+    def _update_brightness_overlay(self) -> None:
+        value = self._brightness
+        if value == 100:
+            self._brightness_item.hide()
+            return
+        if value < 100:
+            alpha = int(round((100 - value) / 100 * 255))
+            color = QColor(0, 0, 0, alpha)
+        else:
+            alpha = int(round((value - 100) / 100 * 140))
+            color = QColor(255, 255, 255, alpha)
+        self._brightness_item.setBrush(QBrush(color))
+        self._brightness_item.show()
+        self._brightness_item.setZValue(10)
+
+    def _sync_video_geometry(self, *_args) -> None:
+        view_size = self.viewport().size()
+        if view_size.width() <= 0 or view_size.height() <= 0:
+            return
+
+        native = self.video_item.nativeSize()
+        if native.width() > 0 and native.height() > 0:
+            video_aspect = native.width() / native.height()
+            view_aspect = view_size.width() / max(1, view_size.height())
+            if view_aspect > video_aspect:
+                height = float(view_size.height())
+                width = height * video_aspect
+            else:
+                width = float(view_size.width())
+                height = width / video_aspect
+            self.video_item.setSize(QSizeF(width, height))
+            self.video_item.setPos(
+                (view_size.width() - width) / 2.0,
+                (view_size.height() - height) / 2.0,
+            )
+        else:
+            self.video_item.setSize(QSizeF(view_size))
+            self.video_item.setPos(0, 0)
+
+        self._brightness_item.setRect(
+            QRectF(0, 0, view_size.width(), view_size.height())
+        )
+        self._brightness_item.setPos(0, 0)
+        self._scene.setSceneRect(0, 0, view_size.width(), view_size.height())
 
     def _emit_single_click(self) -> None:
         if self._toggle_callback is not None:
@@ -108,26 +185,11 @@ class ClickableVideoWidget(QVideoWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._click_layer.setGeometry(self.rect())
-        self._click_layer.raise_()
+        self._sync_video_geometry()
 
-    def eventFilter(self, obj, event) -> bool:
-        if obj is self._click_layer:
-            if (
-                event.type() == QEvent.Type.MouseButtonDblClick
-                and event.button() == Qt.MouseButton.LeftButton
-            ):
-                self._cancel_single_click()
-                if self._double_click_callback is not None:
-                    self._double_click_callback()
-                return True
-            if (
-                event.type() == QEvent.Type.MouseButtonPress
-                and event.button() == Qt.MouseButton.LeftButton
-            ):
-                self._schedule_single_click()
-                return True
-        return super().eventFilter(obj, event)
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_video_geometry()
 
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -144,7 +206,6 @@ class ClickableVideoWidget(QVideoWidget):
             event.accept()
             return
         super().mousePressEvent(event)
-
 
 class PlayerWindow(QMainWindow):
     def __init__(self) -> None:
@@ -166,7 +227,7 @@ class PlayerWindow(QMainWindow):
         self._config = load_config()
         self._media_area_click_timer = QTimer(self)
         self._media_area_click_timer.setSingleShot(True)
-        self._media_area_click_timer.setInterval(ClickableVideoWidget._SINGLE_CLICK_MS)
+        self._media_area_click_timer.setInterval(VideoDisplayHost._SINGLE_CLICK_MS)
         self._media_area_click_timer.timeout.connect(self._on_deferred_media_area_click)
         self._study_countdown_remaining = 0
         self._study_countdown_timer = QTimer(self)
@@ -180,6 +241,20 @@ class PlayerWindow(QMainWindow):
         self._last_good_position_ms = 0
         self._error_dialog_suppressed_until = 0.0
         self._saved_playback_rate = 1.0
+        # Remember the user's output-device choice across Windows re-enumeration
+        # (Bluetooth headsets often fire audioOutputsChanged and briefly vanish).
+        self._preferred_audio_device_id: bytes | None = None
+        self._preferred_audio_device_name: str = ""
+        self._audio_device_refresh_timer = QTimer(self)
+        self._audio_device_refresh_timer.setSingleShot(True)
+        self._audio_device_refresh_timer.setInterval(200)
+        self._audio_device_refresh_timer.timeout.connect(self._refresh_audio_devices)
+        self._repeat_start_ms: int | None = None
+        self._repeat_end_ms: int | None = None
+        self._repeat_gap_timer = QTimer(self)
+        self._repeat_gap_timer.setSingleShot(True)
+        self._repeat_gap_timer.setInterval(_SUBTITLE_REPEAT_GAP_MS)
+        self._repeat_gap_timer.timeout.connect(self._on_subtitle_repeat_gap_elapsed)
 
         self.setWindowTitle("字幕播放器")
         self.setMinimumSize(1000, 640)
@@ -189,7 +264,7 @@ class PlayerWindow(QMainWindow):
 
         self._player = QMediaPlayer()
         self._media_devices = QMediaDevices()
-        self._media_devices.audioOutputsChanged.connect(self._refresh_audio_devices)
+        self._media_devices.audioOutputsChanged.connect(self._schedule_audio_device_refresh)
         self._audio_output = QAudioOutput()
         self._audio_output.setVolume(1.0)
         self._player.setAudioOutput(self._audio_output)
@@ -325,13 +400,12 @@ class PlayerWindow(QMainWindow):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        self._video_widget = ClickableVideoWidget()
-        self._video_widget.setMinimumSize(480, 270)
-        self._video_widget.setAutoFillBackground(False)
-        self._video_widget.set_toggle_callback(self.toggle_playback_from_video)
-        self._video_widget.set_double_click_callback(self.toggle_maximize_from_video)
-        self._player.setVideoOutput(self._video_widget)
-        left_layout.addWidget(self._video_widget, stretch=1)
+        self._video_host = VideoDisplayHost()
+        self._video_host.setMinimumSize(480, 270)
+        self._video_host.set_toggle_callback(self.toggle_playback_from_video)
+        self._video_host.set_double_click_callback(self.toggle_maximize_from_video)
+        self._player.setVideoOutput(self._video_host.video_item)
+        left_layout.addWidget(self._video_host, stretch=1)
 
         self._audio_placeholder = QLabel("音频播放中")
         self._audio_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -421,6 +495,19 @@ class PlayerWindow(QMainWindow):
         self.volume_label = QLabel("100%")
         self.volume_label.setMinimumWidth(36)
         bar.addWidget(self.volume_label)
+
+        bar.addWidget(QLabel("亮度"))
+        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.brightness_slider.setRange(0, 200)
+        self.brightness_slider.setValue(100)
+        self.brightness_slider.setFixedWidth(100)
+        self.brightness_slider.setToolTip("亮度（100% 为原始画面）")
+        self.brightness_slider.valueChanged.connect(self._on_brightness_changed)
+        bar.addWidget(self.brightness_slider)
+
+        self.brightness_label = QLabel("100%")
+        self.brightness_label.setMinimumWidth(36)
+        bar.addWidget(self.brightness_label)
         return bar
 
     def _study_countdown_is_foreground(self) -> bool:
@@ -525,14 +612,15 @@ class PlayerWindow(QMainWindow):
         self._recovering_playback = False
         self._playback_recovery_attempts = 0
         self._last_good_position_ms = 0
+        self._stop_subtitle_repeat()
         self._recreate_audio_output()
         self._player.setSource(QUrl.fromLocalFile(str(media_path)))
 
         is_audio = media_path.suffix.lower() in AUDIO_EXTENSIONS
-        self._video_widget.setVisible(not is_audio)
+        self._video_host.setVisible(not is_audio)
         self._audio_placeholder.setVisible(is_audio)
         if not is_audio:
-            self._player.setVideoOutput(self._video_widget)
+            self._player.setVideoOutput(self._video_host.video_item)
 
         self.subtitle_list.clear()
         self._segments.clear()
@@ -844,7 +932,50 @@ class PlayerWindow(QMainWindow):
         row = self.subtitle_list.row(item)
         if row < 0 or row >= len(self._segments):
             return
+        self._stop_subtitle_repeat()
         self._seek_to(self._segments[row].start, play=True)
+
+    def _stop_subtitle_repeat(self) -> None:
+        self._repeat_gap_timer.stop()
+        self._repeat_start_ms = None
+        self._repeat_end_ms = None
+
+    def _start_subtitle_repeat(self, row: int) -> None:
+        if self._media_path is None or row < 0 or row >= len(self._segments):
+            return
+        seg = self._segments[row]
+        start_ms = self._clamp_position_ms(int(round(float(seg.start) * 1000)))
+        end_ms = self._clamp_position_ms(int(round(float(seg.end) * 1000)))
+        if end_ms <= start_ms:
+            end_ms = self._clamp_position_ms(start_ms + 500)
+        self._repeat_gap_timer.stop()
+        self._repeat_start_ms = start_ms
+        self._repeat_end_ms = end_ms
+        self.subtitle_list.setCurrentRow(row)
+        self._seek_to(start_ms / 1000.0, play=True)
+
+    def _on_subtitle_repeat_gap_elapsed(self) -> None:
+        if self._repeat_start_ms is None or self._repeat_end_ms is None:
+            return
+        self._seek_to(self._repeat_start_ms / 1000.0, play=True)
+
+    def _maybe_handle_subtitle_repeat(self, position_ms: int) -> None:
+        if self._repeat_end_ms is None or self._repeat_start_ms is None:
+            return
+        if self._seeking or self._repeat_gap_timer.isActive():
+            return
+        if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            return
+        if position_ms < self._repeat_end_ms:
+            return
+        self._player.pause()
+        self._seeking = True
+        self._player.setPosition(self._repeat_end_ms)
+        self._seeking = False
+        self.position_slider.blockSignals(True)
+        self.position_slider.setValue(self._repeat_end_ms)
+        self.position_slider.blockSignals(False)
+        self._repeat_gap_timer.start()
 
     def _pause_subtitle_auto_follow(self) -> None:
         self._subtitle_auto_follow = False
@@ -872,14 +1003,17 @@ class PlayerWindow(QMainWindow):
                 return
 
             menu = QMenu(self)
-            copy_action = menu.addAction("复制")
             edit_action = menu.addAction("编辑")
             edit_action.setEnabled(self._subtitle_editing_allowed())
+            copy_action = menu.addAction("复制")
+            repeat_action = menu.addAction("重复播放")
             chosen = menu.exec(self.subtitle_list.mapToGlobal(pos))
             if chosen == copy_action:
                 self._copy_subtitle_text(row)
             elif chosen == edit_action:
                 self._edit_subtitle_text(row)
+            elif chosen == repeat_action:
+                self._start_subtitle_repeat(row)
         finally:
             self._subtitle_menu_open = False
             QTimer.singleShot(0, self._maybe_resume_subtitle_auto_follow)
@@ -979,8 +1113,10 @@ class PlayerWindow(QMainWindow):
 
     def _toggle_play(self) -> None:
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._stop_subtitle_repeat()
             self._player.pause()
         else:
+            self._stop_subtitle_repeat()
             self._play_media()
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
@@ -999,6 +1135,7 @@ class PlayerWindow(QMainWindow):
                 self._last_good_position_ms = position_ms
                 if self._playback_recovery_attempts and not self._recovering_playback:
                     self._playback_recovery_attempts = 0
+            self._maybe_handle_subtitle_repeat(position_ms)
         self._update_time_label(position_ms, self._player.duration())
         self._sync_subtitle_highlight(position_ms / 1000.0)
 
@@ -1057,12 +1194,14 @@ class PlayerWindow(QMainWindow):
 
     def _on_slider_pressed(self) -> None:
         self._seeking = True
+        self._stop_subtitle_repeat()
 
     def _on_slider_released(self) -> None:
         self._seeking = False
         was_playing = (
             self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
         )
+        self._stop_subtitle_repeat()
         self._seek_to(self.position_slider.value() / 1000.0, play=was_playing)
 
     def _on_slider_moved(self, value: int) -> None:
@@ -1152,7 +1291,7 @@ class PlayerWindow(QMainWindow):
         self._player.setSource(QUrl())
         self._player.setSource(QUrl.fromLocalFile(str(self._media_path)))
         if not is_audio:
-            self._player.setVideoOutput(self._video_widget)
+            self._player.setVideoOutput(self._video_host.video_item)
 
     def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
         if not self._awaiting_reload_seek:
@@ -1216,47 +1355,101 @@ class PlayerWindow(QMainWindow):
         self._reload_media_at_position(target_ms, should_play)
         return True
 
+    @staticmethod
+    def _normalize_device_id(device_id: object) -> bytes | None:
+        if device_id is None:
+            return None
+        if isinstance(device_id, (bytes, bytearray, memoryview)):
+            return bytes(device_id)
+        try:
+            return bytes(device_id)
+        except TypeError:
+            return None
+
+    def _schedule_audio_device_refresh(self) -> None:
+        # Windows may emit audioOutputsChanged in bursts (esp. Bluetooth).
+        self._audio_device_refresh_timer.start()
+
+    def _remember_audio_device(self, device: QAudioDevice | None) -> None:
+        if device is None or device.isNull():
+            return
+        self._preferred_audio_device_id = self._normalize_device_id(device.id())
+        self._preferred_audio_device_name = device.description().strip()
+
+    def _find_preferred_audio_device(
+        self, devices: list[QAudioDevice]
+    ) -> QAudioDevice | None:
+        preferred_id = self._preferred_audio_device_id
+        if preferred_id is not None:
+            for device in devices:
+                if self._normalize_device_id(device.id()) == preferred_id:
+                    return device
+        preferred_name = self._preferred_audio_device_name.strip()
+        if preferred_name:
+            for device in devices:
+                if device.description().strip() == preferred_name:
+                    return device
+        return None
+
     def _refresh_audio_devices(self) -> None:
-        current_id = self.audio_device_combo.currentData() if hasattr(self, "audio_device_combo") else None
         if not hasattr(self, "audio_device_combo"):
             return
 
         self.audio_device_combo.blockSignals(True)
         self.audio_device_combo.clear()
-        devices = self._media_devices.audioOutputs()
+        devices = list(self._media_devices.audioOutputs())
         default_device = self._media_devices.defaultAudioOutput()
+        preferred = self._find_preferred_audio_device(devices)
         selected_index = 0
         for index, device in enumerate(devices):
             label = device.description()
             if device.isDefault():
                 label = f"{label}（系统默认）"
-            self.audio_device_combo.addItem(label, device.id())
-            if current_id is not None and device.id() == current_id:
+            # Store as bytes so QVariant round-trips reliably in PyQt6.
+            self.audio_device_combo.addItem(label, self._normalize_device_id(device.id()))
+            if preferred is not None and self._normalize_device_id(device.id()) == self._normalize_device_id(
+                preferred.id()
+            ):
                 selected_index = index
-            elif current_id is None and device.id() == default_device.id():
+            elif preferred is None and self._normalize_device_id(device.id()) == self._normalize_device_id(
+                default_device.id()
+            ):
                 selected_index = index
         self.audio_device_combo.setCurrentIndex(selected_index if devices else -1)
         self.audio_device_combo.blockSignals(False)
+        # If the preferred headset briefly disappeared, keep the preference so
+        # the next refresh can restore it instead of locking onto the default.
         self._sync_audio_output_device()
 
     def _selected_audio_device(self) -> QAudioDevice | None:
-        if not hasattr(self, "audio_device_combo"):
-            return self._media_devices.defaultAudioOutput()
-        device_id = self.audio_device_combo.currentData()
-        if device_id is None:
-            return self._media_devices.defaultAudioOutput()
-        for device in self._media_devices.audioOutputs():
-            if device.id() == device_id:
-                return device
+        devices = list(self._media_devices.audioOutputs())
+        preferred = self._find_preferred_audio_device(devices)
+        if preferred is not None:
+            return preferred
+        if hasattr(self, "audio_device_combo"):
+            device_id = self._normalize_device_id(self.audio_device_combo.currentData())
+            if device_id is not None:
+                for device in devices:
+                    if self._normalize_device_id(device.id()) == device_id:
+                        return device
         return self._media_devices.defaultAudioOutput()
 
     def _sync_audio_output_device(self) -> None:
         device = self._selected_audio_device()
-        if device.isNull():
+        if device is None or device.isNull():
             return
         self._audio_output.setDevice(device)
 
     def _on_audio_device_changed(self, _index: int) -> None:
+        if not hasattr(self, "audio_device_combo"):
+            return
+        device_id = self._normalize_device_id(self.audio_device_combo.currentData())
+        if device_id is None:
+            return
+        for device in self._media_devices.audioOutputs():
+            if self._normalize_device_id(device.id()) == device_id:
+                self._remember_audio_device(device)
+                break
         self._sync_audio_output_device()
 
     def _play_media(self) -> None:
@@ -1272,6 +1465,10 @@ class PlayerWindow(QMainWindow):
             self.mute_btn.setText("静音")
             self.mute_btn.blockSignals(False)
             self._audio_output.setMuted(False)
+
+    def _on_brightness_changed(self, value: int) -> None:
+        self.brightness_label.setText(f"{value}%")
+        self._video_host.set_brightness(value)
 
     def _on_mute_toggled(self, muted: bool) -> None:
         self._audio_output.setMuted(muted)
@@ -1623,6 +1820,7 @@ class PlayerWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._study_countdown_timer.stop()
+        self._stop_subtitle_repeat()
         self._persist_last_media_dir()
         self._stop_live_transcribe()
         self._stop_ai_notes_worker()

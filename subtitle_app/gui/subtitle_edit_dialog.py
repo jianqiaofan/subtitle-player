@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QEvent, Qt
+from PyQt6.QtCore import QEvent, Qt, QTimer
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -16,16 +17,28 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from core.config import AppConfig, load_config
+from core.external_translate import get_translator, is_translator_running, send_hotkey
 from core.subtitle import SubtitleSegment, format_timestamp
 from gui.styles import DARK_STYLE
 
 
-def _seconds_to_parts(seconds: float) -> tuple[int, int, int, int]:
-    millis_total = int(round(seconds * 1000 + 1e-9))
+_MAX_HOURS = 999
+# 分/秒模 60，毫秒模 1000；时不回绕。
+_WRAP_MODULI = {1: 60, 2: 60, 3: 1000}
+
+
+def _millis_to_parts(millis_total: int) -> tuple[int, int, int, int]:
+    millis_total = max(0, millis_total)
     hours, rem = divmod(millis_total, 3_600_000)
     minutes, rem = divmod(rem, 60_000)
     secs, ms = divmod(rem, 1000)
     return hours, minutes, secs, ms
+
+
+def _seconds_to_parts(seconds: float) -> tuple[int, int, int, int]:
+    millis_total = int(round(seconds * 1000 + 1e-9))
+    return _millis_to_parts(millis_total)
 
 
 def _parts_to_seconds(hours: int, minutes: int, seconds: int, millis: int) -> float:
@@ -33,9 +46,17 @@ def _parts_to_seconds(hours: int, minutes: int, seconds: int, millis: int) -> fl
 
 
 class SubtitleEditDialog(QDialog):
-    def __init__(self, segment: SubtitleSegment, parent=None) -> None:
+    def __init__(
+        self,
+        segment: SubtitleSegment,
+        parent=None,
+        config: AppConfig | None = None,
+    ) -> None:
         super().__init__(parent)
         self._segment = segment
+        cfg = config or load_config()
+        self._translator = get_translator(cfg.translate_app)
+        self._hotkey = (cfg.translate_hotkey or "").strip() or self._translator.default_hotkey
         self._focused_time_edit: QLineEdit | None = None
         self.setWindowTitle("编辑字幕")
         self.setMinimumWidth(480)
@@ -60,22 +81,29 @@ class SubtitleEditDialog(QDialog):
             end_widget,
         ) = self._make_time_row(segment.end)
 
-        self._time_edits = (
+        self._start_edits = (
             self.hour_edit,
             self.minute_edit,
             self.second_edit,
             self.millis_edit,
+        )
+        self._end_edits = (
             self.end_hour_edit,
             self.end_minute_edit,
             self.end_second_edit,
             self.end_millis_edit,
         )
-        self._millis_edits = {self.millis_edit, self.end_millis_edit}
-        self._minute_second_edits = {
-            self.minute_edit,
-            self.second_edit,
-            self.end_minute_edit,
-            self.end_second_edit,
+        self._time_edits = self._start_edits + self._end_edits
+        # (字段下标, 步进)
+        self._field_nudge = {
+            self.hour_edit: (0, 1),
+            self.minute_edit: (1, 1),
+            self.second_edit: (2, 1),
+            self.millis_edit: (3, 100),
+            self.end_hour_edit: (0, 1),
+            self.end_minute_edit: (1, 1),
+            self.end_second_edit: (2, 1),
+            self.end_millis_edit: (3, 100),
         }
 
         form = QFormLayout()
@@ -85,6 +113,8 @@ class SubtitleEditDialog(QDialog):
 
         self.text_edit = QPlainTextEdit(segment.text)
         self.text_edit.setMinimumHeight(120)
+        self.text_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.text_edit.customContextMenuRequested.connect(self._show_text_context_menu)
         form.addRow("字幕内容", self.text_edit)
 
         layout.addLayout(form)
@@ -134,10 +164,15 @@ class SubtitleEditDialog(QDialog):
         decrease_btn.setToolTip("对当前焦点时间框 -1（毫秒为 -100）")
         decrease_btn.clicked.connect(lambda: self._nudge_focused_time_field(-1))
 
+        nudge_hint = QLabel("如需增加或减少，请先将鼠标移入到对应框中")
+        nudge_hint.setObjectName("hintLabel")
+        nudge_hint.setWordWrap(True)
+
         self._nudge_buttons = {increase_btn, decrease_btn}
         for btn in (increase_btn, decrease_btn):
             btn.installEventFilter(self)
             layout.addWidget(btn)
+        layout.addWidget(nudge_hint)
         layout.addStretch()
         return row
 
@@ -148,6 +183,53 @@ class SubtitleEditDialog(QDialog):
             elif obj not in getattr(self, "_nudge_buttons", ()):
                 self._focused_time_edit = None
         return super().eventFilter(obj, event)
+
+    def _show_text_context_menu(self, pos) -> None:
+        menu = self.text_edit.createStandardContextMenu()
+        translate_action = QAction("翻译", menu)
+        translate_action.setToolTip(f"调用{self._translator.name}快捷键 {self._hotkey}")
+        selected = self.text_edit.textCursor().selectedText().replace("\u2029", "\n")
+        translate_action.setEnabled(bool(selected.strip()))
+        translate_action.triggered.connect(self._translate_selection)
+        first = menu.actions()[0] if menu.actions() else None
+        if first is not None:
+            menu.insertAction(first, translate_action)
+            menu.insertSeparator(first)
+        else:
+            menu.addAction(translate_action)
+        menu.exec(self.text_edit.mapToGlobal(pos))
+
+    def _ensure_translator_running(self) -> bool:
+        if is_translator_running(self._translator):
+            return True
+        QMessageBox.information(
+            self,
+            self._translator.not_running_title,
+            self._translator.not_running_message,
+        )
+        return False
+
+    def _translate_selection(self) -> None:
+        if not self.text_edit.textCursor().hasSelection():
+            return
+        if not self._ensure_translator_running():
+            return
+        self.text_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+        QTimer.singleShot(80, self._send_translate_hotkey)
+
+    def _send_translate_hotkey(self) -> None:
+        if not self.text_edit.textCursor().hasSelection():
+            return
+        if not self._ensure_translator_running():
+            return
+        self.text_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+        if send_hotkey(self._hotkey):
+            return
+        QMessageBox.warning(
+            self,
+            "翻译失败",
+            f"无法发送{self._translator.name}快捷键 {self._hotkey}。",
+        )
 
     def _make_time_row(
         self, seconds: float
@@ -221,36 +303,79 @@ class SubtitleEditDialog(QDialog):
         column.addWidget(down_btn)
         return stepper
 
+    def _row_edits_for(self, edit: QLineEdit) -> tuple[QLineEdit, QLineEdit, QLineEdit, QLineEdit]:
+        if edit in self._start_edits:
+            return self._start_edits
+        return self._end_edits
+
+    @staticmethod
+    def _read_time_parts(
+        hour_edit: QLineEdit,
+        minute_edit: QLineEdit,
+        second_edit: QLineEdit,
+        millis_edit: QLineEdit,
+    ) -> tuple[int, int, int, int]:
+        def parse(field: QLineEdit) -> int:
+            text = field.text().strip()
+            try:
+                return int(text) if text else 0
+            except ValueError:
+                return 0
+
+        return parse(hour_edit), parse(minute_edit), parse(second_edit), parse(millis_edit)
+
+    def _write_time_parts(
+        self,
+        hour_edit: QLineEdit,
+        minute_edit: QLineEdit,
+        second_edit: QLineEdit,
+        millis_edit: QLineEdit,
+        hours: int,
+        minutes: int,
+        secs: int,
+        millis: int,
+    ) -> None:
+        edits = (hour_edit, minute_edit, second_edit, millis_edit)
+        for field in edits:
+            field.blockSignals(True)
+        hour_edit.setText(f"{hours:02d}")
+        minute_edit.setText(f"{minutes:02d}")
+        second_edit.setText(f"{secs:02d}")
+        millis_edit.setText(f"{millis:03d}")
+        for field in edits:
+            field.blockSignals(False)
+        if hour_edit is self.hour_edit:
+            self._ensure_end_after_start()
+
+    def _nudge_time_row_field(self, edit: QLineEdit, direction: int) -> None:
+        hour_edit, minute_edit, second_edit, millis_edit = self._row_edits_for(edit)
+        values = list(
+            self._read_time_parts(hour_edit, minute_edit, second_edit, millis_edit)
+        )
+        idx, step = self._field_nudge[edit]
+        values[idx] += direction * step
+        for i in range(idx, 0, -1):
+            carry, values[i] = divmod(values[i], _WRAP_MODULI[i])
+            values[i - 1] += carry
+        if not 0 <= values[0] <= _MAX_HOURS:
+            return
+        self._write_time_parts(
+            hour_edit,
+            minute_edit,
+            second_edit,
+            millis_edit,
+            *values,
+        )
+
     def _nudge_seconds(self, second_edit: QLineEdit, delta: int) -> None:
-        text = second_edit.text().strip()
-        try:
-            value = int(text) if text else 0
-        except ValueError:
-            value = 0
-        value = max(0, min(59, value + delta))
-        second_edit.setText(f"{value:02d}")
+        self._nudge_time_row_field(second_edit, delta)
 
     def _nudge_focused_time_field(self, direction: int) -> None:
         edit = self._focused_time_edit
         if edit is None or edit not in self._time_edits:
             return
 
-        text = edit.text().strip()
-        try:
-            value = int(text) if text else 0
-        except ValueError:
-            value = 0
-
-        if edit in self._millis_edits:
-            value = max(0, min(999, value + direction * 100))
-            edit.setText(f"{value:03d}")
-        elif edit in self._minute_second_edits:
-            value = max(0, min(59, value + direction))
-            edit.setText(f"{value:02d}")
-        else:
-            value = max(0, min(999, value + direction))
-            edit.setText(f"{value:02d}")
-
+        self._nudge_time_row_field(edit, direction)
         edit.setFocus(Qt.FocusReason.OtherFocusReason)
         edit.selectAll()
 
@@ -295,10 +420,16 @@ class SubtitleEditDialog(QDialog):
 
     def _set_end_seconds(self, seconds: float) -> None:
         hours, minutes, secs, millis = _seconds_to_parts(seconds)
-        self.end_hour_edit.setText(f"{hours:02d}")
-        self.end_minute_edit.setText(f"{minutes:02d}")
-        self.end_second_edit.setText(f"{secs:02d}")
-        self.end_millis_edit.setText(f"{millis:03d}")
+        self._write_time_parts(
+            self.end_hour_edit,
+            self.end_minute_edit,
+            self.end_second_edit,
+            self.end_millis_edit,
+            hours,
+            minutes,
+            secs,
+            millis,
+        )
 
     def _ensure_end_after_start(self) -> None:
         start = self._parse_start_seconds()
@@ -353,9 +484,11 @@ class SubtitleEditDialog(QDialog):
 
     @staticmethod
     def edit_segment(
-        segment: SubtitleSegment, parent=None
+        segment: SubtitleSegment,
+        parent=None,
+        config: AppConfig | None = None,
     ) -> tuple[float, float, str] | None:
-        dialog = SubtitleEditDialog(segment, parent)
+        dialog = SubtitleEditDialog(segment, parent, config=config)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
         return dialog.values()

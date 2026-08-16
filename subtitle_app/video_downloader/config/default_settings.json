@@ -1,0 +1,20 @@
+{
+  "save_dir": "",
+  "filename_template": "%(title)s [%(id)s].%(ext)s",
+  "video_format": "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[vcodec^=avc]+ba/bv*+ba/b",
+  "merge_output": "mp4",
+  "concurrent_fragments": 8,
+  "max_concurrent_tasks": 2,
+  "proxy": "",
+  "cookies_from_browser": "",
+  "cookies_file": "",
+  "ffmpeg_path": "",
+  "watch_clipboard": false,
+  "auto_download_after_parse": false,
+  "play_sound_on_complete": false,
+  "write_subs": true,
+  "write_thumbnail": false,
+  "embed_metadata": true,
+  "limit_rate": "",
+  "window_geometry": "1080x720"
+}

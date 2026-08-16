@@ -16,5 +16,7 @@
   "ai_notes_user_context": {},
   "ai_notes_template": "learning",
   "ecdict_db_path": "",
-  "last_media_dir": ""
+  "last_media_dir": "",
+  "translate_app": "baidu",
+  "translate_hotkey": "Ctrl+Alt+C"
 }

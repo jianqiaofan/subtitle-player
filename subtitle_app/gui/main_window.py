@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PyQt6.QtCore import QUrl, pyqtSignal
+from PyQt6.QtCore import QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -34,6 +34,13 @@ from core.config import (
     load_config,
     save_config,
 )
+from core.console_window import (
+    add_console_visibility_listener,
+    console_button_label,
+    mirror_log,
+    reveal_console_on_error,
+    toggle_console,
+)
 from core.transcriber import is_cuda_available
 from core.worker import TranscribeWorker
 from gui.styles import DARK_STYLE
@@ -42,6 +49,7 @@ STATUS_WAIT = "等待"
 STATUS_RUNNING = "转写中"
 STATUS_DONE = "完成"
 STATUS_FAIL = "失败"
+WINDOW_TITLE = "音视频转字幕"
 
 
 class TranscribeWindow(QMainWindow):
@@ -53,7 +61,7 @@ class TranscribeWindow(QMainWindow):
         self.worker: TranscribeWorker | None = None
         self._file_rows: dict[str, int] = {}
 
-        self.setWindowTitle("音视频转字幕")
+        self.setWindowTitle(WINDOW_TITLE)
         self.setMinimumSize(860, 640)
         self.resize(920, 700)
         self.setAcceptDrops(True)
@@ -199,7 +207,21 @@ class TranscribeWindow(QMainWindow):
         open_btn = QPushButton("打开输出目录")
         open_btn.clicked.connect(self._open_output_dir)
         layout.addWidget(open_btn)
+
+        self._console_btn = QPushButton(console_button_label())
+        self._console_btn.setToolTip("显示或隐藏后台命令窗口")
+        self._console_btn.clicked.connect(toggle_console)
+        layout.addWidget(self._console_btn)
+        add_console_visibility_listener(self._on_console_visibility_changed)
         return panel
+
+    def _on_console_visibility_changed(self, visible: bool) -> None:
+        def apply() -> None:
+            if not hasattr(self, "_console_btn"):
+                return
+            self._console_btn.setText("隐藏后台" if visible else "查看后台")
+
+        QTimer.singleShot(0, apply)
 
     def _build_log_group(self) -> QGroupBox:
         group = QGroupBox("运行日志")
@@ -259,6 +281,7 @@ class TranscribeWindow(QMainWindow):
         self.log_view.verticalScrollBar().setValue(
             self.log_view.verticalScrollBar().maximum()
         )
+        mirror_log(text)
 
     def _browse_output_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择输出目录")
@@ -394,6 +417,7 @@ class TranscribeWindow(QMainWindow):
         try:
             self.config.validate_model()
         except RuntimeError as exc:
+            reveal_console_on_error(str(exc))
             QMessageBox.warning(self, "模型无效", str(exc))
             return
 

@@ -1,5 +1,7 @@
 # 用户配置（含 API Key、本地路径）
 subtitle_app/config.json
+subtitle_app/video_downloader/config/user_settings.json
+subtitle_app/video_downloader/downloads/
 
 # Python
 __pycache__/
@@ -24,6 +26,7 @@ build/
 
 # Whisper 模型（体积过大，勿提交）
 *.bin
+models/
 
 # 媒体与个人学习资料
 *.mp4

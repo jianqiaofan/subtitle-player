@@ -5,6 +5,10 @@ QMainWindow, QWidget:not(QVideoWidget) {
     font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
     font-size: 13px;
 }
+QVideoWidget {
+    background-color: #000000;
+    border: none;
+}
 QGroupBox {
     border: 1px solid rgba(255, 255, 255, 0.25);
     border-radius: 6px;
@@ -61,6 +65,15 @@ QPushButton#primaryButton {
 }
 QPushButton#primaryButton:hover {
     background-color: #7d4fbd;
+}
+QPushButton#iconButton {
+    padding: 4px;
+    min-width: 28px;
+    max-width: 36px;
+}
+QPushButton#iconButton:checked {
+    background-color: rgba(185, 128, 255, 0.18);
+    border: 1px solid #b980ff;
 }
 QToolButton#toolbarMenuButton {
     color: #b980ff;

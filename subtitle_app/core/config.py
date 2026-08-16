@@ -111,6 +111,8 @@ class AppConfig:
     ai_notes_template: str = "learning"
     ecdict_db_path: str = ""
     last_media_dir: str = ""
+    translate_app: str = "baidu"
+    translate_hotkey: str = "Ctrl+Alt+C"
 
     def get_ai_notes_user_context(self, subtitle_type: str) -> str:
         return str(self.ai_notes_user_context.get(subtitle_type, "") or "").strip()
@@ -249,6 +251,12 @@ def load_config() -> AppConfig:
     cfg.ai_notes_subcategory = migrated_subcategory
     if not cfg.model_path and (ROOT_DIR / "win系统模型中等.bin").exists():
         cfg.model_path = str(ROOT_DIR / "win系统模型中等.bin")
+
+    from core.external_translate import DEFAULT_TRANSLATOR_ID, get_translator, normalize_hotkey_text
+
+    cfg.translate_app = get_translator(cfg.translate_app).id or DEFAULT_TRANSLATOR_ID
+    translator = get_translator(cfg.translate_app)
+    cfg.translate_hotkey = normalize_hotkey_text(cfg.translate_hotkey, translator.default_hotkey)
     return cfg
 
 

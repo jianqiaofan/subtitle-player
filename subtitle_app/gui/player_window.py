@@ -1,30 +1,34 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, QRectF, QSizeF, Qt, QTimer, QUrl
+from PyQt6.QtCore import QEvent, QSize, Qt, QTimer, QUrl
 from PyQt6.QtGui import (
     QAction,
-    QBrush,
     QColor,
     QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
     QGuiApplication,
     QIcon,
-    QPen,
+    QPainter,
+    QPalette,
+    QPixmap,
 )
-from PyQt6.QtMultimedia import QAudioDevice, QAudioOutput, QMediaDevices, QMediaPlayer
-from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
+from PyQt6.QtMultimedia import (
+    QAudioDevice,
+    QAudioOutput,
+    QMediaDevices,
+    QMediaPlayer,
+    QPlaybackOptions,
+)
+from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
-    QFrame,
-    QGraphicsRectItem,
-    QGraphicsScene,
-    QGraphicsView,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -62,6 +66,23 @@ from core.ai_notes_worker import AiNotesWorker
 from core.subtitle_text_export import export_plain_text_markdown
 from core.vocabulary_worker import VocabularyWorker
 from core.config import CONFIG_PATH, INFERENCE_DEVICE_OPTIONS, LIVE_SYNC_FILENAME_LABEL, MEDIA_EXTENSIONS, is_deepseek_configured, load_config, save_config
+from core.console_window import (
+    add_console_visibility_listener,
+    console_button_label,
+    focus_window_by_title,
+    reveal_console_on_error,
+    spawn_hidden_console_process,
+    toggle_console,
+)
+from core.external_translate import get_translator, normalize_hotkey_text
+from core.console_window import (
+    add_console_visibility_listener,
+    console_button_label,
+    focus_window_by_title,
+    reveal_console_on_error,
+    spawn_hidden_console_process,
+    toggle_console,
+)
 from core.transcriber import clear_model_cache, is_cuda_available
 from core.live_worker import LiveTranscribeWorker
 from core.subtitle import SubtitleSegment, find_segment_index_at_time, write_subtitle_file
@@ -71,17 +92,22 @@ from core.sync_subtitle import sync_subtitle_paths
 from gui.ai_notes_corpus_dialog import AiNotesCorpusDialog
 from gui.ai_notes_progress_dialog import AiNotesProgressDialog
 from gui.llm_settings_dialog import LlmSettingsDialog
-from gui.main_window import TranscribeWindow
+from gui.main_window import WINDOW_TITLE as TRANSCRIBE_WINDOW_TITLE
 from gui.styles import DARK_STYLE, PLAYER_LIST_STYLE
 from gui.subtitle_edit_dialog import SubtitleEditDialog
 from gui.subtitle_text_dialog import SubtitleTextDialog
+from gui.translate_hotkey import HotkeyLineEdit, TranslateHotkeyHelpDialog
 from gui.vocabulary_dialog import VocabularyDialog
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".opus"}
 
 
-class VideoDisplayHost(QGraphicsView):
-    """用场景渲染视频，并在同一场景叠亮度遮罩（可避开原生视频层盖住普通控件的问题）。"""
+class ClickableVideoWidget(QVideoWidget):
+    """原生视频输出：硬件直出，无叠加层，避免二次合成导致画质下降。
+
+    Qt6 的 QVideoWidget 内部使用独立视频窗口（WindowTransparentForInput），
+    因此点击事件直接落在本控件上，无需再盖透明子控件。
+    """
 
     _SINGLE_CLICK_MS = 250
 
@@ -89,89 +115,27 @@ class VideoDisplayHost(QGraphicsView):
         super().__init__(parent)
         self._toggle_callback = None
         self._double_click_callback = None
-        self._brightness = 100
         self._single_click_timer = QTimer(self)
         self._single_click_timer.setSingleShot(True)
         self._single_click_timer.setInterval(self._SINGLE_CLICK_MS)
         self._single_click_timer.timeout.connect(self._emit_single_click)
 
-        self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setBackgroundBrush(QBrush(QColor("#000000")))
-        self.setStyleSheet("background: #000; border: none;")
-        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
+        # KeepAspectRatio：按比例缩放并留黑边，避免拉伸变形。
+        self.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        self._scene = QGraphicsScene(self)
-        self.setScene(self._scene)
-
-        self.video_item = QGraphicsVideoItem()
-        self._scene.addItem(self.video_item)
-        self.video_item.nativeSizeChanged.connect(self._sync_video_geometry)
-
-        self._brightness_item = QGraphicsRectItem()
-        self._brightness_item.setPen(QPen(Qt.PenStyle.NoPen))
-        self._brightness_item.setZValue(10)
-        self._brightness_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        self._brightness_item.hide()
-        self._scene.addItem(self._brightness_item)
+        self.setStyleSheet("background-color: #000000; border: none;")
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("#000000"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#000000"))
+        self.setPalette(palette)
+        self.setAutoFillBackground(True)
 
     def set_toggle_callback(self, callback) -> None:
         self._toggle_callback = callback
 
     def set_double_click_callback(self, callback) -> None:
         self._double_click_callback = callback
-
-    def set_brightness(self, value: int) -> None:
-        self._brightness = max(0, min(200, int(value)))
-        self._update_brightness_overlay()
-
-    def _update_brightness_overlay(self) -> None:
-        value = self._brightness
-        if value == 100:
-            self._brightness_item.hide()
-            return
-        if value < 100:
-            alpha = int(round((100 - value) / 100 * 255))
-            color = QColor(0, 0, 0, alpha)
-        else:
-            alpha = int(round((value - 100) / 100 * 140))
-            color = QColor(255, 255, 255, alpha)
-        self._brightness_item.setBrush(QBrush(color))
-        self._brightness_item.show()
-        self._brightness_item.setZValue(10)
-
-    def _sync_video_geometry(self, *_args) -> None:
-        view_size = self.viewport().size()
-        if view_size.width() <= 0 or view_size.height() <= 0:
-            return
-
-        native = self.video_item.nativeSize()
-        if native.width() > 0 and native.height() > 0:
-            video_aspect = native.width() / native.height()
-            view_aspect = view_size.width() / max(1, view_size.height())
-            if view_aspect > video_aspect:
-                height = float(view_size.height())
-                width = height * video_aspect
-            else:
-                width = float(view_size.width())
-                height = width / video_aspect
-            self.video_item.setSize(QSizeF(width, height))
-            self.video_item.setPos(
-                (view_size.width() - width) / 2.0,
-                (view_size.height() - height) / 2.0,
-            )
-        else:
-            self.video_item.setSize(QSizeF(view_size))
-            self.video_item.setPos(0, 0)
-
-        self._brightness_item.setRect(
-            QRectF(0, 0, view_size.width(), view_size.height())
-        )
-        self._brightness_item.setPos(0, 0)
-        self._scene.setSceneRect(0, 0, view_size.width(), view_size.height())
 
     def _emit_single_click(self) -> None:
         if self._toggle_callback is not None:
@@ -182,14 +146,6 @@ class VideoDisplayHost(QGraphicsView):
 
     def _cancel_single_click(self) -> None:
         self._single_click_timer.stop()
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._sync_video_geometry()
-
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
-        self._sync_video_geometry()
 
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -216,7 +172,8 @@ class PlayerWindow(QMainWindow):
         self._seeking = False
         self._subtitle_auto_follow = True
         self._subtitle_menu_open = False
-        self._transcribe_window: TranscribeWindow | None = None
+        self._transcribe_proc: subprocess.Popen | None = None
+        self._video_download_proc: subprocess.Popen | None = None
         self._live_worker: LiveTranscribeWorker | None = None
         self._ai_notes_worker: AiNotesWorker | None = None
         self._ai_notes_progress: AiNotesProgressDialog | None = None
@@ -227,7 +184,7 @@ class PlayerWindow(QMainWindow):
         self._config = load_config()
         self._media_area_click_timer = QTimer(self)
         self._media_area_click_timer.setSingleShot(True)
-        self._media_area_click_timer.setInterval(VideoDisplayHost._SINGLE_CLICK_MS)
+        self._media_area_click_timer.setInterval(ClickableVideoWidget._SINGLE_CLICK_MS)
         self._media_area_click_timer.timeout.connect(self._on_deferred_media_area_click)
         self._study_countdown_remaining = 0
         self._study_countdown_timer = QTimer(self)
@@ -255,6 +212,9 @@ class PlayerWindow(QMainWindow):
         self._repeat_gap_timer.setSingleShot(True)
         self._repeat_gap_timer.setInterval(_SUBTITLE_REPEAT_GAP_MS)
         self._repeat_gap_timer.timeout.connect(self._on_subtitle_repeat_gap_elapsed)
+        self._transcribe_poll_timer = QTimer(self)
+        self._transcribe_poll_timer.setInterval(1500)
+        self._transcribe_poll_timer.timeout.connect(self._poll_transcribe_tool)
 
         self.setWindowTitle("字幕播放器")
         self.setMinimumSize(1000, 640)
@@ -263,6 +223,9 @@ class PlayerWindow(QMainWindow):
         self.setStyleSheet(DARK_STYLE + PLAYER_LIST_STYLE)
 
         self._player = QMediaPlayer()
+        playback_options = QPlaybackOptions()
+        playback_options.setPlaybackIntent(QPlaybackOptions.PlaybackIntent.Playback)
+        self._player.setPlaybackOptions(playback_options)
         self._media_devices = QMediaDevices()
         self._media_devices.audioOutputsChanged.connect(self._schedule_audio_device_refresh)
         self._audio_output = QAudioOutput()
@@ -324,6 +287,8 @@ class PlayerWindow(QMainWindow):
         tools_menu = QMenu(self)
         action_transcribe = tools_menu.addAction("音视频转字幕")
         action_transcribe.triggered.connect(self._open_transcribe_tool)
+        action_download = tools_menu.addAction("视频下载")
+        action_download.triggered.connect(self._open_video_download_tool)
         action_live = tools_menu.addAction("边播边转")
         action_live.triggered.connect(self._start_live_transcribe_manual)
         tools_menu.addSeparator()
@@ -337,11 +302,16 @@ class PlayerWindow(QMainWindow):
         self._action_vocabulary.triggered.connect(self._generate_vocabulary_list)
         action_plain_text = tools_menu.addAction("纯文字")
         action_plain_text.triggered.connect(self._export_plain_text)
+        tools_menu.addSeparator()
+        self._action_console = tools_menu.addAction(console_button_label())
+        self._action_console.setToolTip("显示或隐藏后台命令窗口")
+        self._action_console.triggered.connect(toggle_console)
+        add_console_visibility_listener(self._on_console_visibility_changed)
 
         tools_btn = self._create_toolbar_menu_button(
             "工具",
             style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
-            "转写、笔记与字幕工具",
+            "转写、下载、笔记与字幕工具",
         )
         tools_btn.setMenu(tools_menu)
         bar.addWidget(tools_btn)
@@ -384,6 +354,31 @@ class PlayerWindow(QMainWindow):
         settings_menu.addAction(output_action)
         self._refresh_audio_devices()
 
+        translator = get_translator(self._config.translate_app)
+        hotkey_widget = QWidget()
+        hotkey_layout = QHBoxLayout(hotkey_widget)
+        hotkey_layout.setContentsMargins(12, 6, 12, 6)
+        hotkey_layout.addWidget(QLabel("翻译热键"))
+        self.translate_hotkey_edit = HotkeyLineEdit()
+        self.translate_hotkey_edit.setMinimumWidth(140)
+        self.translate_hotkey_edit.setText(self._config.translate_hotkey or translator.default_hotkey)
+        self.translate_hotkey_edit.setPlaceholderText(translator.default_hotkey)
+        self.translate_hotkey_edit.setToolTip(
+            "需与翻译软件中的「快捷键发起翻译」一致。点击后按下组合键，或直接输入，例如 Ctrl+Alt+C。"
+        )
+        self.translate_hotkey_edit.hotkeyEdited.connect(self._on_translate_hotkey_changed)
+        hotkey_layout.addWidget(self.translate_hotkey_edit, stretch=1)
+        help_btn = QPushButton("说明")
+        help_btn.setAutoDefault(False)
+        help_btn.setDefault(False)
+        help_btn.setToolTip("查看翻译快捷键的设置方法")
+        help_btn.clicked.connect(self._open_translate_hotkey_help)
+        hotkey_layout.addWidget(help_btn)
+        hotkey_action = QWidgetAction(self)
+        hotkey_action.setDefaultWidget(hotkey_widget)
+        settings_menu.addAction(hotkey_action)
+        self._settings_menu = settings_menu
+
         settings_btn = self._create_toolbar_menu_button(
             "设置",
             style.standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView),
@@ -393,6 +388,18 @@ class PlayerWindow(QMainWindow):
         bar.addWidget(settings_btn)
         return bar
 
+    def _on_console_visibility_changed(self, visible: bool) -> None:
+        def apply() -> None:
+            if not hasattr(self, "_action_console"):
+                return
+            self._action_console.setText("隐藏后台" if visible else "查看后台")
+
+        QTimer.singleShot(0, apply)
+
+    def _error_box(self, title: str, text: str) -> None:
+        reveal_console_on_error(f"{title}: {text}")
+        QMessageBox.warning(self, title, text)
+
     def _build_main_splitter(self) -> QSplitter:
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -400,12 +407,12 @@ class PlayerWindow(QMainWindow):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        self._video_host = VideoDisplayHost()
-        self._video_host.setMinimumSize(480, 270)
-        self._video_host.set_toggle_callback(self.toggle_playback_from_video)
-        self._video_host.set_double_click_callback(self.toggle_maximize_from_video)
-        self._player.setVideoOutput(self._video_host.video_item)
-        left_layout.addWidget(self._video_host, stretch=1)
+        self._video_widget = ClickableVideoWidget()
+        self._video_widget.setMinimumSize(480, 270)
+        self._video_widget.set_toggle_callback(self.toggle_playback_from_video)
+        self._video_widget.set_double_click_callback(self.toggle_maximize_from_video)
+        self._player.setVideoOutput(self._video_widget)
+        left_layout.addWidget(self._video_widget, stretch=1)
 
         self._audio_placeholder = QLabel("音频播放中")
         self._audio_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -443,9 +450,51 @@ class PlayerWindow(QMainWindow):
         self._audio_placeholder.installEventFilter(self)
         return splitter
 
+    def _style_media_icon(self, pixmap: QStyle.StandardPixmap) -> QIcon:
+        icon = self.style().standardIcon(pixmap)
+        src = icon.pixmap(QSize(18, 18))
+        if src.isNull():
+            return icon
+        tinted = QPixmap(src.size())
+        tinted.setDevicePixelRatio(src.devicePixelRatio())
+        tinted.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(tinted)
+        painter.drawPixmap(0, 0, src)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        painter.fillRect(tinted.rect(), QColor("#b980ff"))
+        painter.end()
+        result = QIcon()
+        result.addPixmap(tinted)
+        return result
+
+    def _configure_icon_button(self, button: QPushButton, tooltip: str) -> None:
+        button.setObjectName("iconButton")
+        button.setText("")
+        button.setToolTip(tooltip)
+        button.setFixedSize(34, 32)
+        button.setIconSize(QSize(18, 18))
+
+    def _set_play_button_state(self, playing: bool) -> None:
+        if playing:
+            self.play_btn.setIcon(self._style_media_icon(QStyle.StandardPixmap.SP_MediaPause))
+            self.play_btn.setToolTip("暂停")
+        else:
+            self.play_btn.setIcon(self._style_media_icon(QStyle.StandardPixmap.SP_MediaPlay))
+            self.play_btn.setToolTip("播放")
+
+    def _set_mute_button_state(self, muted: bool) -> None:
+        if muted:
+            self.mute_btn.setIcon(self._style_media_icon(QStyle.StandardPixmap.SP_MediaVolumeMuted))
+            self.mute_btn.setToolTip("取消静音")
+        else:
+            self.mute_btn.setIcon(self._style_media_icon(QStyle.StandardPixmap.SP_MediaVolume))
+            self.mute_btn.setToolTip("静音")
+
     def _build_controls(self) -> QHBoxLayout:
         bar = QHBoxLayout()
-        self.play_btn = QPushButton("播放")
+        self.play_btn = QPushButton()
+        self._configure_icon_button(self.play_btn, "播放")
+        self._set_play_button_state(False)
         self.play_btn.clicked.connect(self._toggle_play)
         bar.addWidget(self.play_btn)
 
@@ -478,9 +527,10 @@ class PlayerWindow(QMainWindow):
         self.study_countdown_btn.clicked.connect(self._on_study_countdown_clicked)
         bar.addWidget(self.study_countdown_btn)
 
-        self.mute_btn = QPushButton("静音")
+        self.mute_btn = QPushButton()
+        self._configure_icon_button(self.mute_btn, "静音")
         self.mute_btn.setCheckable(True)
-        self.mute_btn.setFixedWidth(52)
+        self._set_mute_button_state(False)
         self.mute_btn.toggled.connect(self._on_mute_toggled)
         bar.addWidget(self.mute_btn)
 
@@ -495,19 +545,6 @@ class PlayerWindow(QMainWindow):
         self.volume_label = QLabel("100%")
         self.volume_label.setMinimumWidth(36)
         bar.addWidget(self.volume_label)
-
-        bar.addWidget(QLabel("亮度"))
-        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
-        self.brightness_slider.setRange(0, 200)
-        self.brightness_slider.setValue(100)
-        self.brightness_slider.setFixedWidth(100)
-        self.brightness_slider.setToolTip("亮度（100% 为原始画面）")
-        self.brightness_slider.valueChanged.connect(self._on_brightness_changed)
-        bar.addWidget(self.brightness_slider)
-
-        self.brightness_label = QLabel("100%")
-        self.brightness_label.setMinimumWidth(36)
-        bar.addWidget(self.brightness_label)
         return bar
 
     def _study_countdown_is_foreground(self) -> bool:
@@ -617,10 +654,10 @@ class PlayerWindow(QMainWindow):
         self._player.setSource(QUrl.fromLocalFile(str(media_path)))
 
         is_audio = media_path.suffix.lower() in AUDIO_EXTENSIONS
-        self._video_host.setVisible(not is_audio)
+        self._video_widget.setVisible(not is_audio)
         self._audio_placeholder.setVisible(is_audio)
         if not is_audio:
-            self._player.setVideoOutput(self._video_host.video_item)
+            self._player.setVideoOutput(self._video_widget)
 
         self.subtitle_list.clear()
         self._segments.clear()
@@ -700,7 +737,7 @@ class PlayerWindow(QMainWindow):
         try:
             self._segments = load_subtitles(path)
         except Exception as exc:
-            QMessageBox.warning(self, "字幕加载失败", str(exc))
+            self._error_box("字幕加载失败", str(exc))
             self._segments = []
         self._populate_subtitle_list()
 
@@ -785,7 +822,7 @@ class PlayerWindow(QMainWindow):
                 try:
                     resume_segments = load_subtitles(choice.subtitle_path)
                 except Exception as exc:
-                    QMessageBox.warning(self, "字幕加载失败", str(exc))
+                    self._error_box("字幕加载失败", str(exc))
             self._begin_live_transcribe(resume_segments=resume_segments)
             self._update_notes_buttons()
             return
@@ -857,7 +894,7 @@ class PlayerWindow(QMainWindow):
         self._live_worker = None
         self._update_live_status("")
         self._refresh_subtitle_options()
-        QMessageBox.warning(self, "边播边转失败", message)
+        self._error_box("边播边转失败", message)
 
     def _append_live_segments(self, new_segments: list[SubtitleSegment]) -> None:
         for seg in new_segments:
@@ -900,7 +937,7 @@ class PlayerWindow(QMainWindow):
         try:
             self._segments = load_subtitles(Path(path_value))
         except Exception as exc:
-            QMessageBox.warning(self, "字幕加载失败", str(exc))
+            self._error_box("字幕加载失败", str(exc))
             self._segments = []
         self._populate_subtitle_list()
         if self._segments and self._player.duration() > 0:
@@ -1047,7 +1084,7 @@ class PlayerWindow(QMainWindow):
             )
             return
         seg = self._segments[row]
-        result = SubtitleEditDialog.edit_segment(seg, self)
+        result = SubtitleEditDialog.edit_segment(seg, self, config=self._config)
         if result is None:
             return
         new_start, new_end, new_text = result
@@ -1094,7 +1131,7 @@ class PlayerWindow(QMainWindow):
             path.parent.mkdir(parents=True, exist_ok=True)
             write_subtitle_file(self._segments, path, fmt)
         except OSError as exc:
-            QMessageBox.warning(self, "保存失败", str(exc))
+            self._error_box("保存失败", str(exc))
 
     def toggle_playback_from_video(self) -> None:
         if self._media_path is None:
@@ -1120,7 +1157,7 @@ class PlayerWindow(QMainWindow):
             self._play_media()
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
-        self.play_btn.setText("暂停" if state == QMediaPlayer.PlaybackState.PlayingState else "播放")
+        self._set_play_button_state(state == QMediaPlayer.PlaybackState.PlayingState)
 
     def _on_duration_changed(self, duration_ms: int) -> None:
         self.position_slider.setRange(0, max(0, duration_ms))
@@ -1291,7 +1328,7 @@ class PlayerWindow(QMainWindow):
         self._player.setSource(QUrl())
         self._player.setSource(QUrl.fromLocalFile(str(self._media_path)))
         if not is_audio:
-            self._player.setVideoOutput(self._video_host.video_item)
+            self._player.setVideoOutput(self._video_widget)
 
     def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
         if not self._awaiting_reload_seek:
@@ -1462,31 +1499,81 @@ class PlayerWindow(QMainWindow):
         if value > 0 and self.mute_btn.isChecked():
             self.mute_btn.blockSignals(True)
             self.mute_btn.setChecked(False)
-            self.mute_btn.setText("静音")
+            self._set_mute_button_state(False)
             self.mute_btn.blockSignals(False)
             self._audio_output.setMuted(False)
 
-    def _on_brightness_changed(self, value: int) -> None:
-        self.brightness_label.setText(f"{value}%")
-        self._video_host.set_brightness(value)
-
     def _on_mute_toggled(self, muted: bool) -> None:
         self._audio_output.setMuted(muted)
-        self.mute_btn.setText("取消静音" if muted else "静音")
+        self._set_mute_button_state(muted)
 
     def _open_transcribe_tool(self) -> None:
-        initial_files = [self._media_path] if self._media_path else []
-        if self._transcribe_window is None:
-            self._transcribe_window = TranscribeWindow(initial_files=initial_files, parent=self)
-            self._transcribe_window.transcription_finished.connect(self._on_transcription_finished)
-        else:
-            self._transcribe_window.show()
-            self._transcribe_window.raise_()
-            self._transcribe_window.activateWindow()
-            if initial_files:
-                self._transcribe_window._add_files_to_table(initial_files)
+        """启动转写工具为独立进程，避免共用 CMD：关闭转写后台不会关掉播放器。"""
+        if self._transcribe_proc is not None and self._transcribe_proc.poll() is None:
+            if not focus_window_by_title(TRANSCRIBE_WINDOW_TITLE):
+                QMessageBox.information(self, "提示", "音视频转字幕工具已在运行。")
             return
-        self._transcribe_window.show()
+
+        app_root = Path(__file__).resolve().parents[1]
+        main_py = app_root / "main.py"
+        if not main_py.is_file():
+            self._error_box("无法启动", f"未找到转写工具入口：\n{main_py}")
+            return
+
+        cmd = [sys.executable, str(main_py), "--transcribe"]
+        if self._media_path:
+            cmd.append(str(self._media_path))
+        try:
+            self._transcribe_proc = spawn_hidden_console_process(cmd, cwd=app_root)
+        except OSError as exc:
+            self._error_box("无法启动", f"启动转写工具失败：\n{exc}")
+            return
+        self._transcribe_poll_timer.start()
+
+    def _poll_transcribe_tool(self) -> None:
+        proc = self._transcribe_proc
+        if proc is None:
+            self._transcribe_poll_timer.stop()
+            return
+        self._refresh_subtitles_keep_selection(load_new=True)
+        if proc.poll() is not None:
+            self._transcribe_proc = None
+            self._transcribe_poll_timer.stop()
+            self._on_transcription_finished()
+
+    def _refresh_subtitles_keep_selection(self, load_new: bool = False) -> None:
+        previous = self.subtitle_combo.currentData()
+        old_count = self.subtitle_combo.count()
+        self._refresh_subtitle_options()
+        if previous:
+            for index in range(self.subtitle_combo.count()):
+                if self.subtitle_combo.itemData(index) == previous:
+                    self.subtitle_combo.setCurrentIndex(index)
+                    return
+        if load_new and self.subtitle_combo.count() > old_count:
+            self.subtitle_combo.setCurrentIndex(0)
+            self._load_subtitle_at_index(0)
+
+    def _open_video_download_tool(self) -> None:
+        """启动视频下载器（独立进程，避免 CustomTkinter 与 Qt 事件循环冲突）。"""
+        if self._video_download_proc is not None and self._video_download_proc.poll() is None:
+            QMessageBox.information(self, "提示", "视频下载工具已在运行。")
+            return
+
+        tool_root = Path(__file__).resolve().parents[1] / "video_downloader"
+        main_py = tool_root / "main.py"
+        if not main_py.is_file():
+            self._error_box("无法启动", f"未找到视频下载工具：\n{main_py}")
+            return
+
+        try:
+            self._video_download_proc = spawn_hidden_console_process(
+                [sys.executable, str(main_py)],
+                cwd=tool_root,
+            )
+        except OSError as exc:
+            self._error_box("无法启动", f"启动视频下载工具失败：\n{exc}")
+            return
 
     def _on_transcription_finished(self) -> None:
         if self._media_path:
@@ -1509,6 +1596,27 @@ class PlayerWindow(QMainWindow):
                 "当前未安装 CUDA 版 pywhispercpp。\n"
                 "请先运行 subtitle_app/安装CUDA推理.bat，否则将自动使用 CPU。",
             )
+
+    def _on_translate_hotkey_changed(self) -> None:
+        translator = get_translator(self._config.translate_app)
+        text = normalize_hotkey_text(
+            self.translate_hotkey_edit.text(), translator.default_hotkey
+        )
+        if self.translate_hotkey_edit.text() != text:
+            self.translate_hotkey_edit.blockSignals(True)
+            self.translate_hotkey_edit.setText(text)
+            self.translate_hotkey_edit.blockSignals(False)
+        if text == self._config.translate_hotkey:
+            return
+        self._config.translate_hotkey = text
+        save_config(self._config)
+
+    def _open_translate_hotkey_help(self) -> None:
+        self._on_translate_hotkey_changed()
+        if getattr(self, "_settings_menu", None) is not None:
+            self._settings_menu.close()
+        translator = get_translator(self._config.translate_app)
+        TranslateHotkeyHelpDialog(translator, self).exec()
 
     def _open_llm_settings(self) -> None:
         self._config = load_config()
@@ -1569,7 +1677,7 @@ class PlayerWindow(QMainWindow):
 
         corpus_items = collect_valid_subtitle_corpus(self._media_path)
         if not corpus_items:
-            QMessageBox.warning(self, "无法生成", "未找到有效字幕文件，无法生成笔记。")
+            self._error_box("无法生成", "未找到有效字幕文件，无法生成笔记。")
             return
 
         corpus_text = corpus_to_text(corpus_items)
@@ -1650,7 +1758,7 @@ class PlayerWindow(QMainWindow):
                 media_duration_seconds=media_duration,
             )
         except Exception as exc:
-            QMessageBox.warning(self, "纯文字导出失败", str(exc))
+            self._error_box("纯文字导出失败", str(exc))
             return
 
         QMessageBox.information(
@@ -1699,7 +1807,7 @@ class PlayerWindow(QMainWindow):
         self._action_vocabulary.setEnabled(True)
         self._vocabulary_worker = None
         self._update_live_status("")
-        QMessageBox.warning(self, "生词表生成失败", message)
+        self._error_box("生词表生成失败", message)
 
     def _stop_vocabulary_worker(self) -> None:
         if self._vocabulary_worker and self._vocabulary_worker.isRunning():
@@ -1768,14 +1876,14 @@ class PlayerWindow(QMainWindow):
             self._pending_notes_output = full_message
             QTimer.singleShot(500, self._close_ai_notes_progress_and_notify_failure)
         else:
-            QMessageBox.warning(self, "AI 笔记生成失败", full_message)
+            self._error_box("AI 笔记生成失败", full_message)
 
     def _close_ai_notes_progress_and_notify_failure(self) -> None:
         message = self._pending_notes_output
         self._pending_notes_output = ""
         self._close_ai_notes_progress()
         if message:
-            QMessageBox.warning(self, "AI 笔记生成失败", message)
+            self._error_box("AI 笔记生成失败", message)
 
     def _stop_ai_notes_worker(self) -> None:
         if self._ai_notes_worker and self._ai_notes_worker.isRunning():
@@ -1795,8 +1903,7 @@ class PlayerWindow(QMainWindow):
         if now < self._error_dialog_suppressed_until:
             return
         self._error_dialog_suppressed_until = now + _ERROR_DIALOG_COOLDOWN_SEC
-        QMessageBox.warning(
-            self,
+        self._error_box(
             "媒体播放失败",
             f"无法播放该文件：\n{detail}\n\n"
             "可尝试：重新打开该媒体文件后再点击字幕跳转；"
@@ -1826,6 +1933,4 @@ class PlayerWindow(QMainWindow):
         self._stop_ai_notes_worker()
         self._stop_vocabulary_worker()
         self._player.stop()
-        if self._transcribe_window is not None:
-            self._transcribe_window.close()
         super().closeEvent(event)

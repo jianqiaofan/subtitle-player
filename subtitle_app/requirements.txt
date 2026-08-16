@@ -9,3 +9,8 @@ pronouncing>=0.2.0
 nltk>=3.8.0
 jaconv>=0.4.0
 opencc-python-reimplemented>=0.1.7
+# 视频下载工具（subtitle_app/video_downloader）
+yt-dlp>=2024.8.6
+customtkinter>=5.2.2
+Pillow>=10.0.0
+pyperclip>=1.9.0

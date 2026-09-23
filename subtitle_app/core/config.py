@@ -113,6 +113,16 @@ class AppConfig:
     last_media_dir: str = ""
     translate_app: str = "baidu"
     translate_hotkey: str = "Ctrl+Alt+C"
+    # 画面叠加字幕（半透明底条 + 实心字）
+    onscreen_subtitle_enabled: bool = True
+    onscreen_subtitle_font_size: int = 28
+    onscreen_subtitle_color: str = "#FFFFFF"
+    onscreen_subtitle_bg_opacity: float = 0.55
+    onscreen_subtitle_width_percent: int = 80
+    onscreen_subtitle_position: str = "bottom"  # top | middle | bottom
+    # 沉浸列表：字幕列表透明叠在画面上
+    immersive_subtitle_list: bool = False
+    immersive_subtitle_list_opacity: float = 0.28
 
     def get_ai_notes_user_context(self, subtitle_type: str) -> str:
         return str(self.ai_notes_user_context.get(subtitle_type, "") or "").strip()
@@ -257,6 +267,34 @@ def load_config() -> AppConfig:
     cfg.translate_app = get_translator(cfg.translate_app).id or DEFAULT_TRANSLATOR_ID
     translator = get_translator(cfg.translate_app)
     cfg.translate_hotkey = normalize_hotkey_text(cfg.translate_hotkey, translator.default_hotkey)
+    cfg.onscreen_subtitle_enabled = bool(cfg.onscreen_subtitle_enabled)
+    try:
+        cfg.onscreen_subtitle_font_size = max(12, min(72, int(cfg.onscreen_subtitle_font_size)))
+    except (TypeError, ValueError):
+        cfg.onscreen_subtitle_font_size = 28
+    color = str(cfg.onscreen_subtitle_color or "").strip() or "#FFFFFF"
+    if not color.startswith("#"):
+        color = f"#{color}"
+    cfg.onscreen_subtitle_color = color
+    try:
+        cfg.onscreen_subtitle_bg_opacity = max(0.0, min(1.0, float(cfg.onscreen_subtitle_bg_opacity)))
+    except (TypeError, ValueError):
+        cfg.onscreen_subtitle_bg_opacity = 0.55
+    try:
+        cfg.onscreen_subtitle_width_percent = max(30, min(100, int(cfg.onscreen_subtitle_width_percent)))
+    except (TypeError, ValueError):
+        cfg.onscreen_subtitle_width_percent = 80
+    position = str(cfg.onscreen_subtitle_position or "").strip().lower()
+    if position not in {"top", "middle", "bottom"}:
+        position = "bottom"
+    cfg.onscreen_subtitle_position = position
+    cfg.immersive_subtitle_list = bool(cfg.immersive_subtitle_list)
+    try:
+        cfg.immersive_subtitle_list_opacity = max(
+            0.0, min(1.0, float(cfg.immersive_subtitle_list_opacity))
+        )
+    except (TypeError, ValueError):
+        cfg.immersive_subtitle_list_opacity = 0.28
     return cfg
 
 

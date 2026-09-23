@@ -18,5 +18,13 @@
   "ecdict_db_path": "",
   "last_media_dir": "",
   "translate_app": "baidu",
-  "translate_hotkey": "Ctrl+Alt+C"
+  "translate_hotkey": "Ctrl+Alt+C",
+  "onscreen_subtitle_enabled": true,
+  "onscreen_subtitle_font_size": 28,
+  "onscreen_subtitle_color": "#FFFFFF",
+  "onscreen_subtitle_bg_opacity": 0.55,
+  "onscreen_subtitle_width_percent": 80,
+  "onscreen_subtitle_position": "bottom",
+  "immersive_subtitle_list": false,
+  "immersive_subtitle_list_opacity": 0.28
 }

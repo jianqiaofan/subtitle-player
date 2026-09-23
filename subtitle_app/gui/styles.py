@@ -9,6 +9,15 @@ QVideoWidget {
     background-color: #000000;
     border: none;
 }
+QWidget#mediaViewport,
+QWidget#subtitleVideoWidget {
+    background-color: #000000;
+    border: none;
+}
+QWidget#onscreenSubtitleOverlay {
+    background-color: transparent;
+    border: none;
+}
 QGroupBox {
     border: 1px solid rgba(255, 255, 255, 0.25);
     border-radius: 6px;
@@ -151,6 +160,9 @@ QLabel#hintLabel {
     color: #aaaaaa;
     font-size: 12px;
 }
+QLabel#settingsFieldLabel {
+    color: #ffffff;
+}
 QScrollBar:vertical {
     background: #393939;
     width: 10px;
@@ -190,4 +202,45 @@ QSplitter::handle {
     background-color: rgba(255, 255, 255, 0.15);
     width: 4px;
 }
+"""
+
+IMMERSIVE_SUBTITLE_PANEL_STYLE = ""  # use build_immersive_subtitle_panel_style()
+
+
+def build_immersive_subtitle_panel_style(opacity: float) -> str:
+    """Build translucent styles for immersive subtitle list overlay."""
+    opacity = max(0.0, min(1.0, float(opacity)))
+    panel_alpha = int(round(opacity * 255))
+    list_alpha = int(round(opacity * 0.7 * 255))
+    return f"""
+QWidget#subtitlePanel {{
+    background-color: rgba(12, 12, 12, {panel_alpha});
+    border: none;
+    border-left: 1px solid rgba(255, 255, 255, 0.18);
+}}
+QWidget#subtitlePanel QLabel {{
+    color: #ffffff;
+    background: transparent;
+}}
+QListWidget#immersiveSubtitleList {{
+    background-color: rgba(20, 20, 20, {list_alpha});
+    color: #ffffff;
+    border: none;
+    border-radius: 0;
+    padding: 4px;
+    font-size: 13px;
+    outline: none;
+}}
+QListWidget#immersiveSubtitleList::item {{
+    padding: 8px 6px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.10);
+    background: transparent;
+}}
+QListWidget#immersiveSubtitleList::item:selected {{
+    background-color: rgba(185, 128, 255, 0.48);
+    color: #ffffff;
+}}
+QListWidget#immersiveSubtitleList::item:hover {{
+    background-color: rgba(185, 128, 255, 0.24);
+}}
 """

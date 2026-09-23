@@ -15,7 +15,6 @@ from PyQt6.QtGui import (
     QGuiApplication,
     QIcon,
     QPainter,
-    QPalette,
     QPixmap,
 )
 from PyQt6.QtMultimedia import (
@@ -25,7 +24,6 @@ from PyQt6.QtMultimedia import (
     QMediaPlayer,
     QPlaybackOptions,
 )
-from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -93,7 +91,14 @@ from gui.ai_notes_corpus_dialog import AiNotesCorpusDialog
 from gui.ai_notes_progress_dialog import AiNotesProgressDialog
 from gui.llm_settings_dialog import LlmSettingsDialog
 from gui.main_window import WINDOW_TITLE as TRANSCRIBE_WINDOW_TITLE
-from gui.styles import DARK_STYLE, PLAYER_LIST_STYLE
+from gui.onscreen_subtitle import (
+    MediaViewport,
+    OnScreenSubtitleSettingsDialog,
+    OnScreenSubtitleStyle,
+    SubtitleVideoWidget,
+    apply_onscreen_style_to_config,
+)
+from gui.styles import DARK_STYLE, PLAYER_LIST_STYLE, build_immersive_subtitle_panel_style
 from gui.subtitle_edit_dialog import SubtitleEditDialog
 from gui.subtitle_text_dialog import SubtitleTextDialog
 from gui.translate_hotkey import HotkeyLineEdit, TranslateHotkeyHelpDialog
@@ -101,67 +106,6 @@ from gui.vocabulary_dialog import VocabularyDialog
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".opus"}
 
-
-class ClickableVideoWidget(QVideoWidget):
-    """原生视频输出：硬件直出，无叠加层，避免二次合成导致画质下降。
-
-    Qt6 的 QVideoWidget 内部使用独立视频窗口（WindowTransparentForInput），
-    因此点击事件直接落在本控件上，无需再盖透明子控件。
-    """
-
-    _SINGLE_CLICK_MS = 250
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._toggle_callback = None
-        self._double_click_callback = None
-        self._single_click_timer = QTimer(self)
-        self._single_click_timer.setSingleShot(True)
-        self._single_click_timer.setInterval(self._SINGLE_CLICK_MS)
-        self._single_click_timer.timeout.connect(self._emit_single_click)
-
-        # KeepAspectRatio：按比例缩放并留黑边，避免拉伸变形。
-        self.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet("background-color: #000000; border: none;")
-        palette = self.palette()
-        palette.setColor(QPalette.ColorRole.Window, QColor("#000000"))
-        palette.setColor(QPalette.ColorRole.Base, QColor("#000000"))
-        self.setPalette(palette)
-        self.setAutoFillBackground(True)
-
-    def set_toggle_callback(self, callback) -> None:
-        self._toggle_callback = callback
-
-    def set_double_click_callback(self, callback) -> None:
-        self._double_click_callback = callback
-
-    def _emit_single_click(self) -> None:
-        if self._toggle_callback is not None:
-            self._toggle_callback()
-
-    def _schedule_single_click(self) -> None:
-        self._single_click_timer.start()
-
-    def _cancel_single_click(self) -> None:
-        self._single_click_timer.stop()
-
-    def mouseDoubleClickEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._cancel_single_click()
-            if self._double_click_callback is not None:
-                self._double_click_callback()
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
-
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._schedule_single_click()
-            event.accept()
-            return
-        super().mousePressEvent(event)
 
 class PlayerWindow(QMainWindow):
     def __init__(self) -> None:
@@ -184,7 +128,7 @@ class PlayerWindow(QMainWindow):
         self._config = load_config()
         self._media_area_click_timer = QTimer(self)
         self._media_area_click_timer.setSingleShot(True)
-        self._media_area_click_timer.setInterval(ClickableVideoWidget._SINGLE_CLICK_MS)
+        self._media_area_click_timer.setInterval(SubtitleVideoWidget._SINGLE_CLICK_MS)
         self._media_area_click_timer.timeout.connect(self._on_deferred_media_area_click)
         self._study_countdown_remaining = 0
         self._study_countdown_timer = QTimer(self)
@@ -215,6 +159,8 @@ class PlayerWindow(QMainWindow):
         self._transcribe_poll_timer = QTimer(self)
         self._transcribe_poll_timer.setInterval(1500)
         self._transcribe_poll_timer.timeout.connect(self._poll_transcribe_tool)
+        self._immersive_list_active = False
+        self._splitter_sizes_before_immersive: list[int] | None = None
 
         self.setWindowTitle("字幕播放器")
         self.setMinimumSize(1000, 640)
@@ -284,6 +230,11 @@ class PlayerWindow(QMainWindow):
 
         bar.addStretch(1)
 
+        onscreen_btn = QPushButton("画面字幕")
+        onscreen_btn.setToolTip("调整画面叠加字幕的显示、字号、颜色、底条透明度、宽度与位置")
+        onscreen_btn.clicked.connect(self._open_onscreen_subtitle_settings)
+        bar.addWidget(onscreen_btn)
+
         tools_menu = QMenu(self)
         action_transcribe = tools_menu.addAction("音视频转字幕")
         action_transcribe.triggered.connect(self._open_transcribe_tool)
@@ -324,7 +275,7 @@ class PlayerWindow(QMainWindow):
         inference_widget = QWidget()
         inference_layout = QHBoxLayout(inference_widget)
         inference_layout.setContentsMargins(12, 6, 12, 6)
-        inference_layout.addWidget(QLabel("推理设备"))
+        inference_layout.addWidget(self._settings_field_label("推理设备"))
         self.inference_combo = QComboBox()
         self.inference_combo.setMinimumWidth(180)
         for label, value in INFERENCE_DEVICE_OPTIONS:
@@ -344,7 +295,7 @@ class PlayerWindow(QMainWindow):
         output_widget = QWidget()
         output_layout = QHBoxLayout(output_widget)
         output_layout.setContentsMargins(12, 6, 12, 6)
-        output_layout.addWidget(QLabel("输出设备"))
+        output_layout.addWidget(self._settings_field_label("输出设备"))
         self.audio_device_combo = QComboBox()
         self.audio_device_combo.setMinimumWidth(220)
         self.audio_device_combo.currentIndexChanged.connect(self._on_audio_device_changed)
@@ -358,7 +309,7 @@ class PlayerWindow(QMainWindow):
         hotkey_widget = QWidget()
         hotkey_layout = QHBoxLayout(hotkey_widget)
         hotkey_layout.setContentsMargins(12, 6, 12, 6)
-        hotkey_layout.addWidget(QLabel("翻译热键"))
+        hotkey_layout.addWidget(self._settings_field_label("翻译热键"))
         self.translate_hotkey_edit = HotkeyLineEdit()
         self.translate_hotkey_edit.setMinimumWidth(140)
         self.translate_hotkey_edit.setText(self._config.translate_hotkey or translator.default_hotkey)
@@ -388,6 +339,13 @@ class PlayerWindow(QMainWindow):
         bar.addWidget(settings_btn)
         return bar
 
+    @staticmethod
+    def _settings_field_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("settingsFieldLabel")
+        label.setStyleSheet("color: #ffffff;")
+        return label
+
     def _on_console_visibility_changed(self, visible: bool) -> None:
         def apply() -> None:
             if not hasattr(self, "_action_console"):
@@ -402,33 +360,42 @@ class PlayerWindow(QMainWindow):
 
     def _build_main_splitter(self) -> QSplitter:
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._content_splitter = splitter
 
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        self._media_host = QWidget()
+        self._media_host.setObjectName("mediaHost")
+        media_host_layout = QVBoxLayout(self._media_host)
+        media_host_layout.setContentsMargins(0, 0, 0, 0)
+        media_host_layout.setSpacing(0)
 
-        self._video_widget = ClickableVideoWidget()
-        self._video_widget.setMinimumSize(480, 270)
-        self._video_widget.set_toggle_callback(self.toggle_playback_from_video)
-        self._video_widget.set_double_click_callback(self.toggle_maximize_from_video)
-        self._player.setVideoOutput(self._video_widget)
-        left_layout.addWidget(self._video_widget, stretch=1)
+        video_widget = SubtitleVideoWidget()
+        video_widget.set_toggle_callback(self.toggle_playback_from_video)
+        video_widget.set_double_click_callback(self.toggle_maximize_from_video)
+        self._player.setVideoSink(video_widget.video_sink())
 
-        self._audio_placeholder = QLabel("音频播放中")
-        self._audio_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._audio_placeholder.setMinimumHeight(280)
-        self._audio_placeholder.setStyleSheet(
+        audio_placeholder = QLabel("音频播放中")
+        audio_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        audio_placeholder.setMinimumHeight(280)
+        audio_placeholder.setStyleSheet(
             "background-color: #2b2b2b; border: 1px solid rgba(255,255,255,0.2);"
             "font-size: 22px; color: #b980ff;"
         )
-        self._audio_placeholder.hide()
-        left_layout.addWidget(self._audio_placeholder)
+        audio_placeholder.hide()
+
+        self._media_viewport = MediaViewport(video_widget, audio_placeholder)
+        self._video_widget = video_widget
+        self._audio_placeholder = audio_placeholder
+        self._onscreen_overlay = self._media_viewport.overlay
+        self._onscreen_overlay.set_style(OnScreenSubtitleStyle.from_config(self._config))
+        media_host_layout.addWidget(self._media_viewport, stretch=1)
 
         self._subtitle_panel = QWidget()
+        self._subtitle_panel.setObjectName("subtitlePanel")
         right_layout = QVBoxLayout(self._subtitle_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
         header = QHBoxLayout()
-        header.addWidget(QLabel("字幕列表（点击跳转）"))
+        self._subtitle_panel_title = QLabel("字幕列表（点击跳转）")
+        header.addWidget(self._subtitle_panel_title)
         self.live_status_label = QLabel("")
         self.live_status_label.setObjectName("hintLabel")
         header.addStretch(1)
@@ -442,13 +409,108 @@ class PlayerWindow(QMainWindow):
         right_layout.addWidget(self.subtitle_list)
         self.subtitle_list.installEventFilter(self)
 
-        splitter.addWidget(left)
+        splitter.addWidget(self._media_host)
         splitter.addWidget(self._subtitle_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
 
         self._audio_placeholder.installEventFilter(self)
+        self._media_host.installEventFilter(self)
+
+        # Restore immersive list mode from config after widgets exist.
+        QTimer.singleShot(
+            0,
+            lambda: self._set_immersive_subtitle_list(
+                bool(self._config.immersive_subtitle_list),
+                float(self._config.immersive_subtitle_list_opacity),
+            ),
+        )
         return splitter
+
+    def _set_immersive_subtitle_list(
+        self,
+        enabled: bool,
+        opacity: float | None = None,
+    ) -> None:
+        """沉浸列表：画面铺满，字幕列表半透明叠在右侧。"""
+        if not hasattr(self, "_content_splitter") or not hasattr(self, "_subtitle_panel"):
+            return
+        enabled = bool(enabled)
+        if opacity is None:
+            opacity = float(getattr(self._config, "immersive_subtitle_list_opacity", 0.28))
+        opacity = max(0.0, min(1.0, float(opacity)))
+        self._immersive_list_opacity = opacity
+
+        if self._immersive_list_active == enabled:
+            if enabled:
+                self._apply_immersive_list_chrome(True, opacity)
+                self._layout_immersive_list_panel()
+            return
+
+        if enabled:
+            sizes = self._content_splitter.sizes()
+            if len(sizes) >= 2 and sizes[1] > 0:
+                self._splitter_sizes_before_immersive = list(sizes)
+            self._subtitle_panel.setParent(self._media_host)
+            self._apply_immersive_list_chrome(True, opacity)
+            self._subtitle_panel.show()
+            self._immersive_list_active = True
+            self._layout_immersive_list_panel()
+            self._subtitle_panel.raise_()
+        else:
+            self._apply_immersive_list_chrome(False)
+            self._content_splitter.addWidget(self._subtitle_panel)
+            self._immersive_list_active = False
+            restored = self._splitter_sizes_before_immersive
+            if restored and len(restored) >= 2 and sum(restored) > 0:
+                self._content_splitter.setSizes(restored)
+            else:
+                total = max(self._content_splitter.width(), 800)
+                self._content_splitter.setSizes([int(total * 0.62), int(total * 0.38)])
+            self._subtitle_panel.show()
+
+        self._media_viewport.refresh_stacking()
+
+    def _apply_immersive_list_chrome(
+        self,
+        immersive: bool,
+        opacity: float | None = None,
+    ) -> None:
+        panel = self._subtitle_panel
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        if immersive:
+            if opacity is None:
+                opacity = float(getattr(self, "_immersive_list_opacity", 0.28))
+            panel.setStyleSheet(build_immersive_subtitle_panel_style(opacity))
+            self.subtitle_list.setObjectName("immersiveSubtitleList")
+            self._subtitle_panel_title.setText("字幕列表")
+            # Force stylesheet re-polish after objectName change.
+            self.subtitle_list.style().unpolish(self.subtitle_list)
+            self.subtitle_list.style().polish(self.subtitle_list)
+            self.subtitle_list.update()
+        else:
+            panel.setStyleSheet("")
+            self.subtitle_list.setObjectName("")
+            self.subtitle_list.setStyleSheet("")
+            self._subtitle_panel_title.setText("字幕列表（点击跳转）")
+            self.subtitle_list.style().unpolish(self.subtitle_list)
+            self.subtitle_list.style().polish(self.subtitle_list)
+            self.subtitle_list.update()
+
+    def _layout_immersive_list_panel(self) -> None:
+        if not self._immersive_list_active:
+            return
+        host = self._media_host
+        width = max(240, int(host.width() * 0.36))
+        width = min(width, max(240, host.width() - 80))
+        self._subtitle_panel.setGeometry(
+            max(0, host.width() - width),
+            0,
+            width,
+            host.height(),
+        )
+        self._subtitle_panel.raise_()
+        self._subtitle_panel.show()
 
     def _style_media_icon(self, pixmap: QStyle.StandardPixmap) -> QIcon:
         icon = self.style().standardIcon(pixmap)
@@ -654,15 +716,17 @@ class PlayerWindow(QMainWindow):
         self._player.setSource(QUrl.fromLocalFile(str(media_path)))
 
         is_audio = media_path.suffix.lower() in AUDIO_EXTENSIONS
-        self._video_widget.setVisible(not is_audio)
-        self._audio_placeholder.setVisible(is_audio)
+        self._media_viewport.set_audio_mode(is_audio)
+        self._video_widget.clear_frame()
         if not is_audio:
-            self._player.setVideoOutput(self._video_widget)
+            self._player.setVideoSink(self._video_widget.video_sink())
+            QTimer.singleShot(0, self._media_viewport.refresh_stacking)
 
         self.subtitle_list.clear()
         self._segments.clear()
         self._current_subtitle_row = -1
         self._transcribed_until = 0.0
+        self._update_onscreen_subtitle(0.0)
         self._update_live_status("")
 
         if choice is not None:
@@ -779,6 +843,7 @@ class PlayerWindow(QMainWindow):
             self._segments.clear()
             self.subtitle_list.clear()
             self._transcribed_until = 0.0
+            self._update_onscreen_subtitle(0.0)
             self._update_live_status("准备中…")
 
         self._config.language = "mixed"
@@ -942,12 +1007,14 @@ class PlayerWindow(QMainWindow):
         self._populate_subtitle_list()
         if self._segments and self._player.duration() > 0:
             self._sync_subtitle_highlight(self._player.position() / 1000.0)
+        self._update_onscreen_subtitle(self._player.position() / 1000.0)
 
     def _populate_subtitle_list(self) -> None:
         self.subtitle_list.clear()
         for seg in self._segments:
             self.subtitle_list.addItem(QListWidgetItem(self._format_subtitle_item(seg)))
         self._current_subtitle_row = -1
+        self._update_onscreen_subtitle(self._player.position() / 1000.0)
 
     @staticmethod
     def _format_subtitle_item(seg: SubtitleSegment) -> str:
@@ -1158,6 +1225,8 @@ class PlayerWindow(QMainWindow):
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         self._set_play_button_state(state == QMediaPlayer.PlaybackState.PlayingState)
+        if state == QMediaPlayer.PlaybackState.PlayingState and hasattr(self, "_media_viewport"):
+            QTimer.singleShot(0, self._media_viewport.refresh_stacking)
 
     def _on_duration_changed(self, duration_ms: int) -> None:
         self.position_slider.setRange(0, max(0, duration_ms))
@@ -1175,6 +1244,7 @@ class PlayerWindow(QMainWindow):
             self._maybe_handle_subtitle_repeat(position_ms)
         self._update_time_label(position_ms, self._player.duration())
         self._sync_subtitle_highlight(position_ms / 1000.0)
+        self._update_onscreen_subtitle(position_ms / 1000.0)
 
     def _update_time_label(self, position_ms: int, duration_ms: int) -> None:
         self.time_label.setText(
@@ -1198,7 +1268,24 @@ class PlayerWindow(QMainWindow):
         )
         self.subtitle_list.blockSignals(False)
 
+    def _update_onscreen_subtitle(self, seconds: float) -> None:
+        overlay = getattr(self, "_onscreen_overlay", None)
+        if overlay is None:
+            return
+        if not self._segments:
+            overlay.set_text("")
+            return
+        row = find_segment_index_at_time(self._segments, seconds)
+        if row < 0:
+            overlay.set_text("")
+            return
+        overlay.set_text(self._segments[row].text)
+
     def eventFilter(self, obj, event) -> bool:
+        if obj is getattr(self, "_media_host", None):
+            if event.type() == QEvent.Type.Resize and self._immersive_list_active:
+                self._layout_immersive_list_panel()
+            return super().eventFilter(obj, event)
         if obj in (self._audio_placeholder,):
             if (
                 event.type() == QEvent.Type.MouseButtonDblClick
@@ -1328,7 +1415,8 @@ class PlayerWindow(QMainWindow):
         self._player.setSource(QUrl())
         self._player.setSource(QUrl.fromLocalFile(str(self._media_path)))
         if not is_audio:
-            self._player.setVideoOutput(self._video_widget)
+            self._player.setVideoSink(self._video_widget.video_sink())
+            QTimer.singleShot(0, self._media_viewport.refresh_stacking)
 
     def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
         if not self._awaiting_reload_seek:
@@ -1623,6 +1711,34 @@ class PlayerWindow(QMainWindow):
         updated = LlmSettingsDialog.open_settings(self._config, self)
         if updated is not None:
             self._config = updated
+
+    def _open_onscreen_subtitle_settings(self) -> None:
+        self._config = load_config()
+        current = OnScreenSubtitleStyle.from_config(self._config)
+        previous = OnScreenSubtitleStyle.from_config(self._config)
+
+        def on_preview(style: OnScreenSubtitleStyle) -> None:
+            self._onscreen_overlay.set_style(style)
+            self._set_immersive_subtitle_list(
+                style.immersive_list, style.immersive_list_opacity
+            )
+
+        result = OnScreenSubtitleSettingsDialog.edit_style(
+            current, self, on_preview=on_preview
+        )
+        if result is None:
+            self._onscreen_overlay.set_style(previous)
+            self._set_immersive_subtitle_list(
+                previous.immersive_list, previous.immersive_list_opacity
+            )
+            return
+        apply_onscreen_style_to_config(self._config, result)
+        self._onscreen_overlay.set_style(result)
+        self._set_immersive_subtitle_list(
+            result.immersive_list, result.immersive_list_opacity
+        )
+        self._update_onscreen_subtitle(self._player.position() / 1000.0)
+        self._media_viewport.refresh_stacking()
 
     def _ensure_llm_configured(self) -> bool:
         self._config = load_config()

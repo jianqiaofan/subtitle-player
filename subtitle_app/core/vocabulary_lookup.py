@@ -8,10 +8,23 @@ from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 
-from core.config import APP_DIR
+from core.app_paths import app_dir, bundle_dir
 
-DEFAULT_ECDICT_PATH = APP_DIR / "data" / "ecdict.db"
-DEFAULT_JAMDICT_PATH = APP_DIR / "data" / "jamdict.db"
+def _first_existing(*paths: Path) -> Path:
+    for path in paths:
+        if path.is_file():
+            return path
+    return paths[0]
+
+
+DEFAULT_ECDICT_PATH = _first_existing(
+    app_dir() / "data" / "ecdict.db",
+    bundle_dir() / "data" / "ecdict.db",
+)
+DEFAULT_JAMDICT_PATH = _first_existing(
+    app_dir() / "data" / "jamdict.db",
+    bundle_dir() / "data" / "jamdict.db",
+)
 
 WORDNET_POS_ZH = {
     "n": "名词",

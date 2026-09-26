@@ -36,5 +36,18 @@ def find_subtitles_for_media(media_path: Path) -> list[tuple[Path, str]]:
     return results
 
 
+def find_valid_subtitles(media_path: Path) -> list[tuple[Path, str]]:
+    """同目录下能成功加载、且含有字幕内容的文件。"""
+    valid: list[tuple[Path, str]] = []
+    for path, label in find_subtitles_for_media(media_path):
+        try:
+            segments = load_subtitle_file(path)
+        except (OSError, ValueError):
+            continue
+        if segments:
+            valid.append((path, label))
+    return valid
+
+
 def load_subtitles(path: Path) -> list[SubtitleSegment]:
     return load_subtitle_file(path)

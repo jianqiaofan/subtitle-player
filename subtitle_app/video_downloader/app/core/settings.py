@@ -7,10 +7,34 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_PATH = ROOT / "config" / "default_settings.json"
-USER_PATH = ROOT / "config" / "user_settings.json"
-DOWNLOADS_DIR = ROOT / "downloads"
+def _downloader_paths() -> tuple[Path, Path, Path]:
+    source = Path(__file__).resolve().parents[2]
+    try:
+        from core.app_paths import app_dir, bundle_dir, is_frozen
+    except ImportError:
+        return (
+            source / "config" / "default_settings.json",
+            source / "config" / "user_settings.json",
+            source / "downloads",
+        )
+    if not is_frozen():
+        return (
+            source / "config" / "default_settings.json",
+            source / "config" / "user_settings.json",
+            source / "downloads",
+        )
+    writable = app_dir() / "video_downloader"
+    bundled_default = bundle_dir() / "video_downloader" / "config" / "default_settings.json"
+    if not bundled_default.is_file():
+        bundled_default = source / "config" / "default_settings.json"
+    return (
+        bundled_default,
+        writable / "config" / "user_settings.json",
+        writable / "downloads",
+    )
+
+
+DEFAULT_PATH, USER_PATH, DOWNLOADS_DIR = _downloader_paths()
 
 
 class Settings:
@@ -56,9 +80,14 @@ class Settings:
         if custom and Path(custom).exists():
             return custom
         # 优先 PATH 上的较新 ffmpeg（安装目录自带旧版可能无法处理 AV1）
-        found = shutil.which("ffmpeg")
-        if found:
-            return found
+        try:
+            from core.audio import find_ffmpeg
+
+            return find_ffmpeg()
+        except Exception:
+            found = shutil.which("ffmpeg")
+            if found:
+                return found
         bundled = Path(r"D:\Program Files\Shandou\转码程序\ffmpeg.exe")
         if bundled.exists():
             return str(bundled)

@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+from core.app_paths import is_frozen
 from core.config import AppConfig
 from core.speech_split import SpeechRegion, detect_speech_regions, slice_audio
 from core.subtitle import SubtitleSegment
@@ -42,6 +43,8 @@ def _cuda_backend_label() -> str:
 
 def resolve_inference_backend(config: AppConfig) -> tuple[bool, str]:
     """根据配置解析是否启用 GPU，返回 (use_gpu, 日志显示标签)。"""
+    if is_frozen():
+        return False, "CPU"
     pref = (config.inference_device or "auto").strip().lower()
     cuda_ok = is_cuda_available()
 
@@ -246,49 +249,6 @@ def transcribe_mixed(
         SubtitleSegment(index, seg.start, seg.end, seg.text)
         for index, seg in enumerate(merged, start=1)
     ]
-
-
-def transcribe_region_mixed(
-    model,
-    media_path: Path,
-    region: SpeechRegion,
-    work_dir: Path,
-    on_log: ProgressCallback | None = None,
-) -> list[SubtitleSegment]:
-    """对单个语音区间做原文混排转写（按需提取音频，适合边播边转）。"""
-    from core.audio import extract_audio_segment
-
-    chunk_path = work_dir / f"chunk_{int(region.start_sec * 1000)}.wav"
-    extract_audio_segment(
-        media_path,
-        region.start_sec,
-        region.duration_sec,
-        chunk_path,
-    )
-    chunk = model._load_audio(str(chunk_path))
-    try:
-        chunk_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-    if chunk.size < int(0.5 * SAMPLE_RATE):
-        return []
-
-    (detected_lang, probability), _ = model.auto_detect_language(chunk)
-    if on_log:
-        on_log(
-            f"[{_fmt_time(region.start_sec)} → {_fmt_time(region.end_sec)}] "
-            f"语种 {detected_lang} ({float(probability):.0%})"
-        )
-
-    raw_segments = model.transcribe(
-        chunk,
-        language=detected_lang,
-        detect_language=False,
-        translate=False,
-    )
-    time_offset_sec = region.start_sec
-    return _segments_from_raw(raw_segments, time_offset_sec)
 
 
 def transcribe(

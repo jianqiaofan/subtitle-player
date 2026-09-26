@@ -20,8 +20,10 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QSlider,
     QVBoxLayout,
@@ -35,6 +37,11 @@ _POSITION_OPTIONS = (
     ("上方", "top"),
     ("中间", "middle"),
     ("下方", "bottom"),
+)
+
+_LIST_SIDE_OPTIONS = (
+    ("左侧", "left"),
+    ("右侧", "right"),
 )
 
 _EDGE_MARGIN = 24
@@ -53,6 +60,10 @@ class OnScreenSubtitleStyle:
     position: str = "bottom"
     immersive_list: bool = False
     immersive_list_opacity: float = 0.28
+    immersive_list_side: str = "right"
+    immersive_list_width_percent: int = 36
+    # 仅当前视频有效，不写入配置；打开新文件时由播放器重置为显示。
+    subtitle_list_visible: bool = True
 
     @classmethod
     def from_config(cls, config: AppConfig) -> "OnScreenSubtitleStyle":
@@ -65,6 +76,8 @@ class OnScreenSubtitleStyle:
             position=str(config.onscreen_subtitle_position or "bottom"),
             immersive_list=bool(config.immersive_subtitle_list),
             immersive_list_opacity=float(config.immersive_subtitle_list_opacity),
+            immersive_list_side=str(config.immersive_subtitle_list_side or "right"),
+            immersive_list_width_percent=int(config.immersive_subtitle_list_width_percent),
         )
 
     def apply_to_config(self, config: AppConfig) -> None:
@@ -81,6 +94,32 @@ class OnScreenSubtitleStyle:
         config.immersive_subtitle_list_opacity = max(
             0.0, min(1.0, float(self.immersive_list_opacity))
         )
+        side = (self.immersive_list_side or "right").strip().lower()
+        config.immersive_subtitle_list_side = side if side in {"left", "right"} else "right"
+        config.immersive_subtitle_list_width_percent = max(
+            18, min(70, int(self.immersive_list_width_percent))
+        )
+
+
+def immersive_list_pixel_width(total_width: int, width_percent: int) -> int:
+    """沉浸列表实际宽度，与播放器里拖动边缘时的算法一致。"""
+    host_w = max(1, int(total_width))
+    percent = max(18, min(70, int(width_percent)))
+    width = max(180, int(host_w * percent / 100.0))
+    return min(width, max(180, int(host_w * 0.7)))
+
+
+def bounds_beside_immersive_list(bounds: QRect, style: OnScreenSubtitleStyle) -> QRect:
+    """沉浸列表打开时，字幕水平范围改到列表以外的画面里。高度与垂直位置不变。"""
+    if not style.immersive_list:
+        return bounds
+    list_w = immersive_list_pixel_width(bounds.width(), style.immersive_list_width_percent)
+    list_w = min(list_w, max(0, bounds.width() - 8))
+    free_w = max(8, bounds.width() - list_w)
+    side = (style.immersive_list_side or "right").strip().lower()
+    if side == "left":
+        return QRect(bounds.x() + list_w, bounds.y(), free_w, bounds.height())
+    return QRect(bounds.x(), bounds.y(), free_w, bounds.height())
 
 
 def paint_onscreen_subtitle(
@@ -91,6 +130,7 @@ def paint_onscreen_subtitle(
 ) -> None:
     """Draw solid text on a semi-transparent bar inside bounds."""
     cleaned = (text or "").replace("\r\n", "\n").strip()
+    bounds = bounds_beside_immersive_list(bounds, style)
     if not style.enabled or not cleaned or bounds.width() < 8 or bounds.height() < 8:
         return
 
@@ -312,6 +352,17 @@ class OnScreenSubtitleFacade:
         self._video.set_subtitle_style(style)
         self._audio_layer.set_style(style)
 
+    def set_immersive_metrics(self, *, active: bool, side: str, width_percent: int) -> None:
+        """拖动列表宽度时同步画面字幕的水平居中范围。"""
+        side_norm = side if side in {"left", "right"} else "right"
+        percent = max(18, min(70, int(width_percent)))
+        for target in (self._video, self._audio_layer):
+            style = target._style
+            style.immersive_list = bool(active)
+            style.immersive_list_side = side_norm
+            style.immersive_list_width_percent = percent
+            target.update()
+
     def text(self) -> str:
         return self._video._subtitle_text
 
@@ -372,7 +423,24 @@ class OnScreenSubtitleSettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("画面字幕")
         self.setMinimumWidth(420)
-        self.setStyleSheet(DARK_STYLE)
+        self.setWindowOpacity(0.82)
+        self._close_confirmed = False
+        self.setStyleSheet(
+            DARK_STYLE
+            + """
+QGroupBox#settingsSection {
+    color: #1a1a1a;
+    border: 1px solid rgba(0, 0, 0, 0.28);
+}
+QGroupBox#settingsSection::title {
+    color: #1a1a1a;
+    background-color: #f3f3f3;
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+}
+"""
+        )
         self._style = OnScreenSubtitleStyle(
             enabled=style.enabled,
             font_size=style.font_size,
@@ -382,28 +450,44 @@ class OnScreenSubtitleSettingsDialog(QDialog):
             position=style.position,
             immersive_list=style.immersive_list,
             immersive_list_opacity=style.immersive_list_opacity,
+            immersive_list_side=style.immersive_list_side,
+            immersive_list_width_percent=style.immersive_list_width_percent,
+            subtitle_list_visible=style.subtitle_list_visible,
         )
 
         layout = QVBoxLayout(self)
-        layout.addWidget(
-            QLabel("在视频画面上显示当前字幕（半透明底条 + 实心文字）。修改后即时预览。")
+        layout.addWidget(QLabel("修改后即时预览。打开新文件时会重新显示字幕列表。"))
+
+        list_box = QGroupBox("字幕列表")
+        list_box.setObjectName("settingsSection")
+        list_form = QFormLayout(list_box)
+
+        self.list_visible_check = QCheckBox("显示字幕列表")
+        self.list_visible_check.setChecked(self._style.subtitle_list_visible)
+        self.list_visible_check.setToolTip(
+            "取消后隐藏字幕列表，把播放器当作普通播放器使用。"
+            "此选项只对当前视频有效，打开新文件时会重新显示列表。"
         )
-
-        form = QFormLayout()
-
-        self.enabled_check = QCheckBox("显示画面字幕")
-        self.enabled_check.setChecked(self._style.enabled)
-        self.enabled_check.toggled.connect(self._emit_preview)
-        form.addRow("", self.enabled_check)
+        self.list_visible_check.toggled.connect(self._on_list_visible_toggled)
+        list_form.addRow("", self.list_visible_check)
 
         self.immersive_check = QCheckBox("沉浸列表（字幕列表透明叠在画面上）")
         self.immersive_check.setChecked(self._style.immersive_list)
         self.immersive_check.setToolTip(
-            "开启后画面铺满播放区，右侧字幕列表半透明叠在画面上方；"
-            "点击跳转与右键菜单仍可用。"
+            "开启后画面铺满播放区，字幕列表半透明叠在画面上方；"
+            "可左右拖动列表边缘调节宽度；点击跳转与右键菜单仍可用。"
         )
         self.immersive_check.toggled.connect(self._on_immersive_toggled)
-        form.addRow("", self.immersive_check)
+        list_form.addRow("", self.immersive_check)
+
+        self.list_side_combo = QComboBox()
+        for label, value in _LIST_SIDE_OPTIONS:
+            self.list_side_combo.addItem(label, value)
+        side_idx = self.list_side_combo.findData(self._style.immersive_list_side)
+        self.list_side_combo.setCurrentIndex(side_idx if side_idx >= 0 else 1)
+        self.list_side_combo.currentIndexChanged.connect(self._emit_preview)
+        self._list_side_label = QLabel("列表位置")
+        list_form.addRow(self._list_side_label, self.list_side_combo)
 
         self.list_bg_slider = QSlider(Qt.Orientation.Horizontal)
         self.list_bg_slider.setRange(0, 100)
@@ -416,44 +500,56 @@ class OnScreenSubtitleSettingsDialog(QDialog):
         self._list_bg_row_widget = QWidget()
         self._list_bg_row_widget.setLayout(list_bg_row)
         self._list_bg_label = QLabel("列表背景透明度")
-        form.addRow(self._list_bg_label, self._list_bg_row_widget)
-        self._sync_list_bg_visibility()
+        list_form.addRow(self._list_bg_label, self._list_bg_row_widget)
+
+        self._list_drag_hint = QLabel("提示：沉浸模式下可拖动列表内侧边缘调节宽度")
+        self._list_drag_hint.setObjectName("hintLabel")
+        self._list_drag_hint.setWordWrap(True)
+        list_form.addRow("", self._list_drag_hint)
+        layout.addWidget(list_box)
+
+        subtitle_box = QGroupBox("画面字幕")
+        subtitle_box.setObjectName("settingsSection")
+        subtitle_form = QFormLayout(subtitle_box)
+
+        self.enabled_check = QCheckBox("显示画面字幕")
+        self.enabled_check.setChecked(self._style.enabled)
+        self.enabled_check.toggled.connect(self._on_subtitle_enabled_toggled)
+        subtitle_form.addRow("", self.enabled_check)
 
         self.font_slider = QSlider(Qt.Orientation.Horizontal)
         self.font_slider.setRange(12, 72)
         self.font_slider.setValue(self._style.font_size)
         self.font_value = QLabel(str(self._style.font_size))
         self.font_slider.valueChanged.connect(self._on_font_changed)
-        font_row = QHBoxLayout()
-        font_row.addWidget(self.font_slider, stretch=1)
-        font_row.addWidget(self.font_value)
-        form.addRow("字体大小", font_row)
+        self._font_row_widget = self._slider_row(self.font_slider, self.font_value)
+        self._font_label = QLabel("字体大小")
+        subtitle_form.addRow(self._font_label, self._font_row_widget)
 
         self.color_btn = QPushButton()
         self.color_btn.setFixedHeight(28)
         self.color_btn.clicked.connect(self._pick_color)
         self._update_color_button()
-        form.addRow("文字颜色", self.color_btn)
+        self._color_label = QLabel("文字颜色")
+        subtitle_form.addRow(self._color_label, self.color_btn)
 
         self.bg_slider = QSlider(Qt.Orientation.Horizontal)
         self.bg_slider.setRange(0, 100)
         self.bg_slider.setValue(int(round(self._style.bg_opacity * 100)))
         self.bg_value = QLabel(f"{self.bg_slider.value()}%")
         self.bg_slider.valueChanged.connect(self._on_bg_changed)
-        bg_row = QHBoxLayout()
-        bg_row.addWidget(self.bg_slider, stretch=1)
-        bg_row.addWidget(self.bg_value)
-        form.addRow("底条透明度", bg_row)
+        self._bg_row_widget = self._slider_row(self.bg_slider, self.bg_value)
+        self._bg_label = QLabel("底条透明度")
+        subtitle_form.addRow(self._bg_label, self._bg_row_widget)
 
         self.width_slider = QSlider(Qt.Orientation.Horizontal)
         self.width_slider.setRange(30, 100)
         self.width_slider.setValue(self._style.width_percent)
         self.width_value = QLabel(f"{self._style.width_percent}%")
         self.width_slider.valueChanged.connect(self._on_width_changed)
-        width_row = QHBoxLayout()
-        width_row.addWidget(self.width_slider, stretch=1)
-        width_row.addWidget(self.width_value)
-        form.addRow("字幕宽度", width_row)
+        self._width_row_widget = self._slider_row(self.width_slider, self.width_value)
+        self._width_label = QLabel("字幕宽度")
+        subtitle_form.addRow(self._width_label, self._width_row_widget)
 
         self.position_combo = QComboBox()
         for label, value in _POSITION_OPTIONS:
@@ -461,9 +557,12 @@ class OnScreenSubtitleSettingsDialog(QDialog):
         idx = self.position_combo.findData(self._style.position)
         self.position_combo.setCurrentIndex(idx if idx >= 0 else 2)
         self.position_combo.currentIndexChanged.connect(self._emit_preview)
-        form.addRow("字幕位置", self.position_combo)
+        self._position_label = QLabel("字幕位置")
+        subtitle_form.addRow(self._position_label, self.position_combo)
+        layout.addWidget(subtitle_box)
 
-        layout.addLayout(form)
+        self._sync_list_related_controls()
+        self._sync_subtitle_related_controls()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -471,6 +570,7 @@ class OnScreenSubtitleSettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._initial_style = self.current_style()
 
     def current_style(self) -> OnScreenSubtitleStyle:
         return OnScreenSubtitleStyle(
@@ -482,15 +582,111 @@ class OnScreenSubtitleSettingsDialog(QDialog):
             position=str(self.position_combo.currentData() or "bottom"),
             immersive_list=self.immersive_check.isChecked(),
             immersive_list_opacity=self.list_bg_slider.value() / 100.0,
+            immersive_list_side=str(self.list_side_combo.currentData() or "right"),
+            immersive_list_width_percent=int(self._style.immersive_list_width_percent),
+            subtitle_list_visible=self.list_visible_check.isChecked(),
         )
 
-    def _sync_list_bg_visibility(self) -> None:
-        visible = self.immersive_check.isChecked()
-        self._list_bg_label.setVisible(visible)
-        self._list_bg_row_widget.setVisible(visible)
+    def _sync_list_related_controls(self) -> None:
+        list_on = self.list_visible_check.isChecked()
+        immersive_on = list_on and self.immersive_check.isChecked()
+        self.immersive_check.setEnabled(list_on)
+        for widget in (
+            self._list_side_label,
+            self.list_side_combo,
+            self._list_bg_label,
+            self._list_bg_row_widget,
+            self._list_drag_hint,
+        ):
+            widget.setEnabled(immersive_on)
+
+    def _sync_subtitle_related_controls(self) -> None:
+        enabled = self.enabled_check.isChecked()
+        for widget in (
+            self._font_label,
+            self._font_row_widget,
+            self._color_label,
+            self.color_btn,
+            self._bg_label,
+            self._bg_row_widget,
+            self._width_label,
+            self._width_row_widget,
+            self._position_label,
+            self.position_combo,
+        ):
+            widget.setEnabled(enabled)
+
+    def _on_list_visible_toggled(self) -> None:
+        self._sync_list_related_controls()
+        self._emit_preview()
+
+    def _on_subtitle_enabled_toggled(self) -> None:
+        self._sync_subtitle_related_controls()
+        self._emit_preview()
+
+    @staticmethod
+    def _slider_row(slider: QSlider, value_label: QLabel) -> QWidget:
+        row = QHBoxLayout()
+        row.addWidget(slider, stretch=1)
+        row.addWidget(value_label)
+        widget = QWidget()
+        widget.setLayout(row)
+        return widget
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if getattr(self, "_geometry_locked", False):
+            return
+        self._geometry_locked = True
+        self.adjustSize()
+        host = self.parentWidget()
+        if host is not None:
+            host = host.window()
+        if host is not None and host.isVisible():
+            frame = host.frameGeometry()
+            size = self.size()
+            x = frame.x() + max(0, (frame.width() - size.width()) // 2)
+            y = frame.y() + max(0, (frame.height() - size.height()) // 2)
+            self.move(x, y)
+        self.setFixedSize(self.size())
+
+    def _is_dirty(self) -> bool:
+        return self.current_style() != self._initial_style
+
+    def accept(self) -> None:  # noqa: N802
+        self._close_confirmed = True
+        super().accept()
+
+    def reject(self) -> None:  # noqa: N802
+        self._close_confirmed = True
+        super().reject()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if self._close_confirmed or not self._is_dirty():
+            super().closeEvent(event)
+            return
+        choice = QMessageBox(self)
+        choice.setWindowTitle("画面字幕")
+        choice.setIcon(QMessageBox.Icon.Question)
+        choice.setText("画面字幕设置已修改。关闭窗口前，要确认这些修改，还是放弃？")
+        confirm_btn = choice.addButton("确认修改", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = choice.addButton("放弃修改", QMessageBox.ButtonRole.DestructiveRole)
+        choice.setDefaultButton(confirm_btn)
+        choice.exec()
+        clicked = choice.clickedButton()
+        if clicked is confirm_btn:
+            self._close_confirmed = True
+            self.done(QDialog.DialogCode.Accepted)
+            event.accept()
+            return
+        if clicked is discard_btn:
+            self._close_confirmed = True
+            event.accept()
+            return
+        event.ignore()
 
     def _on_immersive_toggled(self) -> None:
-        self._sync_list_bg_visibility()
+        self._sync_list_related_controls()
         self._emit_preview()
 
     def _on_font_changed(self, value: int) -> None:

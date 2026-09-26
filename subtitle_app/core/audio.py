@@ -2,22 +2,29 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import time
 from pathlib import Path
+
+from core.app_paths import ffmpeg_executable
 
 
 def find_ffmpeg() -> str:
+    bundled = ffmpeg_executable("ffmpeg.exe")
+    if bundled is not None:
+        return str(bundled)
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
         return ffmpeg
-    raise RuntimeError("未找到 ffmpeg，请先安装并加入 PATH。")
+    raise RuntimeError("未找到 ffmpeg。请将 ffmpeg.exe 放到程序目录的 ffmpeg 文件夹，或加入 PATH。")
 
 
 def find_ffprobe() -> str:
+    bundled = ffmpeg_executable("ffprobe.exe")
+    if bundled is not None:
+        return str(bundled)
     ffprobe = shutil.which("ffprobe")
     if ffprobe:
         return ffprobe
-    raise RuntimeError("未找到 ffprobe，请先安装并加入 PATH。")
+    raise RuntimeError("未找到 ffprobe。请将 ffprobe.exe 放到程序目录的 ffmpeg 文件夹，或加入 PATH。")
 
 
 def get_media_duration(media_path: Path) -> float:
@@ -79,52 +86,3 @@ def extract_audio(media_path: Path, work_dir: Path) -> Path:
             f"请检查源文件是否包含音轨。"
         )
     return output
-
-
-def extract_audio_segment(
-    media_path: Path,
-    start_sec: float,
-    duration_sec: float,
-    output_path: Path,
-) -> Path:
-    """从媒体文件按需提取一段音频（16kHz 单声道 WAV），适合长视频分片处理。"""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    start_sec = max(0.0, start_sec)
-    duration_sec = max(0.1, duration_sec)
-
-    cmd = [
-        find_ffmpeg(),
-        "-nostdin",
-        "-y",
-        "-ss",
-        f"{start_sec:.3f}",
-        "-t",
-        f"{duration_sec:.3f}",
-        "-i",
-        str(media_path),
-        "-vn",
-        "-ar",
-        "16000",
-        "-ac",
-        "1",
-        "-c:a",
-        "pcm_s16le",
-        str(output_path),
-    ]
-    last_stderr = ""
-    for attempt in range(3):
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        last_stderr = result.stderr or ""
-        if result.returncode == 0 and output_path.exists() and output_path.stat().st_size >= 512:
-            return output_path
-        # Windows 上播放器 seek 时偶发共享冲突，短暂重试
-        time.sleep(0.15 * (attempt + 1))
-    if not output_path.exists() or output_path.stat().st_size < 512:
-        raise RuntimeError(f"音频分片过小或为空：{output_path.name}\n{last_stderr[-2000:]}")
-    raise RuntimeError(f"音频分片提取失败：\n{last_stderr[-2000:]}")

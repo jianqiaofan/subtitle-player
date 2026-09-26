@@ -6,10 +6,14 @@ import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-APP_DIR = Path(__file__).resolve().parent.parent
+from core.app_paths import app_dir, bundle_dir, is_frozen, models_dir, resolve_model_path
+
+APP_DIR = app_dir()
 ROOT_DIR = APP_DIR.parent
 CONFIG_PATH = APP_DIR / "config.json"
-EXAMPLE_CONFIG_PATH = APP_DIR / "config.json.example"
+EXAMPLE_CONFIG_PATH = bundle_dir() / "config.json.example"
+if not EXAMPLE_CONFIG_PATH.is_file():
+    EXAMPLE_CONFIG_PATH = APP_DIR / "config.json.example"
 
 MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
@@ -54,9 +58,6 @@ LANGUAGE_FILENAME_LABELS = {
     "es": "西班牙语",
     "ru": "俄语",
 }
-
-# 边播边转输出文件名后缀（视频名_同步.srt）
-LIVE_SYNC_FILENAME_LABEL = "同步"
 
 DEEPSEEK_API_KEY_PLACEHOLDERS = (
     "请在此填写 DeepSeek API Key",
@@ -111,6 +112,7 @@ class AppConfig:
     ai_notes_template: str = "learning"
     ecdict_db_path: str = ""
     last_media_dir: str = ""
+    recent_media_files: list[str] = field(default_factory=list)
     translate_app: str = "baidu"
     translate_hotkey: str = "Ctrl+Alt+C"
     # 画面叠加字幕（半透明底条 + 实心字）
@@ -123,6 +125,15 @@ class AppConfig:
     # 沉浸列表：字幕列表透明叠在画面上
     immersive_subtitle_list: bool = False
     immersive_subtitle_list_opacity: float = 0.28
+    immersive_subtitle_list_side: str = "right"  # left | right
+    immersive_subtitle_list_width_percent: int = 36
+    # 字幕列表显示密度：normal 普通 | compact 紧凑
+    subtitle_list_density: str = "normal"
+    # 用户添加过的自定义字幕标签，下次对话框里继续出现
+    subtitle_custom_tags: list[str] = field(default_factory=list)
+    # 批量同步标签：上次选择的标签文件和视频文件夹
+    batch_tag_sync_files: list[str] = field(default_factory=list)
+    batch_tag_sync_video_dir: str = ""
 
     def get_ai_notes_user_context(self, subtitle_type: str) -> str:
         return str(self.ai_notes_user_context.get(subtitle_type, "") or "").strip()
@@ -181,17 +192,11 @@ class AppConfig:
         filename = f"{media_path.stem}_{self.language_filename_label()}.{self.output_format}"
         return out_dir / filename
 
-    def build_live_output_path(self, media_path: Path) -> Path:
-        """边播边转输出路径：视频名_同步.扩展名"""
-        out_dir = self.resolved_output_dir(media_path)
-        filename = f"{media_path.stem}_{LIVE_SYNC_FILENAME_LABEL}.{self.output_format}"
-        return out_dir / filename
-
     def resolved_model_path(self) -> Path:
-        if self.model_path.strip():
-            return Path(self.model_path)
-        default = ROOT_DIR / "win系统模型中等.bin"
-        return default
+        resolved = resolve_model_path(self.model_path)
+        if resolved:
+            return Path(resolved)
+        return models_dir() / "win系统模型中等.bin"
 
     def resolved_n_threads(self) -> int:
         if self.n_threads > 0:
@@ -201,15 +206,18 @@ class AppConfig:
     def validate_model(self) -> Path:
         model = self.resolved_model_path()
         if not model.is_file():
-            raise RuntimeError(f"模型文件不存在：{model}")
+            raise RuntimeError(
+                "未找到 Whisper 模型。\n"
+                f"请把 win系统模型最小.bin、win系统模型中等.bin、win系统模型最大.bin 放到：\n"
+                f"{models_dir()}\n"
+                "如果这个文件夹里没有这些文件，请在转写工具中点击「浏览」指定 .bin 模型路径。"
+            )
         return model
 
 
 def _default_config() -> AppConfig:
     cfg = AppConfig()
-    default_model = ROOT_DIR / "win系统模型中等.bin"
-    if default_model.exists():
-        cfg.model_path = str(default_model)
+    cfg.model_path = resolve_model_path("")
     return cfg
 
 
@@ -259,8 +267,9 @@ def load_config() -> AppConfig:
         if str(value or "").strip():
             migrated_subcategory[new_key] = str(value).strip()
     cfg.ai_notes_subcategory = migrated_subcategory
-    if not cfg.model_path and (ROOT_DIR / "win系统模型中等.bin").exists():
-        cfg.model_path = str(ROOT_DIR / "win系统模型中等.bin")
+    cfg.model_path = resolve_model_path(cfg.model_path)
+    if is_frozen():
+        cfg.inference_device = "cpu"
 
     from core.external_translate import DEFAULT_TRANSLATOR_ID, get_translator, normalize_hotkey_text
 
@@ -295,6 +304,45 @@ def load_config() -> AppConfig:
         )
     except (TypeError, ValueError):
         cfg.immersive_subtitle_list_opacity = 0.28
+    side = str(cfg.immersive_subtitle_list_side or "").strip().lower()
+    if side not in {"left", "right"}:
+        side = "right"
+    cfg.immersive_subtitle_list_side = side
+    try:
+        cfg.immersive_subtitle_list_width_percent = max(
+            18, min(70, int(cfg.immersive_subtitle_list_width_percent))
+        )
+    except (TypeError, ValueError):
+        cfg.immersive_subtitle_list_width_percent = 36
+    density = str(cfg.subtitle_list_density or "").strip().lower()
+    if density not in {"normal", "compact"}:
+        density = "normal"
+    cfg.subtitle_list_density = density
+    if not isinstance(cfg.subtitle_custom_tags, list):
+        cfg.subtitle_custom_tags = []
+    custom_tags: list[str] = []
+    for name in cfg.subtitle_custom_tags:
+        cleaned = str(name or "").strip()
+        if cleaned and cleaned not in custom_tags:
+            custom_tags.append(cleaned)
+    cfg.subtitle_custom_tags = custom_tags
+    if not isinstance(cfg.recent_media_files, list):
+        cfg.recent_media_files = []
+    recent_files: list[str] = []
+    for item in cfg.recent_media_files:
+        path = str(item or "").strip()
+        if path and path not in recent_files:
+            recent_files.append(path)
+    cfg.recent_media_files = recent_files[:15]
+    if not isinstance(cfg.batch_tag_sync_files, list):
+        cfg.batch_tag_sync_files = []
+    tag_files: list[str] = []
+    for item in cfg.batch_tag_sync_files:
+        path = str(item or "").strip()
+        if path and path not in tag_files:
+            tag_files.append(path)
+    cfg.batch_tag_sync_files = tag_files
+    cfg.batch_tag_sync_video_dir = str(cfg.batch_tag_sync_video_dir or "").strip()
     return cfg
 
 

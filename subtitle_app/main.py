@@ -5,13 +5,24 @@ from pathlib import Path
 # Must be set before importing QtMultimedia: FFmpeg + HW decode (D3D11VA on Windows).
 os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")
 
-ROOT = Path(__file__).resolve().parent
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from core.app_paths import app_dir, bundle_dir, is_frozen
+
+ROOT = bundle_dir() if is_frozen() else _SCRIPT_DIR
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.console_window import install_console_host, reveal_console_and_wait
 
-_CONSOLE_TITLE = "转写工具 - 后台" if "--transcribe" in sys.argv else "字幕播放器 - 后台"
+if "--transcribe" in sys.argv:
+    _CONSOLE_TITLE = "转写工具 - 后台"
+elif "--download" in sys.argv:
+    _CONSOLE_TITLE = "视频下载器 - 后台"
+else:
+    _CONSOLE_TITLE = "字幕播放器 - 后台"
 install_console_host(title=_CONSOLE_TITLE)
 
 try:
@@ -33,7 +44,22 @@ except ModuleNotFoundError as exc:
     raise
 
 
+def _run_downloader() -> int:
+    tool_root = bundle_dir() / "video_downloader"
+    if not tool_root.is_dir():
+        tool_root = app_dir() / "video_downloader"
+    if str(tool_root) not in sys.path:
+        sys.path.insert(0, str(tool_root))
+    from app.ui.main_window import MainWindow
+
+    MainWindow().mainloop()
+    return 0
+
+
 def main() -> int:
+    if "--download" in sys.argv:
+        return _run_downloader()
+
     # Prefer exact device-pixel sizing to reduce soft scaling of video frames.
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough

@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from core.app_paths import default_model_files, is_frozen, models_dir
 from core.config import (
     INFERENCE_DEVICE_OPTIONS,
     LANGUAGE_OPTIONS,
@@ -87,8 +88,13 @@ class TranscribeWindow(QMainWindow):
 
         row_model = QHBoxLayout()
         row_model.addWidget(QLabel("模型文件"))
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(180)
+        self._fill_model_combo()
+        self.model_combo.currentIndexChanged.connect(self._on_model_combo_changed)
+        row_model.addWidget(self.model_combo)
         self.model_edit = QLineEdit()
-        self.model_edit.setPlaceholderText("选择 .bin 模型（如 win系统模型中等.bin）")
+        self.model_edit.setPlaceholderText("选择 .bin 模型。默认目录没有模型时，请点浏览指定路径")
         row_model.addWidget(self.model_edit, stretch=1)
         browse_model = QPushButton("浏览")
         browse_model.clicked.connect(self._browse_model)
@@ -106,12 +112,17 @@ class TranscribeWindow(QMainWindow):
         row_device = QHBoxLayout()
         row_device.addWidget(QLabel("推理设备"))
         self.inference_combo = QComboBox()
-        for label, value in INFERENCE_DEVICE_OPTIONS:
-            self.inference_combo.addItem(label, value)
-        self.inference_combo.setToolTip(
-            "自动：检测到 CUDA 版 pywhispercpp 时使用 GPU，否则 CPU。\n"
-            "GPU 需先运行「安装CUDA推理.bat」。"
-        )
+        if is_frozen():
+            self.inference_combo.addItem("CPU", "cpu")
+            self.inference_combo.setEnabled(False)
+            self.inference_combo.setToolTip("当前安装包使用 CPU 转字幕。")
+        else:
+            for label, value in INFERENCE_DEVICE_OPTIONS:
+                self.inference_combo.addItem(label, value)
+            self.inference_combo.setToolTip(
+                "自动：检测到 CUDA 版 pywhispercpp 时使用 GPU，否则 CPU。\n"
+                "GPU 需先运行「安装CUDA推理.bat」。"
+            )
         self.inference_combo.currentIndexChanged.connect(lambda _: self._refresh_inference_status())
         row_device.addWidget(self.inference_combo)
         self.inference_status = QLabel()
@@ -142,7 +153,8 @@ class TranscribeWindow(QMainWindow):
         layout.addLayout(row_opts)
 
         hint = QLabel(
-            "内置 Whisper 推理引擎，直接加载 .bin 模型转写，无需 whisper.exe。"
+            f"默认从程序目录下的 models 文件夹读取三个模型：{models_dir()}。"
+            "该位置没有这些文件时，请点击「浏览」自己指定 .bin 路径。"
             "「原文混排」将按语音停顿断点分片后逐段识别语种。"
         )
         hint.setObjectName("hintLabel")
@@ -232,8 +244,41 @@ class TranscribeWindow(QMainWindow):
         layout.addWidget(self.log_view)
         return group
 
+    def _fill_model_combo(self) -> None:
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        files = default_model_files()
+        if files:
+            for path in files:
+                self.model_combo.addItem(path.name, str(path))
+            self.model_combo.addItem("自定义路径", "")
+        else:
+            self.model_combo.addItem("默认位置没有模型，请浏览指定", "")
+        self.model_combo.blockSignals(False)
+
+    def _on_model_combo_changed(self, _index: int) -> None:
+        path = self.model_combo.currentData()
+        if path:
+            self.model_edit.setText(path)
+
+    def _select_model_combo(self, path: str) -> None:
+        if not path:
+            return
+        for index in range(self.model_combo.count()):
+            if self.model_combo.itemData(index) == path:
+                self.model_combo.blockSignals(True)
+                self.model_combo.setCurrentIndex(index)
+                self.model_combo.blockSignals(False)
+                return
+        custom = self.model_combo.findData("")
+        if custom >= 0:
+            self.model_combo.blockSignals(True)
+            self.model_combo.setCurrentIndex(custom)
+            self.model_combo.blockSignals(False)
+
     def _load_settings_to_ui(self) -> None:
         self.model_edit.setText(self.config.model_path)
+        self._select_model_combo(self.config.model_path)
         self.threads_spin.setValue(self.config.n_threads)
 
         idx = self.inference_combo.findData(self.config.inference_device)
@@ -259,6 +304,9 @@ class TranscribeWindow(QMainWindow):
         save_config(self.config)
 
     def _refresh_inference_status(self) -> None:
+        if is_frozen():
+            self.inference_status.setText("当前安装包使用 CPU 转字幕。")
+            return
         if is_cuda_available():
             self.inference_status.setText("当前环境：已安装 CUDA 版 pywhispercpp，可选 GPU。")
         else:
@@ -275,6 +323,7 @@ class TranscribeWindow(QMainWindow):
         )
         if path:
             self.model_edit.setText(path)
+            self._select_model_combo(path)
 
     def _append_log(self, text: str) -> None:
         self.log_view.appendPlainText(text)

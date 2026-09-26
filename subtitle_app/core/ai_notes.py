@@ -36,8 +36,6 @@ def is_api_key_configured(api_key: str) -> bool:
 
 def collect_valid_subtitle_corpus(media_path: Path) -> list[SubtitleCorpusItem]:
     """收集同目录下所有可加载的有效字幕。"""
-    from core.config import load_config
-
     items: list[SubtitleCorpusItem] = []
     for path, label in find_subtitles_for_media(media_path):
         try:
@@ -54,24 +52,6 @@ def collect_valid_subtitle_corpus(media_path: Path) -> list[SubtitleCorpusItem]:
                 segments=tuple(segments),
             )
         )
-
-    partial_path = load_config().build_live_output_path(media_path).with_suffix(
-        ".srt.partial"
-    )
-    if partial_path.is_file():
-        try:
-            segments = load_subtitle_file(partial_path)
-            if segments and not any(item.path.resolve() == partial_path.resolve() for item in items):
-                items.append(
-                    SubtitleCorpusItem(
-                        label="同步(未完成)",
-                        filename=partial_path.name,
-                        path=partial_path,
-                        segments=tuple(segments),
-                    )
-                )
-        except (OSError, ValueError):
-            pass
 
     return items
 

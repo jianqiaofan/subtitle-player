@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
     QLabel,
+    QProgressBar,
     QSpinBox,
     QVBoxLayout,
 )
@@ -82,3 +84,93 @@ class VocabularyDialog(QDialog):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
         return dialog.options()
+
+
+class VocabularyProgressDialog(QDialog):
+    """生词表生成进度。真实步骤较少，进度条在完成前平滑前进。"""
+
+    def __init__(self, media_name: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("正在生成生词表")
+        self.setMinimumWidth(440)
+        self.setModal(True)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setStyleSheet(DARK_STYLE)
+
+        self._current = 0
+        self._target = 12
+        self._finished = False
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        self.title_label = QLabel(f"正在为「{media_name}」生成生词表")
+        self.title_label.setWordWrap(True)
+        layout.addWidget(self.title_label)
+
+        self.status_label = QLabel("正在准备…")
+        self.status_label.setObjectName("hintLabel")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFormat("0%")
+        layout.addWidget(self.progress)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(80)
+        self._timer.timeout.connect(self._tick)
+
+    def start(self) -> None:
+        self._current = 0
+        self._target = 12
+        self._finished = False
+        self.progress.setValue(0)
+        self.progress.setFormat("0%")
+        self.status_label.setText("正在准备…")
+        self._timer.start()
+        self.show()
+
+    def set_status(self, message: str) -> None:
+        self.status_label.setText(message)
+        if "查询" in message or "释义" in message or "注音" in message:
+            self._target = max(self._target, 68)
+        elif "分析" in message:
+            self._target = max(self._target, 36)
+
+    def finish_success(self) -> None:
+        self._finished = True
+        self._timer.stop()
+        self._current = 100
+        self._target = 100
+        self.progress.setValue(100)
+        self.progress.setFormat("100% — 完成")
+        self.status_label.setText("生词表已生成")
+
+    def finish_failure(self, message: str) -> None:
+        self._finished = True
+        self._timer.stop()
+        self.progress.setFormat("已停止")
+        self.status_label.setText(message)
+
+    def allow_close(self) -> None:
+        self._finished = True
+
+    def closeEvent(self, event) -> None:
+        if not self._finished:
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def _tick(self) -> None:
+        if self._finished:
+            return
+        if self._current < self._target:
+            step = max(1, (self._target - self._current + 2) // 3)
+            self._current = min(self._target, self._current + step)
+        elif self._target < 92:
+            self._target += 1
+        self.progress.setValue(self._current)
+        self.progress.setFormat(f"{self._current}%")

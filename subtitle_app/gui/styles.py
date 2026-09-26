@@ -188,8 +188,11 @@ QListWidget {
     font-size: 13px;
 }
 QListWidget::item {
-    padding: 8px 6px;
+    padding: 0px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+QListWidget#subtitleListCompact::item {
+    padding: 0px;
 }
 QListWidget::item:selected {
     background-color: rgba(185, 128, 255, 0.28);
@@ -197,6 +200,46 @@ QListWidget::item:selected {
 }
 QListWidget::item:hover {
     background-color: rgba(185, 128, 255, 0.12);
+}
+QPushButton#subtitleDensityButton {
+    color: #b980ff;
+    background-color: #212121;
+    border: 1px solid #555555;
+    border-radius: 4px;
+    padding: 2px 8px;
+    min-height: 18px;
+    max-height: 24px;
+    font-size: 12px;
+}
+QPushButton#subtitleDensityButton:hover {
+    border: 1px solid #b980ff;
+    background-color: rgba(185, 128, 255, 0.08);
+}
+QPushButton#subtitleTagButton {
+    color: #dddddd;
+    background-color: #212121;
+    border: 1px solid #555555;
+    border-radius: 4px;
+    padding: 2px 8px;
+    min-height: 18px;
+    max-height: 24px;
+    font-size: 12px;
+}
+QPushButton#subtitleTagButton:hover {
+    border: 1px solid #b980ff;
+}
+QPushButton#subtitleTagButton:checked {
+    color: #ffffff;
+    background-color: rgba(185, 128, 255, 0.28);
+    border: 1px solid #b980ff;
+}
+QPushButton#subtitleTagBanner {
+    color: #ffd78a;
+    background: transparent;
+    border: none;
+    text-align: left;
+    padding: 2px 6px;
+    font-size: 12px;
 }
 QSplitter::handle {
     background-color: rgba(255, 255, 255, 0.15);
@@ -207,16 +250,23 @@ QSplitter::handle {
 IMMERSIVE_SUBTITLE_PANEL_STYLE = ""  # use build_immersive_subtitle_panel_style()
 
 
-def build_immersive_subtitle_panel_style(opacity: float) -> str:
+def build_immersive_subtitle_panel_style(
+    opacity: float,
+    side: str = "right",
+    *,
+    compact: bool = False,
+) -> str:
     """Build translucent styles for immersive subtitle list overlay."""
     opacity = max(0.0, min(1.0, float(opacity)))
     panel_alpha = int(round(opacity * 255))
     list_alpha = int(round(opacity * 0.7 * 255))
+    edge = "left" if (side or "right").lower() != "left" else "right"
+    item_padding = "padding: 0px;"
     return f"""
 QWidget#subtitlePanel {{
     background-color: rgba(12, 12, 12, {panel_alpha});
     border: none;
-    border-left: 1px solid rgba(255, 255, 255, 0.18);
+    border-{edge}: 1px solid rgba(255, 255, 255, 0.18);
 }}
 QWidget#subtitlePanel QLabel {{
     color: #ffffff;
@@ -232,7 +282,7 @@ QListWidget#immersiveSubtitleList {{
     outline: none;
 }}
 QListWidget#immersiveSubtitleList::item {{
-    padding: 8px 6px;
+    {item_padding}
     border-bottom: 1px solid rgba(255, 255, 255, 0.10);
     background: transparent;
 }}
@@ -242,5 +292,37 @@ QListWidget#immersiveSubtitleList::item:selected {{
 }}
 QListWidget#immersiveSubtitleList::item:hover {{
     background-color: rgba(185, 128, 255, 0.24);
+}}
+QListWidget#unmatchedTagList {{
+    background-color: rgba(20, 20, 20, {list_alpha});
+    color: #ffffff;
+    border: none;
+    font-size: 13px;
+}}
+QPushButton#subtitleTagButton {{
+    color: #ffffff;
+    background-color: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+}}
+QPushButton#subtitleTagButton:checked {{
+    background-color: rgba(185, 128, 255, 0.48);
+    border: 1px solid #b980ff;
+}}
+QPushButton#subtitleTagBanner {{
+    color: #ffd78a;
+    background: transparent;
+    border: none;
+    text-align: left;
+    padding: 2px 6px;
+}}
+QWidget#immersiveResizeHandle {{
+    background-color: rgba(185, 128, 255, 0.45);
+    border: none;
+}}
+QWidget#immersiveResizeHandle:hover {{
+    background-color: rgba(185, 128, 255, 0.75);
 }}
 """

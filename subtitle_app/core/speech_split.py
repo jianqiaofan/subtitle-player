@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 import subprocess
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -118,102 +117,6 @@ def detect_speech_regions_from_wav_file(
     )
     return _split_long_regions(regions, silences, max_speech_sec, min_silence_sec)
 
-
-def build_speech_regions_for_media(
-    media_path: Path,
-    work_dir: Path,
-    *,
-    # 2 小时内整段提取一次，避免边播边转时反复打开源文件与播放器抢句柄。
-    long_video_threshold_sec: float = 7200.0,
-    window_sec: float = 600.0,
-    on_progress: Callable[[str], None] | None = None,
-    on_regions_batch: Callable[[list[SpeechRegion]], None] | None = None,
-) -> list[SpeechRegion]:
-    """
-    为媒体构建语音分片列表。
-    常规时长：提取完整 WAV 后一次性分析；
-    超长视频（默认 >=2h）：按窗口逐段提取并分析，避免长时间等待与过高内存占用。
-    """
-    all_regions: list[SpeechRegion] = []
-    for batch in iter_speech_regions_for_media(
-        media_path,
-        work_dir,
-        long_video_threshold_sec=long_video_threshold_sec,
-        window_sec=window_sec,
-        on_progress=on_progress,
-    ):
-        all_regions.extend(batch)
-        if on_regions_batch and batch:
-            on_regions_batch(batch)
-    return all_regions
-
-
-def iter_speech_regions_for_media(
-    media_path: Path,
-    work_dir: Path,
-    *,
-    # 2 小时内整段提取一次，避免边播边转时反复打开源文件与播放器抢句柄。
-    long_video_threshold_sec: float = 7200.0,
-    window_sec: float = 600.0,
-    on_progress: Callable[[str], None] | None = None,
-):
-    """按批次 yield 语音区间，便于边播边转时长视频增量启动。"""
-    from core.audio import extract_audio, extract_audio_segment
-
-    duration = get_media_duration(media_path)
-    if duration <= long_video_threshold_sec:
-        if on_progress:
-            on_progress("正在提取音频并分析语音结构…")
-        wav_path = extract_audio(media_path, work_dir)
-        regions = detect_speech_regions_from_wav_file(wav_path)
-        if on_progress:
-            on_progress(f"语音结构分析完成，共 {len(regions)} 个分片")
-        yield regions
-        return
-
-    if on_progress:
-        on_progress(
-            f"长视频（{_fmt_duration(duration)}），按 {_fmt_duration(window_sec)} 分段分析语音结构…"
-        )
-
-    offset = 0.0
-    window_index = 0
-    total = 0
-    while offset < duration - 0.05:
-        window_index += 1
-        chunk_duration = min(window_sec, duration - offset)
-        chunk_wav = work_dir / f"scan_{window_index:04d}.wav"
-        if on_progress:
-            on_progress(
-                f"分析语音结构 {window_index}："
-                f"{_fmt_duration(offset)} → {_fmt_duration(offset + chunk_duration)}"
-            )
-        extract_audio_segment(media_path, offset, chunk_duration, chunk_wav)
-        window_regions = detect_speech_regions_from_wav_file(
-            chunk_wav,
-            offset_sec=offset,
-        )
-        try:
-            chunk_wav.unlink(missing_ok=True)
-        except OSError:
-            pass
-        total += len(window_regions)
-        if on_progress:
-            on_progress(f"已发现 {total} 个语音分片，继续分析…")
-        yield window_regions
-        offset += window_sec
-
-    if on_progress:
-        on_progress(f"语音结构分析完成，共 {total} 个分片")
-
-
-def _fmt_duration(seconds: float) -> str:
-    total = int(seconds)
-    hours, rem = divmod(total, 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"
 
 
 def _detect_silences_ffmpeg(

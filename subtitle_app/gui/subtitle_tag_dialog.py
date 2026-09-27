@@ -5,17 +5,20 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QPlainTextEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
-from core.subtitle_tags import PRESET_TAGS, order_tags
+from core.subtitle_tags import TAG_CATEGORIES, is_preset_tag, order_tags
 from gui.styles import DARK_STYLE
 
 _MAX_TAG_LENGTH = 48
@@ -36,10 +39,12 @@ class SubtitleTagDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("标签")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(520)
+        self.resize(520, 640)
         self.setStyleSheet(DARK_STYLE)
         self._checks: dict[str, QCheckBox] = {}
-        self._note_overridden = False
+        self._custom_count = 0
+        selected = set(selected_tags)
 
         layout = QVBoxLayout(self)
         if row_count > 1:
@@ -47,32 +52,62 @@ class SubtitleTagDialog(QDialog):
         else:
             layout.addWidget(QLabel("选择标签，确认后显示在这条字幕上"))
 
-        self._checks_host = QWidget()
-        self._checks_layout = QVBoxLayout(self._checks_host)
-        self._checks_layout.setContentsMargins(0, 0, 0, 0)
-        self._checks_layout.setSpacing(4)
-        layout.addWidget(self._checks_host)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll = scroll
+        host = QWidget()
+        host_layout = QVBoxLayout(host)
+        host_layout.setContentsMargins(0, 0, 8, 0)
+        host_layout.setSpacing(8)
 
-        known = list(PRESET_TAGS)
-        for name in custom_tags:
-            if name not in known:
-                known.append(name)
-        for name in selected_tags:
-            if name not in known:
-                known.append(name)
-        for name in known:
-            self._add_checkbox(name, checked=name in selected_tags)
+        for title, names in TAG_CATEGORIES:
+            host_layout.addWidget(self._section_label(title))
+            grid = QGridLayout()
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(4)
+            for index, name in enumerate(names):
+                box = self._make_checkbox(name, checked=name in selected)
+                grid.addWidget(box, index // 3, index % 3)
+            host_layout.addLayout(grid)
+
+        host_layout.addWidget(self._section_label("自定义"))
+        hint = QLabel("自己输入。只出现在当前这部视频里，同文件夹的其它视频不会带上。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #b5b5b5; font-weight: normal;")
+        host_layout.addWidget(hint)
+
+        self._custom_grid = QGridLayout()
+        self._custom_grid.setContentsMargins(0, 0, 0, 0)
+        self._custom_grid.setHorizontalSpacing(12)
+        self._custom_grid.setVerticalSpacing(4)
+        host_layout.addLayout(self._custom_grid)
+
+        extra: list[str] = []
+        for name in list(custom_tags) + list(selected_tags):
+            cleaned = name.strip()
+            if not cleaned or is_preset_tag(cleaned) or cleaned in extra:
+                continue
+            extra.append(cleaned)
+        for name in extra:
+            self._add_custom_checkbox(name, checked=name in selected, reveal=False)
 
         add_row = QHBoxLayout()
         self.custom_edit = QLineEdit()
-        self.custom_edit.setPlaceholderText("自定义标签")
+        self.custom_edit.setPlaceholderText("输入自定义标签")
         self.custom_edit.setMaxLength(_MAX_TAG_LENGTH)
         add_button = QPushButton("添加")
         add_button.clicked.connect(self._add_custom_tag)
         self.custom_edit.returnPressed.connect(self._add_custom_tag)
         add_row.addWidget(self.custom_edit, stretch=1)
         add_row.addWidget(add_button)
-        layout.addLayout(add_row)
+        host_layout.addLayout(add_row)
+        host_layout.addStretch(1)
+
+        scroll.setWidget(host)
+        layout.addWidget(scroll, stretch=1)
 
         layout.addWidget(QLabel("备注"))
         self.note_edit = QPlainTextEdit()
@@ -116,15 +151,31 @@ class SubtitleTagDialog(QDialog):
         self._apply_note = checked
         self.note_edit.setEnabled(checked)
 
-    def _add_checkbox(self, name: str, *, checked: bool) -> None:
-        if name in self._checks:
-            if checked:
-                self._checks[name].setChecked(True)
-            return
+    def _section_label(self, title: str) -> QLabel:
+        label = QLabel(title)
+        label.setStyleSheet("color: #e8e8e8; font-weight: bold;")
+        return label
+
+    def _make_checkbox(self, name: str, *, checked: bool) -> QCheckBox:
         box = QCheckBox(name)
         box.setChecked(checked)
         self._checks[name] = box
-        self._checks_layout.addWidget(box)
+        return box
+
+    def _add_custom_checkbox(self, name: str, *, checked: bool, reveal: bool = True) -> None:
+        existing = self._checks.get(name)
+        if existing is not None:
+            if checked:
+                existing.setChecked(True)
+            if reveal:
+                self._scroll.ensureWidgetVisible(existing)
+            return
+        box = self._make_checkbox(name, checked=checked)
+        row, column = divmod(self._custom_count, 3)
+        self._custom_grid.addWidget(box, row, column)
+        self._custom_count += 1
+        if reveal:
+            self._scroll.ensureWidgetVisible(box)
 
     def _add_custom_tag(self) -> None:
         name = self.custom_edit.text().strip()
@@ -135,5 +186,5 @@ class SubtitleTagDialog(QDialog):
             return
         if any(ch in name for ch in "\r\n\t"):
             return
-        self._add_checkbox(name, checked=True)
+        self._add_custom_checkbox(name, checked=True)
         self.custom_edit.clear()

@@ -134,6 +134,9 @@ class AppConfig:
     # 批量同步标签：上次选择的标签文件和视频文件夹
     batch_tag_sync_files: list[str] = field(default_factory=list)
     batch_tag_sync_video_dir: str = ""
+    # 提取全部标签：上次的来源文件夹和保存位置
+    tag_extract_source_dir: str = ""
+    tag_extract_dest_dir: str = ""
 
     def get_ai_notes_user_context(self, subtitle_type: str) -> str:
         return str(self.ai_notes_user_context.get(subtitle_type, "") or "").strip()
@@ -343,6 +346,8 @@ def load_config() -> AppConfig:
             tag_files.append(path)
     cfg.batch_tag_sync_files = tag_files
     cfg.batch_tag_sync_video_dir = str(cfg.batch_tag_sync_video_dir or "").strip()
+    cfg.tag_extract_source_dir = str(cfg.tag_extract_source_dir or "").strip()
+    cfg.tag_extract_dest_dir = str(cfg.tag_extract_dest_dir or "").strip()
     return cfg
 
 

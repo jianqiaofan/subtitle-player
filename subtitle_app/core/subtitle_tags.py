@@ -17,9 +17,71 @@ from core.subtitle import SubtitleSegment
 TAG_FILE_SUFFIX = ".tags.json"
 TAG_DOCUMENT_VERSION = 1
 
-PRESET_TAGS = ("重点", "难点", "易错", "跟读", "已掌握")
-# 左侧色条只取一个标签，按复习优先级。
-TAG_BAR_PRIORITY = ("难点", "重点", "易错", "跟读", "已掌握")
+# 分类只用于选标签界面。存进文件的是标签名字，同名即同一个标签。
+TAG_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "通用",
+        ("重点", "难点", "易错", "新章节", "新页面", "重要断点", "已掌握", "待复习", "存疑"),
+    ),
+    ("备考", ("真题", "得分点", "技巧", "必背", "口诀", "案例")),
+    ("语言学习", ("单词", "语法", "发音", "短语", "地道表达")),
+    ("电影", ("佳句", "反复练听", "跟读", "长难句", "俚语", "文化背景", "名场面")),
+)
+
+
+def _flatten_preset_tags() -> tuple[str, ...]:
+    seen: set[str] = set()
+    names: list[str] = []
+    for _title, tags in TAG_CATEGORIES:
+        for name in tags:
+            if name not in seen:
+                names.append(name)
+                seen.add(name)
+    return tuple(names)
+
+
+PRESET_TAGS = _flatten_preset_tags()
+PRESET_TAG_SET = frozenset(PRESET_TAGS)
+
+# 左侧色条只取一个标签。越靠前越优先；「已掌握」放最后，避免盖住其它标签的颜色。
+_BAR_PRIORITY_PREFERRED = (
+    "存疑",
+    "难点",
+    "易错",
+    "重点",
+    "待复习",
+    "长难句",
+    "反复练听",
+    "跟读",
+    "真题",
+    "得分点",
+    "必背",
+    "单词",
+    "语法",
+    "发音",
+    "短语",
+    "地道表达",
+    "佳句",
+    "俚语",
+    "技巧",
+    "口诀",
+    "案例",
+    "文化背景",
+    "名场面",
+    "新章节",
+    "新页面",
+    "重要断点",
+    "已掌握",
+)
+
+
+def _bar_priority() -> tuple[str, ...]:
+    ordered = [name for name in _BAR_PRIORITY_PREFERRED if name in PRESET_TAG_SET]
+    ordered.extend(name for name in PRESET_TAGS if name not in ordered)
+    return tuple(ordered)
+
+
+TAG_BAR_PRIORITY = _bar_priority()
 
 _TIME_TOLERANCE_MS = 1
 
@@ -111,13 +173,43 @@ def times_close(left: float, right: float) -> bool:
     return abs(time_ms(left) - time_ms(right)) <= _TIME_TOLERANCE_MS
 
 
+def is_preset_tag(name: str) -> bool:
+    return name in PRESET_TAG_SET
+
+
 def custom_tag_names(entries: list[SubtitleTagEntry]) -> list[str]:
     names: list[str] = []
     for entry in entries:
         for tag in entry.tags:
-            if tag not in PRESET_TAGS and tag not in names:
+            if not is_preset_tag(tag) and tag not in names:
                 names.append(tag)
     return names
+
+
+def _subtitle_matches_stem(subtitle_stem: str, media_stem: str) -> bool:
+    return subtitle_stem == media_stem or subtitle_stem.startswith(f"{media_stem}_")
+
+
+def subtitle_belongs_to_media(subtitle_path: Path, media_path: Path) -> bool:
+    """字幕属于当前这部视频。同目录里文件名更长的另一部媒体优先认领。"""
+    from core.config import MEDIA_EXTENSIONS
+
+    subtitle_stem = subtitle_path.stem
+    media_stem = media_path.stem
+    if not _subtitle_matches_stem(subtitle_stem, media_stem):
+        return False
+    best = media_stem
+    try:
+        entries = list(media_path.parent.iterdir())
+    except OSError:
+        return True
+    for item in entries:
+        if not item.is_file() or item.suffix.lower() not in MEDIA_EXTENSIONS:
+            continue
+        other = item.stem
+        if len(other) > len(best) and _subtitle_matches_stem(subtitle_stem, other):
+            best = other
+    return best == media_stem
 
 
 def custom_tags_for_media(
@@ -125,7 +217,7 @@ def custom_tags_for_media(
     current_subtitle: Path | None,
     current_entries: list[SubtitleTagEntry],
 ) -> list[str]:
-    """只收集当前视频自己的自定义标签，不带上其它视频里用过的名字。"""
+    """只收集当前视频自己的自定义标签，不带上同文件夹里其它视频用过的名字。"""
     from core.subtitle_loader import find_subtitles_for_media
 
     names = custom_tag_names(current_entries)
@@ -133,6 +225,8 @@ def custom_tags_for_media(
         return names
     current = current_subtitle.resolve() if current_subtitle is not None else None
     for path, _label in find_subtitles_for_media(media_path):
+        if not subtitle_belongs_to_media(path, media_path):
+            continue
         if current is not None and path.resolve() == current:
             continue
         document = load_tag_document(tag_path_for_subtitle(path), path.name)
@@ -379,6 +473,116 @@ def find_batch_tag_matches(
                 )
             )
     return matches
+
+
+@dataclass
+class TagExtractResult:
+    copied: list[str] = field(default_factory=list)
+    merged: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    error: str = ""
+
+
+def _path_is_inside(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _iter_tag_files(folder: Path, exclude: Path | None) -> tuple[list[Path], list[str]]:
+    found: list[Path] = []
+    problems: list[str] = []
+    try:
+        walker = folder.rglob("*")
+    except OSError as exc:
+        return [], [f"无法读取 {folder}：{exc}"]
+    while True:
+        try:
+            path = next(walker)
+        except StopIteration:
+            break
+        except OSError as exc:
+            problems.append(f"无法读取部分子文件夹：{exc}")
+            continue
+        if not path.is_file() or not path.name.endswith(TAG_FILE_SUFFIX):
+            continue
+        if exclude is not None and _path_is_inside(path, exclude):
+            continue
+        found.append(path)
+    found.sort(key=lambda item: str(item).casefold())
+    return found, problems
+
+
+def collect_tag_files(source_dir: Path, dest_dir: Path) -> TagExtractResult:
+    """把来源文件夹（含子文件夹）里的标签收到保存位置。同名字幕合并，不改来源。"""
+    result = TagExtractResult()
+    if not source_dir.is_dir():
+        result.error = "来源文件夹不存在。"
+        return result
+    try:
+        source_resolved = source_dir.resolve()
+        dest_resolved = dest_dir.resolve()
+    except OSError as exc:
+        result.error = f"无法读取所选文件夹：{exc}"
+        return result
+    if source_resolved == dest_resolved:
+        result.error = "来源文件夹和保存位置不能是同一个文件夹。请另选一个文件夹来接收标签。"
+        return result
+    exclude = dest_resolved if _path_is_inside(dest_resolved, source_resolved) else None
+    files, problems = _iter_tag_files(source_resolved, exclude)
+    result.skipped.extend(problems)
+    groups: dict[str, list[Path]] = {}
+    for path in files:
+        groups.setdefault(path.name.casefold(), []).append(path)
+    try:
+        dest_resolved.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        result.error = f"无法创建保存位置：{exc}"
+        return result
+    for grouped in groups.values():
+        subtitle_name = subtitle_name_for_tag_path(grouped[0])
+        if not subtitle_name:
+            result.skipped.append(f"{grouped[0].name}：不是标签文件")
+            continue
+        documents: list[SubtitleTagDocument] = []
+        for path in grouped:
+            try:
+                if path.resolve() == (dest_resolved / path.name).resolve():
+                    continue
+            except OSError:
+                pass
+            incoming = read_tag_document_for_import(path)
+            if incoming is None:
+                result.skipped.append(f"{path}：标签文件无效，或与字幕文件名不一致")
+                continue
+            documents.append(incoming)
+        if not documents:
+            continue
+        destination = dest_resolved / grouped[0].name
+        local = load_tag_document(destination, subtitle_name)
+        had_local = bool(local.entries)
+        merged = list(local.entries)
+        for document in documents:
+            merged = merge_tag_entries(merged, document.entries)
+        local.entries = merged
+        local.subtitle_file = subtitle_name
+        try:
+            save_tag_document(destination, local)
+        except OSError as exc:
+            result.skipped.append(f"{destination.name}：无法写入（{exc}）")
+            continue
+        if had_local or len(documents) > 1:
+            detail = subtitle_name
+            if len(documents) > 1:
+                detail += f"：合并了 {len(documents)} 个同名字幕的标签"
+            else:
+                detail += "：已并入保存位置里原有的标签"
+            result.merged.append(detail)
+        else:
+            result.copied.append(subtitle_name)
+    return result
 
 
 def sync_tag_file_into_folder(source: Path, folder: Path) -> tuple[str, str]:

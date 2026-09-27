@@ -108,6 +108,7 @@ from core.subtitle_tags import (
 )
 from core.subtitle_loader import find_valid_subtitles, load_subtitles
 from gui.batch_tag_sync_dialog import BatchTagSyncDialog
+from gui.extract_tags_dialog import ExtractTagsDialog
 from gui.ai_notes_corpus_dialog import AiNotesCorpusDialog
 from gui.ai_notes_progress_dialog import AiNotesProgressDialog
 from gui.llm_settings_dialog import LlmSettingsDialog
@@ -308,6 +309,8 @@ class PlayerWindow(QMainWindow):
         action_sync_tags.triggered.connect(self._sync_tag_files)
         action_batch_sync_tags = tools_menu.addAction("批量同步标签")
         action_batch_sync_tags.triggered.connect(self._batch_sync_tag_files)
+        action_extract_tags = tools_menu.addAction("提取全部标签")
+        action_extract_tags.triggered.connect(self._extract_all_tags)
         tools_menu.addSeparator()
         self._action_console = tools_menu.addAction(console_button_label())
         self._action_console.setToolTip("显示或隐藏后台命令窗口")
@@ -2509,6 +2512,20 @@ class PlayerWindow(QMainWindow):
         dialog.exec()
         affected = dialog.affected_video_dirs()
         if self._media_path is not None and self._media_path.parent.resolve() in affected:
+            self._reload_current_subtitle_tags()
+
+    def _extract_all_tags(self) -> None:
+        start_dir = str(self._media_path.parent) if self._media_path is not None else ""
+        dialog = ExtractTagsDialog(self, start_dir=start_dir)
+        dialog.exec()
+        output = dialog.output_dir()
+        if output is None or self._media_path is None:
+            return
+        try:
+            same_folder = self._media_path.parent.resolve() == output.resolve()
+        except OSError:
+            return
+        if same_folder:
             self._reload_current_subtitle_tags()
 
     def _reload_current_subtitle_tags(self) -> None:

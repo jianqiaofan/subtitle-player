@@ -1,0 +1,20 @@
+[Unit]
+Description=字幕云同步 FastAPI
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=simple
+User=subtitle-sync
+Group=subtitle-sync
+WorkingDirectory=/opt/subtitle-sync
+EnvironmentFile=/etc/subtitle-sync.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/subtitle-sync/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8002 --workers 1
+NoNewPrivileges=true
+PrivateTmp=true
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

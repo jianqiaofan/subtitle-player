@@ -113,6 +113,8 @@ class AppConfig:
     ecdict_db_path: str = ""
     last_media_dir: str = ""
     recent_media_files: list[str] = field(default_factory=list)
+    # 媒体路径 -> 上次播放位置（毫秒），用于再次打开时停在原进度
+    media_playback_positions: dict[str, int] = field(default_factory=dict)
     translate_app: str = "baidu"
     translate_hotkey: str = "Ctrl+Alt+C"
     # 画面叠加字幕（半透明底条 + 实心字）
@@ -137,6 +139,10 @@ class AppConfig:
     # 提取全部标签：上次的来源文件夹和保存位置
     tag_extract_source_dir: str = ""
     tag_extract_dest_dir: str = ""
+    # 云同步账号。同一用户名在不同设备上是同一个用户。
+    cloud_server_url: str = "https://subtitle.gcsfg.work"
+    cloud_username: str = ""
+    cloud_password: str = ""
 
     def get_ai_notes_user_context(self, subtitle_type: str) -> str:
         return str(self.ai_notes_user_context.get(subtitle_type, "") or "").strip()
@@ -337,6 +343,20 @@ def load_config() -> AppConfig:
         if path and path not in recent_files:
             recent_files.append(path)
     cfg.recent_media_files = recent_files[:15]
+    raw_positions = cfg.media_playback_positions
+    positions: dict[str, int] = {}
+    if isinstance(raw_positions, dict):
+        for key, value in raw_positions.items():
+            path = str(key or "").strip()
+            try:
+                position_ms = int(value)
+            except (TypeError, ValueError):
+                continue
+            if path and position_ms > 0:
+                positions[path] = position_ms
+    if len(positions) > 200:
+        positions = dict(list(positions.items())[-200:])
+    cfg.media_playback_positions = positions
     if not isinstance(cfg.batch_tag_sync_files, list):
         cfg.batch_tag_sync_files = []
     tag_files: list[str] = []
@@ -348,6 +368,9 @@ def load_config() -> AppConfig:
     cfg.batch_tag_sync_video_dir = str(cfg.batch_tag_sync_video_dir or "").strip()
     cfg.tag_extract_source_dir = str(cfg.tag_extract_source_dir or "").strip()
     cfg.tag_extract_dest_dir = str(cfg.tag_extract_dest_dir or "").strip()
+    cfg.cloud_server_url = str(cfg.cloud_server_url or "").strip() or "https://subtitle.gcsfg.work"
+    cfg.cloud_username = str(cfg.cloud_username or "").strip()
+    cfg.cloud_password = str(cfg.cloud_password or "")
     return cfg
 
 

@@ -26,6 +26,7 @@ from PyQt6.QtMultimedia import (
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -36,6 +37,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSlider,
     QSplitter,
@@ -56,6 +58,14 @@ _RECOVERABLE_PLAYBACK_MARKERS = (
 _MAX_PLAYBACK_RECOVERY_ATTEMPTS = 2
 _ERROR_DIALOG_COOLDOWN_SEC = 4.0
 _SUBTITLE_REPEAT_GAP_MS = 500
+# 短于这个进度不记成“上次播放位置”，再次打开时停在第一帧。
+_PLAYBACK_RESUME_MIN_MS = 2000
+# 离结尾太近视为已经看完，下次从第一帧开始。
+_PLAYBACK_END_MARGIN_MS = 3000
+_PLAYBACK_POSITION_LIMIT = 200
+_RESTART_LINK_VISIBLE_MS = 5000
+_OPEN_FRAME_WAIT_MS = 350
+_OPEN_FRAME_NUDGE_MS = 2000
 
 from core.ai_notes import (
     build_notes_output_path,
@@ -92,6 +102,22 @@ from core.console_window import (
 )
 from core.transcriber import clear_model_cache, is_cuda_available
 from core.subtitle import SubtitleSegment, find_segment_index_at_time, write_subtitle_file
+from core.cloud_sync import (
+    DEFAULT_CLOUD_SERVER,
+    apply_shared_download,
+    apply_subtitle_download,
+    apply_tag_download,
+    classify_subtitles,
+    collect_folder_subtitles,
+    collect_folder_tags,
+    collect_media_subtitles,
+    collect_media_tags,
+    fetch_remote_index,
+    inspect_open_media,
+    load_account_client,
+    upload_subtitles,
+    upload_tags,
+)
 from core.subtitle_tags import (
     SubtitleTagDocument,
     SubtitleTagEntry,
@@ -101,12 +127,27 @@ from core.subtitle_tags import (
     load_tag_document,
     order_tags,
     PRESET_TAGS,
+    retire_tag_entry,
     save_tag_document,
+    set_entry_note,
+    set_entry_tags,
     snapshot_entry,
+    stamp_new_entry,
     sync_tag_file_into_folder,
     tag_path_for_subtitle,
 )
 from core.subtitle_loader import find_valid_subtitles, load_subtitles
+from core.video_hash import video_content_hash
+from gui.cloud_account_dialog import CloudAccountDialog
+from gui.cloud_sync_ui import (
+    CloudTask,
+    LeftSubmenu,
+    choose_shared_subtitle,
+    confirm_share_upload,
+    confirm_subtitle_download,
+    confirm_subtitle_replace,
+    confirm_tag_download,
+)
 from gui.batch_tag_sync_dialog import BatchTagSyncDialog
 from gui.extract_tags_dialog import ExtractTagsDialog
 from gui.ai_notes_corpus_dialog import AiNotesCorpusDialog
@@ -183,6 +224,29 @@ class PlayerWindow(QMainWindow):
         self._repeat_gap_timer.setSingleShot(True)
         self._repeat_gap_timer.setInterval(_SUBTITLE_REPEAT_GAP_MS)
         self._repeat_gap_timer.timeout.connect(self._on_subtitle_repeat_gap_elapsed)
+        self._open_pause_pending = False
+        self._open_pause_position_ms = 0
+        self._open_pause_applied_ms = 0
+        self._holding_open_pause = False
+        self._open_frame_nudge = False
+        self._open_preview_should_pause = False
+        self._open_nudge_audio_overridden = False
+        self._open_nudge_restore_muted = False
+        self._play_after_open_pause = False
+        self._open_pause_ui_done = True
+        self._open_frame_seen = False
+        self._open_nudge_timer = QTimer(self)
+        self._open_nudge_timer.setSingleShot(True)
+        self._open_nudge_timer.setInterval(_OPEN_FRAME_NUDGE_MS)
+        self._open_nudge_timer.timeout.connect(self._on_open_nudge_timeout)
+        self._restart_link_timer = QTimer(self)
+        self._restart_link_timer.setSingleShot(True)
+        self._restart_link_timer.setInterval(_RESTART_LINK_VISIBLE_MS)
+        self._restart_link_timer.timeout.connect(self._hide_restart_from_start_link)
+        self._playback_save_timer = QTimer(self)
+        self._playback_save_timer.setSingleShot(True)
+        self._playback_save_timer.setInterval(3000)
+        self._playback_save_timer.timeout.connect(self._remember_playback_position)
         self._transcribe_poll_timer = QTimer(self)
         self._transcribe_poll_timer.setInterval(1500)
         self._transcribe_poll_timer.timeout.connect(self._poll_transcribe_tool)
@@ -305,12 +369,19 @@ class PlayerWindow(QMainWindow):
         self._action_vocabulary.triggered.connect(self._generate_vocabulary_list)
         action_plain_text = tools_menu.addAction("纯文字")
         action_plain_text.triggered.connect(self._export_plain_text)
-        action_sync_tags = tools_menu.addAction("同步标签文件")
-        action_sync_tags.triggered.connect(self._sync_tag_files)
-        action_batch_sync_tags = tools_menu.addAction("批量同步标签")
-        action_batch_sync_tags.triggered.connect(self._batch_sync_tag_files)
-        action_extract_tags = tools_menu.addAction("提取全部标签")
-        action_extract_tags.triggered.connect(self._extract_all_tags)
+        upload_subtitle_menu = LeftSubmenu("上传字幕文件 ◀", tools_menu)
+        upload_subtitle_menu.addAction("上传当前字幕").triggered.connect(self._upload_current_subtitles)
+        upload_subtitle_menu.addAction("批量上传字幕").triggered.connect(self._upload_folder_subtitles)
+        tools_menu.addMenu(upload_subtitle_menu)
+        local_tag_menu = LeftSubmenu("本地标签同步 ◀", tools_menu)
+        local_tag_menu.addAction("同步标签文件").triggered.connect(self._sync_tag_files)
+        local_tag_menu.addAction("批量同步标签").triggered.connect(self._batch_sync_tag_files)
+        local_tag_menu.addAction("提取全部标签").triggered.connect(self._extract_all_tags)
+        tools_menu.addMenu(local_tag_menu)
+        upload_tag_menu = LeftSubmenu("上传标签文件 ◀", tools_menu)
+        upload_tag_menu.addAction("上传当前标签").triggered.connect(self._upload_current_tags)
+        upload_tag_menu.addAction("批量上传标签").triggered.connect(self._upload_folder_tags)
+        tools_menu.addMenu(upload_tag_menu)
         tools_menu.addSeparator()
         self._action_console = tools_menu.addAction(console_button_label())
         self._action_console.setToolTip("显示或隐藏后台命令窗口")
@@ -391,6 +462,10 @@ class PlayerWindow(QMainWindow):
         hotkey_action = QWidgetAction(self)
         hotkey_action.setDefaultWidget(hotkey_widget)
         settings_menu.addAction(hotkey_action)
+
+        settings_menu.addSeparator()
+        action_cloud_account = settings_menu.addAction("用户设置")
+        action_cloud_account.triggered.connect(self._open_cloud_account_settings)
         self._settings_menu = settings_menu
 
         settings_btn = self._create_toolbar_menu_button(
@@ -435,6 +510,7 @@ class PlayerWindow(QMainWindow):
         video_widget.set_toggle_callback(self.toggle_playback_from_video)
         video_widget.set_double_click_callback(self.toggle_maximize_from_video)
         self._player.setVideoSink(video_widget.video_sink())
+        video_widget.video_sink().videoFrameChanged.connect(self._on_preview_video_frame)
 
         audio_placeholder = QLabel("音频播放中")
         audio_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -850,6 +926,19 @@ class PlayerWindow(QMainWindow):
         self.position_slider.valueChanged.connect(self._on_slider_moved)
         bar.addWidget(self.position_slider, stretch=1)
 
+        self.restart_from_start_btn = QPushButton("从头开始播放")
+        self.restart_from_start_btn.setObjectName("linkButton")
+        self.restart_from_start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.restart_from_start_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.restart_from_start_btn.setFlat(True)
+        self.restart_from_start_btn.setToolTip("从开头重新播放")
+        link_font = self.restart_from_start_btn.font()
+        link_font.setUnderline(True)
+        self.restart_from_start_btn.setFont(link_font)
+        self.restart_from_start_btn.clicked.connect(self._on_restart_from_start_clicked)
+        self.restart_from_start_btn.hide()
+        bar.addWidget(self.restart_from_start_btn)
+
         self.time_label = QLabel("00:00 / 00:00")
         bar.addWidget(self.time_label)
 
@@ -1034,27 +1123,32 @@ class PlayerWindow(QMainWindow):
         if not media_path.is_file():
             return
 
+        self._remember_playback_position()
+        self._cancel_open_preview()
+        resume_ms = self._saved_playback_position_ms(media_path)
+
         self._media_path = media_path
         self._set_subtitle_list_visible(True)
         self._persist_last_media_dir(media_path)
         self.media_label.setText(media_path.name)
         self._open_dir_btn.setEnabled(True)
-        self._pending_seek_ms = None
+        self._pending_seek_ms = resume_ms
         self._pending_play_after_seek = False
         self._awaiting_reload_seek = False
         self._recovering_playback = False
         self._playback_recovery_attempts = 0
-        self._last_good_position_ms = 0
+        self._last_good_position_ms = resume_ms
+        self._open_pause_position_ms = resume_ms
+        self._open_pause_applied_ms = 0
+        self._open_pause_pending = True
+        self._holding_open_pause = False
         self._stop_subtitle_repeat()
         self._recreate_audio_output()
-        self._player.setSource(QUrl.fromLocalFile(str(media_path)))
-
         is_audio = media_path.suffix.lower() in AUDIO_EXTENSIONS
         self._media_viewport.set_audio_mode(is_audio)
         self._video_widget.clear_frame()
         if not is_audio:
             self._player.setVideoSink(self._video_widget.video_sink())
-            QTimer.singleShot(0, self._media_viewport.refresh_stacking)
 
         self.subtitle_list.clear()
         self._segments.clear()
@@ -1063,11 +1157,16 @@ class PlayerWindow(QMainWindow):
         self._update_onscreen_subtitle(0.0)
         self._update_live_status("")
 
+        self._player.setSource(QUrl.fromLocalFile(str(media_path)))
+        if not is_audio:
+            QTimer.singleShot(0, self._media_viewport.refresh_stacking)
+
         self._refresh_subtitle_options()
         if self.subtitle_combo.count() > 0:
             self.subtitle_combo.setCurrentIndex(0)
             self._load_subtitle_at_index(0)
         self._update_notes_buttons()
+        self._schedule_cloud_check()
 
     def _update_notes_buttons(self) -> None:
         if not self._media_path:
@@ -1145,9 +1244,12 @@ class PlayerWindow(QMainWindow):
             self._segments = []
         self._load_tag_document_for_current_subtitle()
         self._populate_subtitle_list()
-        if self._segments and self._player.duration() > 0:
-            self._sync_subtitle_highlight(self._player.position() / 1000.0)
-        self._update_onscreen_subtitle(self._player.position() / 1000.0)
+        preview_seconds = self._player.position() / 1000.0
+        if self._holding_open_pause:
+            preview_seconds = self._open_pause_applied_ms / 1000.0
+        if self._segments and (self._player.duration() > 0 or self._holding_open_pause):
+            self._sync_subtitle_highlight(preview_seconds, force=True)
+        self._update_onscreen_subtitle(preview_seconds)
 
     def _populate_subtitle_list(self) -> None:
         self._bind_subtitle_tags()
@@ -1310,15 +1412,18 @@ class PlayerWindow(QMainWindow):
             entry = self._tag_by_row.get(row)
             note = new_note if new_note is not None else (entry.note if entry is not None else "")
             if not new_tags and not note.strip():
-                self._drop_tag_entry(entry)
+                if entry is not None:
+                    retire_tag_entry(entry)
                 continue
             if entry is None:
                 entry = entry_from_segment(segment, new_tags, note)
+                stamp_new_entry(entry)
                 self._tag_document.entries.append(entry)
             else:
                 snapshot_entry(entry, segment)
-                entry.tags = new_tags
-                entry.note = note
+                set_entry_tags(entry, new_tags)
+                if new_note is not None:
+                    set_entry_note(entry, note)
         self._save_subtitle_tags()
         self._bind_subtitle_tags()
         self._refresh_subtitle_list_texts()
@@ -1348,9 +1453,7 @@ class PlayerWindow(QMainWindow):
     def _drop_tag_entry(self, entry: SubtitleTagEntry | None) -> None:
         if entry is None:
             return
-        self._tag_document.entries = [
-            item for item in self._tag_document.entries if item.id != entry.id
-        ]
+        retire_tag_entry(entry)
 
     def _matched_tag_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -1604,9 +1707,9 @@ class PlayerWindow(QMainWindow):
             for tag in entry.tags:
                 if tag not in merged:
                     merged.append(tag)
-            existing.tags = order_tags(merged)
+            set_entry_tags(existing, merged)
             if not existing.note.strip() and entry.note.strip():
-                existing.note = entry.note
+                set_entry_note(existing, entry.note, entry.note_at or None)
             snapshot_entry(existing, segment)
             self._drop_tag_entry(entry)
         else:
@@ -1651,9 +1754,7 @@ class PlayerWindow(QMainWindow):
         entry = next((item for item in self._tag_document.entries if item.id == entry_id), None)
         if entry is None:
             return
-        entry.note = note.strip()
-        if not entry.has_content():
-            self._drop_tag_entry(entry)
+        set_entry_note(entry, note)
         self._save_subtitle_tags()
         self._bind_subtitle_tags()
         self._refresh_subtitle_list_texts()
@@ -1727,7 +1828,7 @@ class PlayerWindow(QMainWindow):
         if row < 0 or row >= len(self._segments):
             return
         self._stop_subtitle_repeat()
-        self._seek_to(self._segments[row].start, play=True)
+        self._seek_to(self._segments[row].start)
 
     def _selected_subtitle_rows(self) -> list[int]:
         rows = sorted(
@@ -2009,6 +2110,22 @@ class PlayerWindow(QMainWindow):
             self._toggle_play()
 
     def _toggle_play(self) -> None:
+        if self._open_frame_nudge or self._open_preview_should_pause:
+            self._release_open_preview(keep_playing=True)
+            return
+        if self._open_pause_pending:
+            self._play_after_open_pause = True
+            return
+        if self._holding_open_pause and not self._open_pause_ui_done:
+            self._open_pause_ui_done = True
+            self._open_nudge_timer.stop()
+            self._holding_open_pause = False
+            self._maybe_show_restart_link()
+            self._stop_subtitle_repeat()
+            self._play_media()
+            return
+        self._open_pause_pending = False
+        self._holding_open_pause = False
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._stop_subtitle_repeat()
             self._player.pause()
@@ -2017,23 +2134,65 @@ class PlayerWindow(QMainWindow):
             self._play_media()
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
-        self._set_play_button_state(state == QMediaPlayer.PlaybackState.PlayingState)
-        if state == QMediaPlayer.PlaybackState.PlayingState and hasattr(self, "_media_viewport"):
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        if self._open_frame_nudge:
+            self._set_play_button_state(False)
+        else:
+            self._set_play_button_state(playing)
+        if playing and not self._open_frame_nudge and not self._open_preview_should_pause:
+            self._holding_open_pause = False
+            self._open_pause_pending = False
+        if (
+            state == QMediaPlayer.PlaybackState.PausedState
+            and not self._open_frame_nudge
+            and not self._open_preview_should_pause
+        ):
+            self._remember_playback_position()
+        if playing and hasattr(self, "_media_viewport") and not self._open_frame_nudge:
             QTimer.singleShot(0, self._media_viewport.refresh_stacking)
 
     def _on_duration_changed(self, duration_ms: int) -> None:
         self.position_slider.setRange(0, max(0, duration_ms))
+        if (
+            self._holding_open_pause
+            and duration_ms > 0
+            and self._open_pause_applied_ms > 0
+            and self._open_pause_applied_ms >= max(0, duration_ms - _PLAYBACK_END_MARGIN_MS)
+        ):
+            self._open_pause_applied_ms = 0
+            self._open_pause_position_ms = 0
+            self._hide_restart_from_start_link()
+            self._player.setPosition(0)
+        if self._holding_open_pause and not self._open_frame_nudge:
+            self._sync_open_pause_ui(self._open_pause_applied_ms)
+            return
+        if self._holding_open_pause:
+            self._update_time_label(self._open_pause_applied_ms, duration_ms)
+            return
         self._update_time_label(self._player.position(), duration_ms)
 
     def _on_position_changed(self, position_ms: int) -> None:
+        if self._holding_open_pause and not self._open_pause_ui_done:
+            if self._open_frame_nudge:
+                self._maybe_finish_audio_open_nudge(position_ms)
+            else:
+                self._maybe_finish_paused_open(position_ms)
+            return
         if not self._seeking:
             self.position_slider.blockSignals(True)
             self.position_slider.setValue(position_ms)
             self.position_slider.blockSignals(False)
-            if position_ms >= 0:
+            if position_ms >= 0 and not self._open_frame_nudge:
                 self._last_good_position_ms = position_ms
                 if self._playback_recovery_attempts and not self._recovering_playback:
                     self._playback_recovery_attempts = 0
+            if (
+                not self._open_frame_nudge
+                and not self._holding_open_pause
+                and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                and not self._playback_save_timer.isActive()
+            ):
+                self._playback_save_timer.start()
             self._maybe_handle_subtitle_repeat(position_ms)
         self._update_time_label(position_ms, self._player.duration())
         self._sync_subtitle_highlight(position_ms / 1000.0)
@@ -2201,6 +2360,300 @@ class PlayerWindow(QMainWindow):
             self._saved_playback_rate = float(rate)
             self._player.setPlaybackRate(self._saved_playback_rate)
 
+    def _playback_position_key(self, path: Path) -> str:
+        return str(path.resolve())
+
+    def _saved_playback_position_ms(self, path: Path) -> int:
+        raw = self._config.media_playback_positions.get(self._playback_position_key(path), 0)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 0
+        if value < _PLAYBACK_RESUME_MIN_MS:
+            return 0
+        return value
+
+    def _forget_playback_position(self, path: Path) -> None:
+        key = self._playback_position_key(path)
+        if key not in self._config.media_playback_positions:
+            return
+        positions = dict(self._config.media_playback_positions)
+        positions.pop(key, None)
+        self._config.media_playback_positions = positions
+        save_config(self._config)
+
+    def _remember_playback_position(self) -> None:
+        path = self._media_path
+        if path is None or self._open_frame_nudge or self._open_preview_should_pause:
+            return
+        playing = self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        if self._holding_open_pause and not playing:
+            return
+        if self._open_pause_pending and not playing:
+            return
+        position = int(self._player.position())
+        duration = int(self._player.duration())
+        key = self._playback_position_key(path)
+        positions = dict(self._config.media_playback_positions)
+        finished = duration > 0 and position >= max(0, duration - _PLAYBACK_END_MARGIN_MS)
+        forget = position < _PLAYBACK_RESUME_MIN_MS or finished
+        if forget:
+            if key not in positions:
+                return
+            positions.pop(key, None)
+        else:
+            if positions.get(key) == position:
+                return
+            positions.pop(key, None)
+            positions[key] = position
+            if len(positions) > _PLAYBACK_POSITION_LIMIT:
+                positions = dict(list(positions.items())[-_PLAYBACK_POSITION_LIMIT:])
+        self._config.media_playback_positions = positions
+        save_config(self._config)
+
+    def _resume_point_is_meaningful(self, position_ms: int) -> bool:
+        if position_ms < _PLAYBACK_RESUME_MIN_MS:
+            return False
+        duration = self._player.duration()
+        if duration > 0 and position_ms >= max(0, duration - _PLAYBACK_END_MARGIN_MS):
+            return False
+        return True
+
+    def _sync_open_pause_ui(self, position_ms: int) -> None:
+        position_ms = max(0, int(position_ms))
+        self.position_slider.blockSignals(True)
+        self.position_slider.setValue(position_ms)
+        self.position_slider.blockSignals(False)
+        self._update_time_label(position_ms, self._player.duration())
+        self._sync_subtitle_highlight(position_ms / 1000.0, force=True)
+        self._update_onscreen_subtitle(position_ms / 1000.0)
+
+    def _show_restart_from_start_link(self) -> None:
+        if not hasattr(self, "restart_from_start_btn"):
+            return
+        self.restart_from_start_btn.show()
+        self._restart_link_timer.start()
+
+    def _hide_restart_from_start_link(self) -> None:
+        self._restart_link_timer.stop()
+        if hasattr(self, "restart_from_start_btn"):
+            self.restart_from_start_btn.hide()
+
+    def _maybe_show_restart_link(self) -> None:
+        if not hasattr(self, "restart_from_start_btn"):
+            return
+        if self._resume_point_is_meaningful(self._open_pause_applied_ms):
+            if not self.restart_from_start_btn.isVisible():
+                self._show_restart_from_start_link()
+        else:
+            self._hide_restart_from_start_link()
+
+    def _complete_open_pause_ui(self) -> None:
+        self._maybe_show_restart_link()
+        if not self._play_after_open_pause:
+            return
+        self._play_after_open_pause = False
+        self._holding_open_pause = False
+        self._play_media()
+
+    def _restore_open_nudge_audio(self) -> None:
+        if not self._open_nudge_audio_overridden:
+            return
+        self._open_nudge_audio_overridden = False
+        self._audio_output.setMuted(self._open_nudge_restore_muted)
+
+    def _cancel_open_preview(self) -> None:
+        self._open_pause_pending = False
+        self._holding_open_pause = False
+        self._open_pause_ui_done = True
+        self._open_frame_nudge = False
+        self._open_preview_should_pause = False
+        self._play_after_open_pause = False
+        self._open_nudge_timer.stop()
+        self._restore_open_nudge_audio()
+        self._hide_restart_from_start_link()
+
+    def _begin_open_pause(self) -> None:
+        if not self._open_pause_pending or self._media_path is None:
+            return
+        self._open_pause_pending = False
+        position_ms = self._clamp_position_ms(self._open_pause_position_ms)
+        if not self._resume_point_is_meaningful(position_ms):
+            position_ms = 0
+        self._open_pause_applied_ms = position_ms
+        self._last_good_position_ms = position_ms
+        self._pending_seek_ms = position_ms
+        self._pending_play_after_seek = False
+        self._holding_open_pause = True
+        self._open_pause_ui_done = False
+        self._open_frame_seen = False
+        self._player.setPlaybackRate(self._saved_playback_rate)
+        self._set_play_button_state(False)
+        self._sync_open_pause_ui(position_ms)
+
+        is_audio = self._media_path.suffix.lower() in AUDIO_EXTENSIONS
+        if is_audio and position_ms <= 0:
+            self._player.pause()
+            self._mark_open_pause_settled()
+            return
+
+        self._seeking = True
+        self._player.setPosition(position_ms)
+        self._seeking = False
+        self._player.pause()
+        self._open_nudge_timer.setInterval(_OPEN_FRAME_WAIT_MS)
+        self._open_nudge_timer.start()
+
+    def _maybe_finish_paused_open(self, position_ms: int) -> None:
+        if self._open_pause_ui_done or self._media_path is None:
+            return
+        if self._media_path.suffix.lower() not in AUDIO_EXTENSIONS:
+            return
+        target = self._open_pause_applied_ms
+        if target >= _PLAYBACK_RESUME_MIN_MS and position_ms + 400 < target:
+            return
+        if self._open_frame_seen:
+            return
+        self._open_frame_seen = True
+        QTimer.singleShot(0, self._mark_open_pause_settled)
+
+    def _mark_open_pause_settled(self) -> None:
+        if self._open_pause_ui_done or not self._holding_open_pause:
+            return
+        self._open_pause_ui_done = True
+        self._open_nudge_timer.stop()
+        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._player.pause()
+        self._sync_open_pause_ui(self._open_pause_applied_ms)
+        self._complete_open_pause_ui()
+
+    def _nudge_open_frame_if_needed(self) -> None:
+        if not self._holding_open_pause or self._open_pause_ui_done or self._media_path is None:
+            return
+        if self._play_after_open_pause:
+            self._open_pause_ui_done = True
+            self._open_nudge_timer.stop()
+            self._holding_open_pause = False
+            self._play_after_open_pause = False
+            self._maybe_show_restart_link()
+            self._play_media()
+            return
+        if self._open_frame_seen:
+            self._mark_open_pause_settled()
+            return
+        is_audio = self._media_path.suffix.lower() in AUDIO_EXTENSIONS
+        target = self._open_pause_applied_ms
+        if is_audio and (
+            target < _PLAYBACK_RESUME_MIN_MS
+            or abs(int(self._player.position()) - target) <= 400
+        ):
+            self._mark_open_pause_settled()
+            return
+
+        self._open_nudge_restore_muted = self._audio_output.isMuted()
+        self._audio_output.setMuted(True)
+        self._open_nudge_audio_overridden = True
+        self._open_frame_nudge = True
+        self._open_preview_should_pause = True
+        self._player.play()
+        self._open_nudge_timer.setInterval(_OPEN_FRAME_NUDGE_MS)
+        self._open_nudge_timer.start()
+
+    def _maybe_finish_audio_open_nudge(self, position_ms: int) -> None:
+        if self._media_path is None or self._media_path.suffix.lower() not in AUDIO_EXTENSIONS:
+            return
+        target = self._open_pause_applied_ms
+        if target >= _PLAYBACK_RESUME_MIN_MS and position_ms + 400 < target:
+            return
+        self._open_frame_nudge = False
+        self._open_nudge_timer.stop()
+        QTimer.singleShot(0, self._pause_after_open_preview)
+
+    def _on_preview_video_frame(self, frame) -> None:
+        if not frame.isValid():
+            return
+        if (
+            self._holding_open_pause
+            and not self._open_frame_nudge
+            and not self._open_pause_ui_done
+        ):
+            target = self._open_pause_applied_ms
+            if target >= _PLAYBACK_RESUME_MIN_MS and self._player.position() + 400 < target:
+                return
+            if self._open_frame_seen:
+                return
+            self._open_frame_seen = True
+            QTimer.singleShot(0, self._mark_open_pause_settled)
+            return
+        if not self._open_frame_nudge:
+            return
+        target = self._open_pause_applied_ms
+        if target >= _PLAYBACK_RESUME_MIN_MS and self._player.position() + 400 < target:
+            return
+        self._open_frame_nudge = False
+        self._open_nudge_timer.stop()
+        QTimer.singleShot(0, self._pause_after_open_preview)
+
+    def _on_open_nudge_timeout(self) -> None:
+        if not self._open_frame_nudge:
+            self._nudge_open_frame_if_needed()
+            return
+        self._open_frame_nudge = False
+        target = self._open_pause_applied_ms
+        if target > 0:
+            self._player.setPosition(target)
+        self._pause_after_open_preview()
+
+    def _pause_after_open_preview(self) -> None:
+        if not self._open_preview_should_pause:
+            return
+        self._open_preview_should_pause = False
+        self._open_frame_nudge = False
+        self._open_nudge_timer.stop()
+        target = max(0, int(self._open_pause_applied_ms))
+        self._player.pause()
+        if target > 0 and abs(int(self._player.position()) - target) > 500:
+            self._seeking = True
+            self._player.setPosition(target)
+            self._seeking = False
+        self._restore_open_nudge_audio()
+        self._sync_open_pause_ui(target)
+        self._open_pause_ui_done = True
+        self._complete_open_pause_ui()
+
+    def _release_open_preview(self, *, keep_playing: bool) -> None:
+        self._open_frame_nudge = False
+        self._open_preview_should_pause = False
+        self._open_pause_ui_done = True
+        self._open_nudge_timer.stop()
+        self._restore_open_nudge_audio()
+        self._holding_open_pause = False
+        self._open_pause_pending = False
+        self._play_after_open_pause = False
+        if keep_playing:
+            self._set_play_button_state(True)
+            if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                self._play_media()
+            self._maybe_show_restart_link()
+            return
+        self._player.pause()
+        self._set_play_button_state(False)
+
+    def _on_restart_from_start_clicked(self) -> None:
+        self._hide_restart_from_start_link()
+        self._open_frame_nudge = False
+        self._open_preview_should_pause = False
+        self._open_pause_ui_done = True
+        self._open_nudge_timer.stop()
+        self._restore_open_nudge_audio()
+        self._holding_open_pause = False
+        self._open_pause_pending = False
+        self._play_after_open_pause = False
+        if self._media_path is not None:
+            self._forget_playback_position(self._media_path)
+        self._open_pause_applied_ms = 0
+        self._seek_to(0.0, play=True)
+
     def _clamp_position_ms(self, position_ms: int) -> int:
         position_ms = max(0, int(position_ms))
         duration = self._player.duration()
@@ -2212,9 +2665,21 @@ class PlayerWindow(QMainWindow):
         if self._media_path is None:
             return
 
+        self._open_pause_pending = False
+        self._holding_open_pause = False
+        self._play_after_open_pause = False
+        self._open_pause_ui_done = True
+        self._open_nudge_timer.stop()
+        nudging = self._open_frame_nudge or self._open_preview_should_pause
+        if nudging:
+            self._open_frame_nudge = False
+            self._open_preview_should_pause = False
+            self._open_nudge_timer.stop()
+            self._restore_open_nudge_audio()
         position_ms = self._clamp_position_ms(int(round(float(seconds) * 1000)))
         was_playing = (
-            self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            not nudging
+            and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
         )
         should_play = was_playing if play is None else play
         self._pending_seek_ms = position_ms
@@ -2259,6 +2724,7 @@ class PlayerWindow(QMainWindow):
         if self._media_path is None:
             return
 
+        self._cancel_open_preview()
         self._recovering_playback = True
         self._awaiting_reload_seek = True
         self._pending_seek_ms = self._clamp_position_ms(position_ms)
@@ -2279,7 +2745,17 @@ class PlayerWindow(QMainWindow):
             QTimer.singleShot(0, self._media_viewport.refresh_stacking)
 
     def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
+        if status in (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        ) and self._open_pause_pending:
+            self._begin_open_pause()
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self._remember_playback_position()
         if not self._awaiting_reload_seek:
+            if status == QMediaPlayer.MediaStatus.InvalidMedia:
+                self._open_pause_pending = False
+                self._hide_restart_from_start_link()
             return
         if status not in (
             QMediaPlayer.MediaStatus.LoadedMedia,
@@ -2331,10 +2807,12 @@ class PlayerWindow(QMainWindow):
             else self._last_good_position_ms
         )
         should_play = self._pending_play_after_seek
-        if (
+        if self._holding_open_pause and not should_play:
+            should_play = False
+        elif (
             self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
             or should_play
-        ):
+        ) and not self._open_frame_nudge:
             should_play = True
         self._reload_media_at_position(target_ms, should_play)
         return True
@@ -2453,6 +2931,276 @@ class PlayerWindow(QMainWindow):
     def _on_mute_toggled(self, muted: bool) -> None:
         self._audio_output.setMuted(muted)
         self._set_mute_button_state(muted)
+
+    def _open_cloud_account_settings(self) -> None:
+        if getattr(self, "_settings_menu", None) is not None:
+            self._settings_menu.close()
+        CloudAccountDialog(self._config, self).exec()
+
+    def _account_snapshot(self) -> tuple[str, str, str]:
+        return (
+            self._config.cloud_server_url or DEFAULT_CLOUD_SERVER,
+            (self._config.cloud_username or "").strip(),
+            self._config.cloud_password or "",
+        )
+
+    def _require_cloud_account(self) -> bool:
+        _url, username, password = self._account_snapshot()
+        if username and password:
+            return True
+        QMessageBox.information(
+            self,
+            "用户设置",
+            "还没有用户名。请先在「设置 → 用户设置」填写用户名和密码并注册。\n"
+            "不同设备使用同一个用户名，即为同一用户。",
+        )
+        return False
+
+    def _start_cloud_task(self, work, on_success, title: str | None) -> None:
+        progress = None
+        host = QApplication.activeModalWidget() or self
+        if title:
+            progress = QProgressDialog(title, None, 0, 0, host)
+            progress.setWindowTitle("云同步")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setCancelButton(None)
+            progress.setMinimumDuration(0)
+            progress.show()
+        task = CloudTask(work, self)
+
+        def ok(result) -> None:
+            if progress is not None:
+                progress.close()
+            on_success(result)
+
+        def fail(message: str) -> None:
+            if progress is not None:
+                progress.close()
+            QMessageBox.warning(QApplication.activeModalWidget() or self, "云同步", message)
+
+        task.succeeded.connect(ok)
+        task.failed.connect(fail)
+        task.finished.connect(task.deleteLater)
+        self._cloud_task = task
+        task.start()
+
+    def _upload_current_subtitles(self) -> None:
+        if not self._require_cloud_account():
+            return
+        if self._media_path is None:
+            QMessageBox.information(self, "上传字幕", "请先打开视频。")
+            return
+        media = self._media_path
+        account = self._account_snapshot()
+
+        def work():
+            items, skipped = collect_media_subtitles(media)
+            if not items:
+                return {"plan": [], "skipped": skipped}
+            client = load_account_client(*account)
+            remote = fetch_remote_index(client, {item.video_hash for item in items})
+            return {"plan": classify_subtitles(items, remote), "skipped": skipped}
+
+        self._start_cloud_task(work, self._confirm_subtitle_upload, "正在查看云端字幕…")
+
+    def _upload_folder_subtitles(self) -> None:
+        if not self._require_cloud_account():
+            return
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "选择要上传字幕的文件夹",
+            str(self._config.resolved_last_media_dir()),
+        )
+        if not chosen:
+            return
+        folder = Path(chosen)
+        account = self._account_snapshot()
+
+        def work():
+            items, skipped = collect_folder_subtitles(folder)
+            if not items:
+                return {"plan": [], "skipped": skipped}
+            client = load_account_client(*account)
+            remote = fetch_remote_index(client, {item.video_hash for item in items})
+            return {"plan": classify_subtitles(items, remote), "skipped": skipped}
+
+        self._start_cloud_task(work, self._confirm_subtitle_upload, "正在查看云端字幕…")
+
+    def _confirm_subtitle_upload(self, result: dict) -> None:
+        plan = result.get("plan") or []
+        skipped = list(result.get("skipped") or [])
+        if not plan:
+            QMessageBox.information(self, "上传字幕", "\n".join(skipped) or "没有可上传的字幕。")
+            return
+        conflicts = [
+            (item.item.subtitle_name, item.remote_updated_at)
+            for item in plan
+            if item.state == "changed"
+        ]
+        choice = confirm_subtitle_replace(self, conflicts, allow_skip=len(plan) > 1) if conflicts else "replace"
+        if choice == "cancel":
+            return
+        selected = []
+        same: list[str] = []
+        for candidate in plan:
+            if candidate.state == "same":
+                same.append(f"{candidate.item.subtitle_name}：已是最新")
+            elif candidate.state == "changed" and choice != "replace":
+                skipped.append(f"{candidate.item.subtitle_name}：已跳过")
+            else:
+                selected.append(candidate.item)
+        if not selected:
+            QMessageBox.information(self, "上传字幕", "\n".join(same + skipped) or "没有需要上传的字幕。")
+            return
+        shared = confirm_share_upload(self)
+        if shared is None:
+            return
+        account = self._account_snapshot()
+
+        def work():
+            client = load_account_client(*account)
+            uploaded = upload_subtitles(client, selected, shared)
+            return uploaded, same, skipped, shared
+
+        self._start_cloud_task(work, self._show_subtitle_upload_result, "正在上传字幕…")
+
+    def _show_subtitle_upload_result(self, result: tuple) -> None:
+        uploaded, same, skipped, shared = result
+        lines = [f"已上传 {len(uploaded)} 个字幕" + ("，并共享给其他用户" if shared else "")]
+        lines.extend(uploaded)
+        if same:
+            lines.append("")
+            lines.extend(same)
+        if skipped:
+            lines.append("")
+            lines.extend(skipped)
+        QMessageBox.information(self, "上传字幕", "\n".join(lines))
+
+    def _upload_current_tags(self) -> None:
+        if not self._require_cloud_account():
+            return
+        if self._media_path is None:
+            QMessageBox.information(self, "上传标签", "请先打开视频。")
+            return
+        items, skipped = collect_media_tags(self._media_path)
+        if not items:
+            QMessageBox.information(self, "上传标签", "\n".join(skipped) or "当前视频没有可上传的标签。")
+            return
+        self._upload_tag_items(items, skipped)
+
+    def _upload_folder_tags(self) -> None:
+        if not self._require_cloud_account():
+            return
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "选择要上传标签的文件夹",
+            str(self._config.resolved_last_media_dir()),
+        )
+        if not chosen:
+            return
+        items, skipped = collect_folder_tags(Path(chosen))
+        if not items:
+            QMessageBox.information(self, "上传标签", "\n".join(skipped) or "这个文件夹里没有可上传的标签。")
+            return
+        self._upload_tag_items(items, skipped)
+
+    def _upload_tag_items(self, items, skipped: list[str]) -> None:
+        account = self._account_snapshot()
+
+        def work():
+            client = load_account_client(*account)
+            uploaded, unchanged = upload_tags(client, items)
+            return uploaded, unchanged, skipped
+
+        self._start_cloud_task(work, self._show_tag_upload_result, "正在上传标签…")
+
+    def _show_tag_upload_result(self, result: tuple) -> None:
+        uploaded, unchanged, skipped = result
+        lines = [f"已同步 {len(uploaded)} 个标签文件" if uploaded else "没有新的标签变更"]
+        lines.extend(uploaded)
+        if unchanged:
+            lines.append("")
+            lines.extend(f"{name}：和云端相比没有变化" for name in unchanged)
+        if skipped:
+            lines.append("")
+            lines.extend(skipped)
+        QMessageBox.information(self, "上传标签", "\n".join(lines))
+
+    def _schedule_cloud_check(self) -> None:
+        if self._media_path is None:
+            return
+        if not self._config.cloud_username.strip() or not self._config.cloud_password:
+            return
+        media = self._media_path
+        account = (
+            self._config.cloud_server_url or DEFAULT_CLOUD_SERVER,
+            self._config.cloud_username,
+            self._config.cloud_password,
+        )
+
+        def work():
+            client = load_account_client(*account)
+            return inspect_open_media(client, media)
+
+        task = CloudTask(work, self)
+        task.succeeded.connect(lambda result, media=media, username=account[1]: self._offer_cloud_updates(media, username, result))
+        task.failed.connect(lambda _message: None)
+        task.finished.connect(task.deleteLater)
+        self._cloud_check_task = task
+        task.start()
+
+    def _offer_cloud_updates(self, media: Path, username: str, update) -> None:
+        if self._media_path is None or self._media_path != media:
+            return
+        if update.subtitles and confirm_subtitle_download(self, update.subtitles):
+            for item in update.subtitles:
+                apply_subtitle_download(username, item)
+            current = None
+            index = self.subtitle_combo.currentIndex()
+            if index >= 0:
+                current = self.subtitle_combo.itemData(index)
+            self._refresh_subtitle_options()
+            if current:
+                self._select_subtitle_path(Path(str(current)))
+            elif self.subtitle_combo.count() > 0:
+                self.subtitle_combo.setCurrentIndex(0)
+                self._load_subtitle_at_index(0)
+        if self._media_path != media:
+            return
+        if update.tags and confirm_tag_download(self, update.tags):
+            for item in update.tags:
+                apply_tag_download(username, item)
+            self._reload_current_subtitle_tags()
+        if self._media_path != media:
+            return
+        if update.shares and not find_valid_subtitles(media):
+            chosen = choose_shared_subtitle(self, update.shares)
+            if chosen and chosen.get("username"):
+                self._download_shared_subtitles(media, str(chosen["username"]))
+
+    def _download_shared_subtitles(self, media: Path, sharer: str) -> None:
+        account = self._account_snapshot()
+
+        def work():
+            client = load_account_client(*account)
+            return client.get_share(video_content_hash(media), sharer)
+
+        def done(payload: dict) -> None:
+            if self._media_path != media:
+                return
+            shares = payload.get("shares") if isinstance(payload, dict) else None
+            subtitles = []
+            if shares:
+                subtitles = shares[0].get("subtitles") or []
+            written = apply_shared_download(media, subtitles)
+            if not written:
+                QMessageBox.information(self, "共享字幕", "没有下载到字幕。")
+                return
+            self._refresh_subtitle_options()
+            self._select_subtitle_path(written[0])
+            QMessageBox.information(self, "共享字幕", f"已同步 {sharer} 分享的 {len(written)} 个字幕。")
+
+        self._start_cloud_task(work, done, "正在同步共享字幕…")
 
     def _sync_tag_files(self) -> None:
         if self._media_path is None:
@@ -3014,6 +3762,11 @@ class PlayerWindow(QMainWindow):
     def _on_player_error(self, error: QMediaPlayer.Error, message: str = "") -> None:
         if error == QMediaPlayer.Error.NoError:
             return
+        if self._open_frame_nudge or self._open_preview_should_pause:
+            self._open_frame_nudge = False
+            self._open_preview_should_pause = False
+            self._open_nudge_timer.stop()
+            self._restore_open_nudge_audio()
         detail = message or self._player.errorString() or "未知错误"
         if self._try_recover_playback(detail):
             return
@@ -3044,6 +3797,9 @@ class PlayerWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._study_countdown_timer.stop()
+        self._playback_save_timer.stop()
+        self._remember_playback_position()
+        self._cancel_open_preview()
         self._stop_subtitle_repeat()
         self._persist_last_media_dir()
         self._stop_ai_notes_worker()

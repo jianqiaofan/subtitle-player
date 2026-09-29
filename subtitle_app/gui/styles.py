@@ -84,6 +84,25 @@ QPushButton#iconButton:checked {
     background-color: rgba(185, 128, 255, 0.18);
     border: 1px solid #b980ff;
 }
+QPushButton#linkButton {
+    color: #d7b3ff;
+    background-color: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 0 8px;
+    min-height: 0;
+    font-weight: normal;
+}
+QPushButton#linkButton:hover {
+    color: #ffffff;
+    background-color: transparent;
+    border: none;
+}
+QPushButton#linkButton:pressed {
+    color: #b980ff;
+    background-color: transparent;
+    border: none;
+}
 QToolButton#toolbarMenuButton {
     color: #b980ff;
     background-color: #212121;

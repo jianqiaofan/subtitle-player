@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -95,9 +96,15 @@ class SubtitleTagEntry:
     text: str
     tags: list[str] = field(default_factory=list)
     note: str = ""
+    # 云同步：每个标签的是否还在和最后操作时间。播放器只显示 present 的名字。
+    tag_ops: list[dict] = field(default_factory=list)
+    note_at: str = ""
 
     def has_content(self) -> bool:
         return bool(self.tags) or bool(self.note.strip())
+
+    def should_keep(self) -> bool:
+        return self.has_content() or bool(self.tag_ops) or bool(self.note_at)
 
 
 @dataclass
@@ -307,7 +314,7 @@ def load_tag_document(tag_path: Path, subtitle_name: str) -> SubtitleTagDocument
     if isinstance(raw_entries, list):
         for item in raw_entries:
             parsed = _parse_entry(item)
-            if parsed is not None and parsed.has_content():
+            if parsed is not None and parsed.should_keep():
                 entries.append(parsed)
     document.entries = entries
     return document
@@ -349,6 +356,8 @@ def _clone_entry(entry: SubtitleTagEntry, entry_id: str | None = None) -> Subtit
         text=entry.text or "",
         tags=order_tags(list(entry.tags)),
         note=(entry.note or "").strip(),
+        tag_ops=[dict(op) for op in entry.tag_ops if isinstance(op, dict)],
+        note_at=entry.note_at or "",
     )
 
 
@@ -614,7 +623,7 @@ def sync_tag_file_into_folder(source: Path, folder: Path) -> tuple[str, str]:
 
 
 def save_tag_document(tag_path: Path, document: SubtitleTagDocument) -> None:
-    kept = [entry for entry in document.entries if entry.has_content()]
+    kept = [entry for entry in document.entries if entry.should_keep()]
     document.entries = kept
     if not kept:
         if tag_path.is_file():
@@ -624,7 +633,7 @@ def save_tag_document(tag_path: Path, document: SubtitleTagDocument) -> None:
     payload = {
         "version": TAG_DOCUMENT_VERSION,
         "subtitle_file": document.subtitle_file,
-        "entries": [asdict(entry) for entry in kept],
+        "entries": [_entry_payload(entry) for entry in kept],
     }
     tag_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -708,6 +717,13 @@ def _parse_entry(item: object) -> SubtitleTagEntry | None:
             if cleaned:
                 tags.append(cleaned)
     entry_id = str(item.get("id") or "").strip() or new_entry_id()
+    tag_ops = _parse_tag_ops(item.get("tag_ops"))
+    if tag_ops:
+        visible = [op["name"] for op in tag_ops if op.get("present")]
+        known = {op["name"] for op in tag_ops}
+        visible.extend(name for name in tags if name not in known)
+        tags = visible
+    note_at = str(item.get("note_at") or "").strip()
     return SubtitleTagEntry(
         id=entry_id,
         index=index,
@@ -716,4 +732,86 @@ def _parse_entry(item: object) -> SubtitleTagEntry | None:
         text=str(item.get("text") or ""),
         tags=order_tags(tags),
         note=str(item.get("note") or "").strip(),
+        tag_ops=tag_ops,
+        note_at=note_at,
     )
+
+
+def tag_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def set_entry_tags(entry: SubtitleTagEntry, names: list[str], at: str | None = None) -> None:
+    """按勾选结果更新可见标签，并记下本次新增或取消的时间。"""
+    moment = at or tag_timestamp()
+    new_tags = order_tags(names)
+    old = set(entry.tags)
+    new = set(new_tags)
+    by_name = {
+        str(op.get("name")): dict(op)
+        for op in entry.tag_ops
+        if isinstance(op, dict) and str(op.get("name") or "").strip()
+    }
+    for name in new - old:
+        by_name[name] = {"name": name, "present": True, "at": moment}
+    for name in old - new:
+        by_name[name] = {"name": name, "present": False, "at": moment}
+    entry.tag_ops = list(by_name.values())
+    entry.tags = new_tags
+
+
+def set_entry_note(entry: SubtitleTagEntry, note: str, at: str | None = None) -> None:
+    cleaned = (note or "").strip()
+    if cleaned == (entry.note or "").strip() and (entry.note_at or cleaned == ""):
+        entry.note = cleaned
+        return
+    entry.note = cleaned
+    entry.note_at = at or tag_timestamp()
+
+
+def retire_tag_entry(entry: SubtitleTagEntry, at: str | None = None) -> None:
+    """整句清除：每个还在的标签记成一次取消，记录留在文件里。"""
+    moment = at or tag_timestamp()
+    set_entry_tags(entry, [], moment)
+    if entry.note or entry.note_at:
+        entry.note = ""
+        entry.note_at = moment
+
+
+def stamp_new_entry(entry: SubtitleTagEntry, at: str | None = None) -> None:
+    moment = at or tag_timestamp()
+    entry.tag_ops = [{"name": name, "present": True, "at": moment} for name in entry.tags]
+    if entry.note.strip():
+        entry.note_at = moment
+
+
+def _entry_payload(entry: SubtitleTagEntry) -> dict:
+    payload = {
+        "id": entry.id,
+        "index": int(entry.index),
+        "start": float(entry.start),
+        "end": float(entry.end),
+        "text": entry.text or "",
+        "tags": list(entry.tags),
+        "note": entry.note or "",
+    }
+    if entry.tag_ops:
+        payload["tag_ops"] = [dict(op) for op in entry.tag_ops if isinstance(op, dict)]
+    if entry.note_at:
+        payload["note_at"] = entry.note_at
+    return payload
+
+
+def _parse_tag_ops(raw: object) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+    ops: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or not isinstance(item.get("present"), bool):
+            continue
+        at = str(item.get("at") or "").strip()
+        ops.append({"name": name, "present": item["present"], "at": at})
+    return ops

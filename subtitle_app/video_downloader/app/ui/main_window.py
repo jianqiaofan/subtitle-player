@@ -135,23 +135,34 @@ class MainWindow(ctk.CTk):
         # toolbar for table
         tools = ctk.CTkFrame(self, fg_color="transparent")
         tools.pack(fill="x", padx=16, pady=(4, 4))
+        start_btn: ctk.CTkButton | None = None
         for text, cmd in [
             ("开始下载选中", self._start_selected),
             ("取消选中", self._cancel_selected),
             ("删除选中", self._remove_selected),
             ("清除已结束", self._clear_finished),
         ]:
-            ctk.CTkButton(
+            btn = ctk.CTkButton(
                 tools, text=text, width=120 if text == "开始下载选中" else 100, height=30,
                 fg_color=COLORS["panel2"], hover_color=COLORS["border"],
                 command=cmd,
-            ).pack(side="left", padx=(0, 6))
+            )
+            btn.pack(side="left", padx=(0, 6))
+            if text == "开始下载选中":
+                start_btn = btn
 
         # task table via tkinter Treeview inside CTk frame
         table_wrap = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=12)
         table_wrap.pack(fill="both", expand=True, padx=16, pady=6)
 
+        import tkinter.font as tkfont
         import tkinter.ttk as ttk
+
+        # 与「开始下载选中」按钮同一套缩放后的字体高度
+        self._table_font = tkfont.Font(
+            root=self, font=self._apply_font_scaling(start_btn.cget("font"))
+        )
+        row_h = self._table_font.metrics("linespace") + 8
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -160,16 +171,16 @@ class MainWindow(ctk.CTk):
             background=COLORS["panel"],
             fieldbackground=COLORS["panel"],
             foreground=COLORS["text"],
-            rowheight=46,
+            rowheight=row_h,
             borderwidth=0,
-            font=("Segoe UI", 18),
+            font=self._table_font,
         )
         style.configure(
             "App.Treeview.Heading",
             background=COLORS["panel2"],
             foreground=COLORS["muted"],
             relief="flat",
-            font=("Segoe UI Semibold", 17),
+            font=self._table_font,
         )
         style.map(
             "App.Treeview",

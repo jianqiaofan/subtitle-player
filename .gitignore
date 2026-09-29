@@ -1,7 +1,11 @@
 # 用户配置（含 API Key、本地路径）
 subtitle_app/config.json
+subtitle_app/cloud_baselines/
 subtitle_app/video_downloader/config/user_settings.json
 subtitle_app/video_downloader/downloads/
+subtitle_server/.env
+subtitle_server/data/
+*.videohash.json
 
 # Python
 __pycache__/

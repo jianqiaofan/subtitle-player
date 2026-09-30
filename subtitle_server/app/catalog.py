@@ -5,7 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.models import Subtitle, TagDocumentRow, User
+from app.models import PlaybackSession, Subtitle, TagDocumentRow, User
 from app.names import subtitle_suffix
 from app.storage import (
     StorageError,
@@ -278,3 +278,90 @@ def delete_stored_row(db: Session, settings: Settings, row: Subtitle | TagDocume
         raise StorageError("无法删除云端文件") from exc
     db.delete(row)
     db.commit()
+
+
+_MIN_PLAYBACK_MS = 1_577_836_800_000
+_MAX_PLAYBACK_MS = 4_102_444_800_000
+_MAX_PLAYBACK_SPAN_MS = 24 * 60 * 60 * 1000
+
+
+class InvalidPlayback(ValueError):
+    pass
+
+
+def _session_payload(row: PlaybackSession) -> dict:
+    return {
+        "id": row.session_id,
+        "started_at": int(row.started_at_ms),
+        "ended_at": int(row.ended_at_ms),
+    }
+
+
+def list_playback_sessions(db: Session, user: User, video_hash: str) -> list[dict]:
+    rows = db.scalars(
+        select(PlaybackSession)
+        .where(PlaybackSession.user_id == user.id, PlaybackSession.video_hash == video_hash)
+        .order_by(PlaybackSession.started_at_ms.desc(), PlaybackSession.id.desc())
+    ).all()
+    return [_session_payload(row) for row in rows]
+
+
+def merge_playback_sessions(
+    db: Session,
+    user: User,
+    video_hash: str,
+    video_stem: str,
+    sessions: list[dict],
+) -> list[dict]:
+    """只追加当前用户还没有的播放段。已有记录保持原样，其他用户的记录不可见。"""
+    if len(sessions) > 500:
+        raise InvalidPlayback("一次最多同步 500 条播放记录")
+    cleaned: list[tuple[str, int, int]] = []
+    seen: set[str] = set()
+    for item in sessions:
+        if not isinstance(item, dict):
+            raise InvalidPlayback("播放记录无效")
+        session_id = str(item.get("id") or "").strip().lower()
+        if len(session_id) < 16 or len(session_id) > 64 or any(ch not in "0123456789abcdef" for ch in session_id):
+            raise InvalidPlayback("播放记录编号无效")
+        try:
+            started = int(item.get("started_at"))
+            ended = int(item.get("ended_at"))
+        except (TypeError, ValueError) as exc:
+            raise InvalidPlayback("播放时间无效") from exc
+        if not (_MIN_PLAYBACK_MS <= started <= _MAX_PLAYBACK_MS and _MIN_PLAYBACK_MS <= ended <= _MAX_PLAYBACK_MS):
+            raise InvalidPlayback("播放时间无效")
+        if ended <= started or ended - started > _MAX_PLAYBACK_SPAN_MS:
+            raise InvalidPlayback("播放时间无效")
+        if session_id in seen:
+            continue
+        seen.add(session_id)
+        cleaned.append((session_id, started, ended))
+
+    for _attempt in range(2):
+        existing_rows = db.scalars(
+            select(PlaybackSession).where(PlaybackSession.user_id == user.id)
+        ).all()
+        owned = {row.session_id: row for row in existing_rows}
+        try:
+            for session_id, started, ended in cleaned:
+                current = owned.get(session_id)
+                if current is not None:
+                    continue
+                db.add(
+                    PlaybackSession(
+                        user_id=user.id,
+                        session_id=session_id,
+                        video_hash=video_hash,
+                        video_stem=video_stem,
+                        started_at_ms=started,
+                        ended_at_ms=ended,
+                    )
+                )
+            db.commit()
+            break
+        except IntegrityError:
+            db.rollback()
+            if _attempt == 1:
+                raise Conflict from None
+    return list_playback_sessions(db, user, video_hash)

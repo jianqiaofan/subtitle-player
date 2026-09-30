@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,13 +16,11 @@ from core.cloud_tags import (
     merge_server_document,
     server_has_visible_tags,
 )
-from core.config import MEDIA_EXTENSIONS
 from core.subtitle_loader import SUBTITLE_EXTENSIONS, load_subtitles
 from core.subtitle_tags import (
     SubtitleTagDocument,
     load_tag_document,
     save_tag_document,
-    subtitle_belongs_to_media,
     subtitle_name_for_tag_path,
     tag_path_for_subtitle,
 )
@@ -61,6 +60,25 @@ class OpenMediaUpdate:
     subtitles: list[dict] = field(default_factory=list)
     tags: list[dict] = field(default_factory=list)
     shares: list[dict] = field(default_factory=list)
+    screenshots_changed: bool = False
+
+
+def _timeline_tag_file(media_path: Path, digest: str) -> TagFile | None:
+    from core.media_bundle import timeline_subtitle_name, timeline_tag_path
+
+    tag_path = timeline_tag_path(media_path)
+    name = timeline_subtitle_name(media_path)
+    document = load_tag_document(tag_path, name)
+    if not any(entry.should_keep() for entry in document.entries):
+        return None
+    document.subtitle_file = name
+    return TagFile(
+        path=tag_path,
+        video_hash=digest,
+        video_stem=media_path.stem,
+        subtitle_name=name,
+        document=document,
+    )
 
 
 def content_hash(text: str) -> str:
@@ -72,17 +90,9 @@ def read_subtitle_text(path: Path) -> str:
 
 
 def paired_video(subtitle_path: Path) -> Path | None:
-    folder = subtitle_path.parent
-    try:
-        entries = list(folder.iterdir())
-    except OSError:
-        return None
-    for item in entries:
-        if not item.is_file() or item.suffix.lower() not in MEDIA_EXTENSIONS:
-            continue
-        if subtitle_belongs_to_media(subtitle_path, item):
-            return item
-    return None
+    from core.media_bundle import media_for_subtitle
+
+    return media_for_subtitle(subtitle_path)
 
 
 def collect_media_subtitles(media_path: Path) -> tuple[list[SubtitleFile], list[str]]:
@@ -133,6 +143,9 @@ def collect_media_tags(media_path: Path) -> tuple[list[TagFile], list[str]]:
                 document=document,
             )
         )
+    timeline = _timeline_tag_file(media_path, digest)
+    if timeline is not None:
+        found.append(timeline)
     if not found:
         skipped.append(f"{media_path.name}：没有可上传的标签")
     return found, skipped
@@ -341,6 +354,95 @@ def upload_tags(client: CloudClient, items: list[TagFile]) -> tuple[list[str], l
     return uploaded, unchanged
 
 
+def cloud_host_reachable(server_url: str, timeout: float = 1.5) -> bool:
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(server_url or "")
+    host = parsed.hostname
+    if not host:
+        return False
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_online(server_url: str) -> None:
+    if not cloud_host_reachable(server_url):
+        raise CloudError("当前设备未联网，未进行同步。")
+
+
+def _shared_flags(client: CloudClient, video_hash: str) -> dict[str, bool]:
+    flags: dict[str, bool] = {}
+    try:
+        rows = client.list_library_subtitles()
+    except CloudError:
+        return flags
+    for row in rows:
+        if not isinstance(row, dict) or str(row.get("video_hash") or "") != video_hash:
+            continue
+        suffix = str(row.get("subtitle_suffix") or "")
+        if suffix:
+            flags[suffix] = bool(row.get("shared"))
+    return flags
+
+
+def upload_session_changes(
+    client: CloudClient,
+    media_path: Path,
+    *,
+    subtitles: bool,
+    tags: bool,
+) -> list[str]:
+    """退出时同步。已共享的字幕保持共享，新字幕仍只给自己。"""
+    lines: list[str] = []
+    if subtitles:
+        items, skipped = collect_media_subtitles(media_path)
+        if items:
+            flags = _shared_flags(client, items[0].video_hash)
+            remote = fetch_remote_index(client, {item.video_hash for item in items})
+            for candidate in classify_subtitles(items, remote):
+                if candidate.state == "same":
+                    lines.append(f"{candidate.item.subtitle_name}：字幕已是最新")
+                    continue
+                suffix = language_suffix(candidate.item.subtitle_name, candidate.item.video_stem)
+                upload_subtitles(client, [candidate.item], flags.get(suffix, False))
+                lines.append(f"{candidate.item.subtitle_name}：字幕已同步")
+        else:
+            lines.extend(skipped)
+    if tags:
+        tag_items, tag_skipped = collect_media_tags(media_path)
+        if tag_items:
+            uploaded, unchanged = upload_tags(client, tag_items)
+            lines.extend(f"{name}：标签已同步" for name in uploaded)
+            lines.extend(f"{name}：标签没有新的变化" for name in unchanged)
+        else:
+            lines.extend(tag_skipped)
+    return lines
+
+
+def sync_playback_log(client: CloudClient, media_path: Path) -> None:
+    """把已结束的播放记录追加到云端，并收回这个用户在其他设备上的记录。"""
+    from core.playback_log import apply_remote_playback, completed_sessions, load_playback_sessions
+
+    digest = video_content_hash(media_path)
+    local = completed_sessions(load_playback_sessions(media_path))
+    payload = client.put_playback(
+        digest,
+        media_path.stem,
+        [
+            {"id": item.id, "started_at": item.started_at, "ended_at": item.ended_at}
+            for item in local
+            if item.ended_at is not None
+        ],
+    )
+    remote = payload.get("sessions") if isinstance(payload, dict) else None
+    apply_remote_playback(media_path, remote if isinstance(remote, list) else [])
+
+
 def inspect_open_media(client: CloudClient, media_path: Path) -> OpenMediaUpdate:
     digest = video_content_hash(media_path)
     bundle = client.get_sync(digest)
@@ -351,15 +453,18 @@ def inspect_open_media(client: CloudClient, media_path: Path) -> OpenMediaUpdate
         if not suffix or not content:
             continue
         name = media_path.stem + suffix
-        local_path = media_path.parent / name
+        from core.media_bundle import subtitle_read_path, subtitle_write_path
+
+        read_path = subtitle_read_path(media_path, suffix)
+        write_path = subtitle_write_path(media_path, suffix)
         remote_hash = str(item.get("content_hash") or "")
         updated_at = str(item.get("updated_at") or "")
         seen = subtitle_baseline_hash(client.username, digest, suffix)
-        if remote_hash and remote_hash == seen and local_path.is_file():
+        if remote_hash and remote_hash == seen and read_path.is_file():
             continue
-        if local_path.is_file():
+        if read_path.is_file():
             try:
-                local_text = read_subtitle_text(local_path)
+                local_text = read_subtitle_text(read_path)
             except OSError:
                 local_text = ""
             if content_hash(local_text) == content_hash(content):
@@ -376,7 +481,8 @@ def inspect_open_media(client: CloudClient, media_path: Path) -> OpenMediaUpdate
                 "content": content,
                 "updated_at": updated_at,
                 "content_hash": remote_hash,
-                "path": str(local_path),
+                "path": str(write_path),
+                "legacy_path": str(read_path) if read_path.is_file() and read_path != write_path else "",
                 "state": state,
             }
         )
@@ -388,10 +494,12 @@ def inspect_open_media(client: CloudClient, media_path: Path) -> OpenMediaUpdate
         if not suffix or not remote_hash:
             continue
         name = media_path.stem + suffix
-        subtitle_path = media_path.parent / name
-        tag_path = tag_path_for_subtitle(subtitle_path)
+        from core.media_bundle import subtitle_write_path, tag_read_path, tag_write_path
+
+        read_path = tag_read_path(media_path, suffix)
+        write_path = tag_write_path(media_path, suffix)
         seen = tag_baseline_hash(client.username, digest, suffix)
-        local = load_tag_document(tag_path, name)
+        local = load_tag_document(read_path, name)
         local_has_tags = any(entry.should_keep() for entry in local.entries)
         # 和字幕一样：云端没变且本机文件还在，就不再问。本机标签不在时要重新下载。
         if remote_hash == seen and local_has_tags:
@@ -406,8 +514,9 @@ def inspect_open_media(client: CloudClient, media_path: Path) -> OpenMediaUpdate
                 "document": document,
                 "updated_at": updated_at,
                 "content_hash": remote_hash,
-                "path": str(tag_path_for_subtitle(subtitle_path)),
-                "subtitle_path": str(subtitle_path),
+                "path": str(write_path),
+                "source_path": str(read_path) if read_path.is_file() else "",
+                "subtitle_path": str(subtitle_write_path(media_path, suffix)),
             }
         )
     from core.subtitle_loader import find_valid_subtitles
@@ -421,23 +530,51 @@ def inspect_open_media(client: CloudClient, media_path: Path) -> OpenMediaUpdate
 
 
 def apply_shared_download(media_path: Path, subtitles: list[dict]) -> list[Path]:
+    from core.media_bundle import remove_legacy_subtitle, subtitle_write_path
+
     written: list[Path] = []
     for item in subtitles:
         suffix = str(item.get("subtitle_suffix") or "")
         content = str(item.get("content") or "")
         if not suffix or not content:
             continue
-        path = media_path.parent / f"{media_path.stem}{suffix}"
+        path = subtitle_write_path(media_path, suffix)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content.encode("utf-8"))
+        remove_legacy_subtitle(media_path, path.name)
         written.append(path)
     return written
 
 
+def subtitle_path_after_download(
+    previous: Path | None,
+    timeline_path: Path,
+    written: list[Path],
+) -> Path | None:
+    """同步字幕后该显示哪一份。时间线只是占位，不能再拿去当字幕文件打开。"""
+    if previous is not None and previous != timeline_path and previous.is_file():
+        return previous
+    for path in written:
+        if path != timeline_path and path.is_file():
+            return path
+    return None
+
+
 def apply_subtitle_download(username: str, item: dict) -> Path:
+    from core.media_bundle import remove_legacy_subtitle
+
     path = Path(item["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(str(item.get("content") or "").encode("utf-8"))
+    legacy = str(item.get("legacy_path") or "")
+    if legacy:
+        legacy_path = Path(legacy)
+        if legacy_path.is_file() and legacy_path.resolve() != path.resolve():
+            legacy_path.unlink()
+    else:
+        media_name = path.parent.name[: -len(".data")] if path.parent.name.endswith(".data") else ""
+        if media_name:
+            remove_legacy_subtitle(path.parent.parent / media_name, path.name)
     record_subtitle_baseline(
         username,
         str(item.get("video_hash") or ""),
@@ -451,11 +588,15 @@ def apply_subtitle_download(username: str, item: dict) -> Path:
 def apply_tag_download(username: str, item: dict) -> Path:
     subtitle_name = str(item.get("subtitle_name") or "")
     tag_path = Path(item["path"])
-    local = load_tag_document(tag_path, subtitle_name)
+    source_value = str(item.get("source_path") or "")
+    source = Path(source_value) if source_value else tag_path
+    local = load_tag_document(source, subtitle_name)
     local.subtitle_file = subtitle_name
     document = item.get("document") if isinstance(item.get("document"), dict) else {}
     merged = merge_server_document(local, document)
     save_tag_document(tag_path, merged)
+    if source.is_file() and source.resolve() != tag_path.resolve():
+        source.unlink()
     # 基线记云端版本。本机多出来的标签会在下次上传时送上去。
     record_tag_baseline(
         username,
@@ -491,6 +632,7 @@ def _load_store(username: str) -> dict:
         return {"subtitles": {}, "tags": {}}
     payload.setdefault("subtitles", {})
     payload.setdefault("tags", {})
+    payload.setdefault("screenshots", {})
     return payload
 
 
@@ -538,6 +680,91 @@ def record_tag_baseline(
         "document": document,
     }
     _save_store(username, store)
+
+
+def screenshot_baseline_ids(username: str, video_hash: str) -> set[str]:
+    ids, _media, _cleared = _screenshot_baseline(username, video_hash)
+    return set(ids)
+
+
+def screenshot_baseline_media(username: str, video_hash: str) -> str:
+    """上次在这台电脑上同步这部视频截图时，视频文件的路径。"""
+    _ids, media, _cleared = _screenshot_baseline(username, video_hash)
+    return media
+
+
+def screenshot_catalog_was_cleared(username: str, video_hash: str, media_path: Path) -> bool:
+    """播放器里主动删光了这个文件的截图。只删配套文件夹不算。"""
+    _ids, media, cleared = _screenshot_baseline(username, video_hash)
+    return cleared and media == screenshot_media_key(media_path)
+
+
+def mark_screenshot_catalog_cleared(username: str, video_hash: str, media_path: Path) -> None:
+    """记下这次是在播放器里把截图删光的，同步时才通知云端删除。"""
+    if not username or not video_hash:
+        return
+    store = _load_store(username)
+    shots = store.setdefault("screenshots", {})
+    if not isinstance(shots, dict):
+        shots = {}
+        store["screenshots"] = shots
+    ids, _media, _cleared = _screenshot_baseline(username, video_hash)
+    shots[video_hash] = {
+        "ids": ids,
+        "media": screenshot_media_key(media_path),
+        "cleared": True,
+    }
+    _save_store(username, store)
+
+
+def record_screenshot_baseline(
+    username: str,
+    video_hash: str,
+    shot_ids: list[str],
+    media_path: Path | None = None,
+) -> None:
+    if not username or not video_hash:
+        return
+    store = _load_store(username)
+    shots = store.setdefault("screenshots", {})
+    if not isinstance(shots, dict):
+        shots = {}
+        store["screenshots"] = shots
+    media = screenshot_baseline_media(username, video_hash)
+    if media_path is not None:
+        media = screenshot_media_key(media_path)
+    shots[video_hash] = {
+        "ids": sorted({shot_id for shot_id in shot_ids if shot_id}),
+        "media": media,
+        "cleared": False,
+    }
+    _save_store(username, store)
+
+
+def _screenshot_baseline(username: str, video_hash: str) -> tuple[list[str], str, bool]:
+    if not username or not video_hash:
+        return [], "", False
+    store = _load_store(username).get("screenshots") or {}
+    raw = store.get(video_hash) if isinstance(store, dict) else None
+    if isinstance(raw, list):
+        return _shot_ids(raw), "", False
+    if isinstance(raw, dict):
+        return _shot_ids(raw.get("ids")), str(raw.get("media") or ""), bool(raw.get("cleared"))
+    return [], "", False
+
+
+def _shot_ids(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    return sorted({shot_id for shot_id in raw if isinstance(shot_id, str) and shot_id})
+
+
+def screenshot_media_key(media_path: Path) -> str:
+    try:
+        resolved = media_path.resolve()
+    except OSError:
+        resolved = media_path
+    return os.path.normcase(str(resolved))
 
 
 def subtitle_baseline_hash(username: str, video_hash: str, suffix: str) -> str:

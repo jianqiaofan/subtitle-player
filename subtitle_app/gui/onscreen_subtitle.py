@@ -245,6 +245,11 @@ class SubtitleVideoWidget(QWidget):
         self._frame = QImage()
         self.update()
 
+    def current_frame(self) -> QImage:
+        if self._frame.isNull():
+            return QImage()
+        return self._frame.copy()
+
     def set_subtitle_text(self, text: str) -> None:
         cleaned = (text or "").replace("\r\n", "\n").strip()
         if cleaned == self._subtitle_text:

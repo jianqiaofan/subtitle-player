@@ -21,6 +21,7 @@ from PyQt6.QtMultimedia import (
     QAudioDevice,
     QAudioOutput,
     QMediaDevices,
+    QMediaMetaData,
     QMediaPlayer,
     QPlaybackOptions,
 )
@@ -108,15 +109,54 @@ from core.cloud_sync import (
     apply_subtitle_download,
     apply_tag_download,
     classify_subtitles,
+    cloud_host_reachable,
     collect_folder_subtitles,
     collect_folder_tags,
     collect_media_subtitles,
     collect_media_tags,
+    ensure_online,
     fetch_remote_index,
     inspect_open_media,
     load_account_client,
+    mark_screenshot_catalog_cleared,
+    subtitle_path_after_download,
+    sync_playback_log,
+    upload_session_changes,
     upload_subtitles,
     upload_tags,
+)
+from core.playback_log import begin_playback_session, end_playback_session
+from core.screenshot_sync import sync_screenshots
+from core.screenshots import (
+    Screenshot,
+    ScreenshotDocument,
+    ScreenshotNote,
+    interleave_screenshots,
+    load_screenshots,
+    nearest_screenshot_index,
+    new_screenshot_id,
+    now_ms,
+    remove_screenshot,
+    save_screenshots,
+    screenshot_content_matches,
+    screenshot_export_filename,
+    screenshot_image_file,
+    screenshot_image_path,
+    sorted_screenshots,
+)
+from core.media_bundle import (
+    apply_subtitle_choice,
+    settle_media_sidecars,
+    timeline_subtitle_name,
+    timeline_tag_path,
+    timeline_virtual_path,
+)
+from core.timeline import (
+    TIMELINE_STEP_CHOICES,
+    assign_tags_by_time,
+    build_timeline_segments,
+    default_timeline_step,
+    fold_timeline_into_subtitle,
 )
 from core.subtitle_tags import (
     SubtitleTagDocument,
@@ -138,6 +178,7 @@ from core.subtitle_tags import (
 )
 from core.subtitle_loader import find_valid_subtitles, load_subtitles
 from core.video_hash import video_content_hash
+from gui.playback_log_dialog import PlaybackLogDialog
 from gui.cloud_account_dialog import CloudAccountDialog
 from gui.cloud_sync_ui import (
     CloudTask,
@@ -147,6 +188,8 @@ from gui.cloud_sync_ui import (
     confirm_subtitle_download,
     confirm_subtitle_replace,
     confirm_tag_download,
+    ask_exit_sync,
+    ask_subtitle_conflicts,
 )
 from gui.batch_tag_sync_dialog import BatchTagSyncDialog
 from gui.extract_tags_dialog import ExtractTagsDialog
@@ -165,6 +208,8 @@ from gui.onscreen_subtitle import (
 from gui.styles import DARK_STYLE, PLAYER_LIST_STYLE, build_immersive_subtitle_panel_style
 from gui.tag_filter_bar import TagFilterBar
 from gui.subtitle_edit_dialog import SubtitleEditDialog
+from gui.screenshot_dialog import ScreenshotDialog
+from gui.screenshot_preview import ScreenshotPreview
 from gui.subtitle_list_delegate import PAYLOAD_ROLE, SubtitleListDelegate
 from gui.subtitle_note_popup import NotePreviewPopup, SubtitleNoteDialog
 from gui.subtitle_tag_dialog import SubtitleTagDialog
@@ -180,6 +225,7 @@ class PlayerWindow(QMainWindow):
         super().__init__()
         self._media_path: Path | None = None
         self._segments: list[SubtitleSegment] = []
+        self._screenshot_document = ScreenshotDocument()
         self._current_subtitle_row = -1
         self._seeking = False
         self._subtitle_auto_follow = True
@@ -270,6 +316,15 @@ class PlayerWindow(QMainWindow):
         self._selected_tag_filters: set[str] = set()
         self._tag_filter_buttons: dict[str, QPushButton] = {}
         self._subtitle_list_layout_width = -1
+        self._timeline_mode = False
+        self._timeline_step_user_set = False
+        self._resolving_subtitles = False
+        self._skipped_subtitle_conflicts: set[tuple[str, str]] = set()
+        self._subtitle_dirty = False
+        self._tags_dirty = False
+        self._edit_generation = 0
+        self._sync_prompted_generation = 0
+        self._playback_session_open = False
 
         self.setWindowTitle("字幕播放器")
         self.setMinimumSize(1000, 640)
@@ -348,6 +403,12 @@ class PlayerWindow(QMainWindow):
 
         bar.addStretch(1)
 
+        self._screenshot_preview_btn = QPushButton("截图预览")
+        self._screenshot_preview_btn.setToolTip("查看本视频的截图")
+        self._screenshot_preview_btn.setEnabled(False)
+        self._screenshot_preview_btn.clicked.connect(self._open_screenshot_preview)
+        bar.addWidget(self._screenshot_preview_btn)
+
         onscreen_btn = QPushButton("画面字幕")
         onscreen_btn.setToolTip("调整画面叠加字幕的显示、字号、颜色、底条透明度、宽度与位置")
         onscreen_btn.clicked.connect(self._open_onscreen_subtitle_settings)
@@ -364,6 +425,8 @@ class PlayerWindow(QMainWindow):
         self._action_view_notes = tools_menu.addAction("查看笔记")
         self._action_view_notes.setEnabled(False)
         self._action_view_notes.triggered.connect(self._view_ai_notes)
+        action_playback_log = tools_menu.addAction("学习记录")
+        action_playback_log.triggered.connect(self._show_playback_log)
         tools_menu.addSeparator()
         self._action_vocabulary = tools_menu.addAction("生词表")
         self._action_vocabulary.triggered.connect(self._generate_vocabulary_list)
@@ -528,6 +591,12 @@ class PlayerWindow(QMainWindow):
         self._onscreen_overlay.set_style(OnScreenSubtitleStyle.from_config(self._config))
         media_host_layout.addWidget(self._media_viewport, stretch=1)
 
+        self._screenshot_preview = ScreenshotPreview(self._media_host)
+        self._screenshot_preview.closed.connect(self._update_screenshot_actions)
+        self._screenshot_preview.style_changed.connect(self._save_screenshot_note_style)
+        self._screenshot_preview.box_changed.connect(self._save_screenshot_note_box)
+        self._screenshot_preview.export_requested.connect(self._export_preview_screenshot)
+
         self._subtitle_panel = QWidget()
         self._subtitle_panel.setObjectName("subtitlePanel")
         right_layout = QVBoxLayout(self._subtitle_panel)
@@ -536,6 +605,13 @@ class PlayerWindow(QMainWindow):
         header.setSpacing(6)
         self._subtitle_panel_title = QLabel("字幕列表（点击跳转）")
         header.addWidget(self._subtitle_panel_title)
+        self._timeline_step_combo = QComboBox()
+        self._timeline_step_combo.setToolTip("没有字幕时，时间线每一条的长度")
+        for seconds, label in TIMELINE_STEP_CHOICES:
+            self._timeline_step_combo.addItem(label, seconds)
+        self._timeline_step_combo.currentIndexChanged.connect(self._on_timeline_step_changed)
+        self._timeline_step_combo.hide()
+        header.addWidget(self._timeline_step_combo)
         self._subtitle_density_btn = QPushButton()
         self._subtitle_density_btn.setObjectName("subtitleDensityButton")
         self._subtitle_density_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -842,6 +918,10 @@ class PlayerWindow(QMainWindow):
         )
         handle.show()
         handle.raise_()
+        preview = getattr(self, "_screenshot_preview", None)
+        if preview is not None and preview.isVisible():
+            preview.setGeometry(host.rect())
+            preview.raise_()
         self._refresh_subtitle_list_item_layout()
         self._sync_onscreen_immersive_metrics()
 
@@ -902,6 +982,7 @@ class PlayerWindow(QMainWindow):
         else:
             self.play_btn.setIcon(self._style_media_icon(QStyle.StandardPixmap.SP_MediaPlay))
             self.play_btn.setToolTip("播放")
+        self._update_screenshot_actions()
 
     def _set_mute_button_state(self, muted: bool) -> None:
         if muted:
@@ -915,9 +996,14 @@ class PlayerWindow(QMainWindow):
         bar = QHBoxLayout()
         self.play_btn = QPushButton()
         self._configure_icon_button(self.play_btn, "播放")
+        self.screenshot_btn = QPushButton("截图")
+        self.screenshot_btn.setToolTip("暂停后截取当前画面")
+        self.screenshot_btn.setEnabled(False)
+        self.screenshot_btn.clicked.connect(self._capture_screenshot)
         self._set_play_button_state(False)
         self.play_btn.clicked.connect(self._toggle_play)
         bar.addWidget(self.play_btn)
+        bar.addWidget(self.screenshot_btn)
 
         self.position_slider = QSlider(Qt.Orientation.Horizontal)
         self.position_slider.setRange(0, 0)
@@ -1122,12 +1208,25 @@ class PlayerWindow(QMainWindow):
         media_path = media_path.resolve()
         if not media_path.is_file():
             return
+        if self._media_path is not None and self._media_path.resolve() != media_path:
+            self._note_playback_stopped()
+            self._offer_exit_sync(blocking=False)
 
         self._remember_playback_position()
         self._cancel_open_preview()
         resume_ms = self._saved_playback_position_ms(media_path)
 
         self._media_path = media_path
+        self._subtitle_dirty = False
+        self._tags_dirty = False
+        self._edit_generation = 0
+        self._sync_prompted_generation = 0
+        self._timeline_step_user_set = False
+        self._screenshot_document = load_screenshots(media_path)
+        preview = getattr(self, "_screenshot_preview", None)
+        if preview is not None and preview.isVisible():
+            preview.hide()
+        self._resolve_subtitle_locations()
         self._set_subtitle_list_visible(True)
         self._persist_last_media_dir(media_path)
         self.media_label.setText(media_path.name)
@@ -1161,12 +1260,329 @@ class PlayerWindow(QMainWindow):
         if not is_audio:
             QTimer.singleShot(0, self._media_viewport.refresh_stacking)
 
+        self._show_subtitles_or_timeline()
+        self._update_notes_buttons()
+        self._update_screenshot_actions()
+        self._schedule_cloud_check()
+        self._offer_pending_sync()
+
+    def _resolve_subtitle_locations(self) -> None:
+        if self._media_path is None or self._resolving_subtitles:
+            return
+        self._resolving_subtitles = True
+        try:
+            conflicts = settle_media_sidecars(self._media_path)
+            pending = [
+                conflict
+                for conflict in conflicts
+                if (str(self._media_path), conflict.name) not in self._skipped_subtitle_conflicts
+            ]
+            if not pending:
+                return
+            choices = ask_subtitle_conflicts(self, pending)
+            if not choices:
+                for conflict in pending:
+                    self._skipped_subtitle_conflicts.add((str(self._media_path), conflict.name))
+                return
+            for conflict in pending:
+                winner = choices.get(conflict.name)
+                if winner in {"bundle", "legacy"}:
+                    apply_subtitle_choice(self._media_path, conflict, winner)
+                    self._skipped_subtitle_conflicts.discard((str(self._media_path), conflict.name))
+        finally:
+            self._resolving_subtitles = False
+
+    def _show_subtitles_or_timeline(self) -> None:
         self._refresh_subtitle_options()
         if self.subtitle_combo.count() > 0:
+            self._leave_timeline_mode()
+            self._absorb_timeline_tags()
             self.subtitle_combo.setCurrentIndex(0)
             self._load_subtitle_at_index(0)
-        self._update_notes_buttons()
-        self._schedule_cloud_check()
+            return
+        self._enter_timeline_mode()
+
+    def _leave_timeline_mode(self) -> None:
+        self._timeline_mode = False
+        if hasattr(self, "_timeline_step_combo"):
+            self._timeline_step_combo.hide()
+        if hasattr(self, "_subtitle_panel_title"):
+            self._subtitle_panel_title.setText("字幕列表（点击跳转）")
+
+    def _enter_timeline_mode(self) -> None:
+        if self._media_path is None:
+            return
+        self._timeline_mode = True
+        self._subtitle_panel_title.setText("时间线（点击跳转）")
+        self._timeline_step_combo.show()
+        virtual = timeline_virtual_path(self._media_path)
+        self.subtitle_combo.blockSignals(True)
+        self.subtitle_combo.clear()
+        self.subtitle_combo.addItem("时间线", str(virtual))
+        self.subtitle_combo.setCurrentIndex(0)
+        self.subtitle_combo.blockSignals(False)
+        self._load_tag_document_for_current_subtitle()
+        duration_ms = self._player.duration()
+        if duration_ms <= 0:
+            self._segments = []
+            self._populate_subtitle_list()
+            return
+        duration_seconds = duration_ms / 1000.0
+        if self._timeline_step_user_set:
+            step = int(self._timeline_step_combo.currentData() or default_timeline_step(duration_seconds))
+            self._rebuild_timeline(step, duration_seconds)
+            return
+        self._apply_default_timeline_step(duration_seconds)
+
+    def _apply_default_timeline_step(self, duration_seconds: float) -> None:
+        step = default_timeline_step(duration_seconds)
+        self._timeline_step_combo.blockSignals(True)
+        index = self._timeline_step_combo.findData(step)
+        if index >= 0:
+            self._timeline_step_combo.setCurrentIndex(index)
+        self._timeline_step_combo.blockSignals(False)
+        self._rebuild_timeline(step, duration_seconds)
+
+    def _on_timeline_step_changed(self, index: int) -> None:
+        if index < 0 or not self._timeline_mode or self._media_path is None:
+            return
+        self._timeline_step_user_set = True
+        step = int(self._timeline_step_combo.currentData() or 0)
+        duration = self._player.duration() / 1000.0
+        self._rebuild_timeline(step, duration)
+
+    def _rebuild_timeline(self, step_seconds: int, duration_seconds: float) -> None:
+        self._segments = build_timeline_segments(duration_seconds, step_seconds)
+        self._populate_subtitle_list()
+        preview_seconds = self._player.position() / 1000.0
+        if self._segments:
+            self._sync_subtitle_highlight(preview_seconds, force=True)
+        self._update_onscreen_subtitle(preview_seconds)
+
+    def _absorb_timeline_tags(self) -> None:
+        if self._media_path is None:
+            return
+        tag_path = timeline_tag_path(self._media_path)
+        name = timeline_subtitle_name(self._media_path)
+        timeline = load_tag_document(tag_path, name)
+        if not any(entry.has_content() for entry in timeline.entries):
+            return
+        changed = False
+        for path, _label in find_valid_subtitles(self._media_path):
+            try:
+                segments = load_subtitles(path)
+            except (OSError, ValueError):
+                continue
+            if not segments:
+                continue
+            document_path = tag_path_for_subtitle(path)
+            document = load_tag_document(document_path, path.name)
+            if not fold_timeline_into_subtitle(segments, document, timeline):
+                continue
+            document.subtitle_file = path.name
+            save_tag_document(document_path, document)
+            changed = True
+        if not changed:
+            return
+        timeline.subtitle_file = name
+        save_tag_document(tag_path, timeline)
+        self._tags_dirty = True
+        self._edit_generation += 1
+
+    def _network_looks_online(self) -> bool:
+        try:
+            from PyQt6.QtNetwork import QNetworkInformation
+
+            if QNetworkInformation.loadDefaultBackend():
+                info = QNetworkInformation.instance()
+                if info is not None:
+                    reach = info.reachability()
+                    if reach in (
+                        QNetworkInformation.Reachability.Disconnected,
+                        QNetworkInformation.Reachability.Local,
+                    ):
+                        return False
+                    if reach == QNetworkInformation.Reachability.Online:
+                        return True
+        except Exception:
+            pass
+        return cloud_host_reachable(self._config.cloud_server_url or DEFAULT_CLOUD_SERVER)
+
+    def _offer_pending_sync(self) -> None:
+        if self._media_path is None:
+            return
+        key = str(self._media_path.resolve())
+        pending = self._config.cloud_sync_pending.get(key)
+        if not isinstance(pending, dict):
+            return
+        if not self._network_looks_online():
+            return
+        self._config.cloud_sync_pending.pop(key, None)
+        save_config(self._config)
+        self._subtitle_dirty = bool(pending.get("subtitles"))
+        self._tags_dirty = bool(pending.get("tags"))
+        if not self._subtitle_dirty and not self._tags_dirty:
+            return
+        self._edit_generation = max(self._edit_generation, 1)
+        self._sync_prompted_generation = 0
+        self._offer_exit_sync(blocking=False)
+
+    def _offer_exit_sync(self, *, blocking: bool) -> None:
+        media = self._media_path
+        if media is None or (not self._subtitle_dirty and not self._tags_dirty):
+            return
+        if self._edit_generation <= self._sync_prompted_generation:
+            return
+        if not (self._config.cloud_username or "").strip() or not self._config.cloud_password:
+            return
+        key = str(media.resolve())
+        policy = self._config.cloud_sync_policy.get(key)
+        if isinstance(policy, dict):
+            do_subtitles = self._subtitle_dirty and bool(policy.get("subtitles"))
+            do_tags = self._tags_dirty and bool(policy.get("tags"))
+            self._sync_prompted_generation = self._edit_generation
+            self._subtitle_dirty = False
+            self._tags_dirty = False
+            if do_subtitles or do_tags:
+                self._run_exit_upload(media, do_subtitles, do_tags, blocking)
+            return
+        if not self._network_looks_online():
+            self._config.cloud_sync_pending[key] = {
+                "subtitles": self._subtitle_dirty,
+                "tags": self._tags_dirty,
+            }
+            save_config(self._config)
+            self._sync_prompted_generation = self._edit_generation
+            return
+        choice = ask_exit_sync(self, subtitles=self._subtitle_dirty, tags=self._tags_dirty)
+        self._sync_prompted_generation = self._edit_generation
+        if choice is None:
+            self._subtitle_dirty = False
+            self._tags_dirty = False
+            return
+        do_subtitles, do_tags, remember = choice
+        if remember:
+            self._config.cloud_sync_policy[key] = {"subtitles": do_subtitles, "tags": do_tags}
+            save_config(self._config)
+        self._subtitle_dirty = False
+        self._tags_dirty = False
+        if do_subtitles or do_tags:
+            self._run_exit_upload(media, do_subtitles, do_tags, blocking)
+
+    def _run_exit_upload(self, media: Path, subtitles: bool, tags: bool, blocking: bool) -> None:
+        if not self._network_looks_online():
+            self._config.cloud_sync_pending[str(media.resolve())] = {
+                "subtitles": subtitles,
+                "tags": tags,
+            }
+            save_config(self._config)
+            return
+        account = self._account_snapshot()
+
+        def work():
+            ensure_online(account[0])
+            client = load_account_client(*account)
+            return upload_session_changes(client, media, subtitles=subtitles, tags=tags)
+
+        if not blocking:
+            self._start_cloud_task(work, lambda _lines: None, "正在同步到云端…")
+            return
+
+        from PyQt6.QtCore import QEventLoop
+
+        loop = QEventLoop()
+        holder = {"error": ""}
+
+        def ok(_result) -> None:
+            loop.quit()
+
+        def fail(message: str) -> None:
+            holder["error"] = message
+            loop.quit()
+
+        progress = QProgressDialog("正在同步到云端…", None, 0, 0, self)
+        progress.setWindowTitle("云同步")
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.show()
+        task = CloudTask(work, self)
+        task.succeeded.connect(ok)
+        task.failed.connect(fail)
+        task.finished.connect(task.deleteLater)
+        self._cloud_task = task
+        task.start()
+        loop.exec()
+        progress.close()
+        if holder["error"]:
+            QMessageBox.warning(self, "云同步", holder["error"])
+
+    def _show_playback_log(self) -> None:
+        if self._media_path is None:
+            QMessageBox.information(self, "学习记录", "请先打开视频。")
+            return
+        PlaybackLogDialog(self._media_path, self).exec()
+
+    def _note_playback_started(self) -> None:
+        if self._media_path is None or self._playback_session_open:
+            return
+        if self._open_frame_nudge or self._open_preview_should_pause:
+            return
+        try:
+            begin_playback_session(self._media_path)
+        except OSError:
+            return
+        self._playback_session_open = True
+        self._sync_playback_log(self._media_path, wait=False)
+
+    def _note_playback_stopped(self, *, wait: bool = False) -> None:
+        media = self._media_path
+        if media is None:
+            return
+        ended = False
+        if self._playback_session_open:
+            try:
+                end_playback_session(media)
+            except OSError:
+                pass
+            self._playback_session_open = False
+            ended = True
+        if ended or wait:
+            self._sync_playback_log(media, wait=wait)
+
+    def _sync_playback_log(self, media: Path, *, wait: bool) -> None:
+        if not (self._config.cloud_username or "").strip() or not self._config.cloud_password:
+            return
+        if not self._network_looks_online():
+            return
+        account = self._account_snapshot()
+
+        def work():
+            ensure_online(account[0])
+            client = load_account_client(*account)
+            sync_playback_log(client, media)
+
+        if not wait:
+            task = CloudTask(work, self)
+            task.failed.connect(lambda _message: None)
+            task.finished.connect(task.deleteLater)
+            self._playback_sync_task = task
+            task.start()
+            return
+
+        from PyQt6.QtCore import QEventLoop
+
+        loop = QEventLoop()
+
+        def done(_result=None) -> None:
+            loop.quit()
+
+        task = CloudTask(work, self)
+        task.succeeded.connect(done)
+        task.failed.connect(done)
+        task.finished.connect(task.deleteLater)
+        self._playback_sync_task = task
+        task.start()
+        loop.exec()
 
     def _update_notes_buttons(self) -> None:
         if not self._media_path:
@@ -1190,12 +1606,22 @@ class PlayerWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(notes_path.resolve())))
 
     def _select_subtitle_path(self, path: Path) -> None:
+        if (
+            self._media_path is not None
+            and path == timeline_virtual_path(self._media_path)
+            and not path.is_file()
+        ):
+            self._show_subtitles_or_timeline()
+            return
         self._refresh_subtitle_options()
         for index in range(self.subtitle_combo.count()):
             if self.subtitle_combo.itemData(index) == str(path):
                 self.subtitle_combo.setCurrentIndex(index)
                 self._load_subtitle_at_index(index)
                 return
+        if not path.is_file():
+            self._show_subtitles_or_timeline()
+            return
         try:
             self._segments = load_subtitles(path)
         except Exception as exc:
@@ -1215,13 +1641,31 @@ class PlayerWindow(QMainWindow):
         self.subtitle_combo.blockSignals(False)
 
     def _refresh_subtitle_list_texts(self) -> None:
-        if self.subtitle_list.count() != len(self._segments):
+        rows = interleave_screenshots(self._segments, self._screenshot_document.entries)
+        if self.subtitle_list.count() != len(rows):
             self._populate_subtitle_list()
             return
-        for row, seg in enumerate(self._segments):
-            item = self.subtitle_list.item(row)
-            if item is not None:
-                self._apply_subtitle_item_payload(item, seg, row)
+        shots = {shot.id: shot for shot in self._screenshot_document.entries}
+        for list_row, entry in enumerate(rows):
+            item = self.subtitle_list.item(list_row)
+            if item is None:
+                self._populate_subtitle_list()
+                return
+            if entry.kind == "screenshot":
+                shot = shots.get(entry.screenshot_id)
+                if shot is None:
+                    self._populate_subtitle_list()
+                    return
+                self._apply_screenshot_item_payload(item, shot)
+            elif 0 <= entry.segment_index < len(self._segments):
+                self._apply_subtitle_item_payload(
+                    item,
+                    self._segments[entry.segment_index],
+                    entry.segment_index,
+                )
+            else:
+                self._populate_subtitle_list()
+                return
 
     def _update_live_status(self, message: str) -> None:
         self.live_status_label.setText(message or "")
@@ -1237,8 +1681,17 @@ class PlayerWindow(QMainWindow):
         path_value = self.subtitle_combo.itemData(index)
         if not path_value:
             return
+        path = Path(str(path_value))
+        if (
+            self._timeline_mode
+            and self._media_path is not None
+            and path == timeline_virtual_path(self._media_path)
+        ):
+            return
+        self._leave_timeline_mode()
+        self._absorb_timeline_tags()
         try:
-            self._segments = load_subtitles(Path(path_value))
+            self._segments = load_subtitles(path)
         except Exception as exc:
             self._error_box("字幕加载失败", str(exc))
             self._segments = []
@@ -1254,9 +1707,20 @@ class PlayerWindow(QMainWindow):
     def _populate_subtitle_list(self) -> None:
         self._bind_subtitle_tags()
         self.subtitle_list.clear()
-        for row, seg in enumerate(self._segments):
+        shots = {shot.id: shot for shot in self._screenshot_document.entries}
+        for entry in interleave_screenshots(self._segments, self._screenshot_document.entries):
             item = QListWidgetItem()
-            self._apply_subtitle_item_payload(item, seg, row)
+            if entry.kind == "screenshot":
+                shot = shots.get(entry.screenshot_id)
+                if shot is None:
+                    continue
+                self._apply_screenshot_item_payload(item, shot)
+            else:
+                self._apply_subtitle_item_payload(
+                    item,
+                    self._segments[entry.segment_index],
+                    entry.segment_index,
+                )
             self.subtitle_list.addItem(item)
         self._current_subtitle_row = -1
         self._refresh_tag_filter_bar()
@@ -1317,6 +1781,8 @@ class PlayerWindow(QMainWindow):
         self._fill_unmatched_list()
 
     def _taggable_subtitle_path(self) -> Path | None:
+        if self._timeline_mode and self._media_path is not None:
+            return timeline_virtual_path(self._media_path)
         path = self._current_subtitle_save_path()
         if path is None or not self._subtitle_editing_allowed():
             return None
@@ -1337,6 +1803,12 @@ class PlayerWindow(QMainWindow):
         self._tag_document = load_tag_document(self._tag_path, path.name)
 
     def _bind_subtitle_tags(self) -> None:
+        if self._timeline_mode:
+            self._tag_by_row, self._tag_unmatched = assign_tags_by_time(
+                self._segments,
+                self._tag_document.entries,
+            )
+            return
         assignment = assign_tags(self._segments, self._tag_document.entries)
         self._tag_by_row = assignment.by_row
         self._tag_unmatched = assignment.unmatched
@@ -1351,6 +1823,9 @@ class PlayerWindow(QMainWindow):
             save_tag_document(self._tag_path, self._tag_document)
         except OSError as exc:
             self._error_box("标签保存失败", str(exc))
+            return
+        self._tags_dirty = True
+        self._edit_generation += 1
 
     def _subtitle_item_payload(self, seg: SubtitleSegment, row: int) -> dict:
         entry = self._tag_by_row.get(row)
@@ -1361,6 +1836,8 @@ class PlayerWindow(QMainWindow):
         start = self._format_clock(seg.start)
         end = self._format_clock(seg.end)
         return {
+            "kind": "subtitle",
+            "segment_row": row,
             "compact": compact,
             "meta": f"{seg.index}. [{start} → {end}]",
             "body": body,
@@ -1375,6 +1852,447 @@ class PlayerWindow(QMainWindow):
         item.setData(Qt.ItemDataRole.UserRole, float(seg.start))
         item.setText(payload["body"])
         item.setToolTip("")
+
+    def _item_payload(self, item: QListWidgetItem | None) -> dict:
+        if item is None:
+            return {}
+        payload = item.data(PAYLOAD_ROLE)
+        return payload if isinstance(payload, dict) else {}
+
+    def _segment_row_from_item(self, item: QListWidgetItem | None) -> int | None:
+        payload = self._item_payload(item)
+        if payload.get("kind") == "screenshot" or "segment_row" not in payload:
+            return None
+        try:
+            row = int(payload["segment_row"])
+        except (TypeError, ValueError):
+            return None
+        if 0 <= row < len(self._segments):
+            return row
+        return None
+
+    def _list_row_for_segment(self, segment_row: int) -> int:
+        for list_row in range(self.subtitle_list.count()):
+            if self._segment_row_from_item(self.subtitle_list.item(list_row)) == segment_row:
+                return list_row
+        return -1
+
+    def _segment_row_hidden(self, segment_row: int) -> bool:
+        list_row = self._list_row_for_segment(segment_row)
+        if list_row < 0:
+            return True
+        return self.subtitle_list.isRowHidden(list_row)
+
+    def _list_row_for_screenshot(self, shot_id: str) -> int:
+        for list_row in range(self.subtitle_list.count()):
+            payload = self._item_payload(self.subtitle_list.item(list_row))
+            if payload.get("kind") == "screenshot" and payload.get("screenshot_id") == shot_id:
+                return list_row
+        return -1
+
+    def _apply_screenshot_item_payload(self, item: QListWidgetItem, shot: Screenshot) -> None:
+        title = (shot.title or "").strip() or "（无标题）"
+        payload = {
+            "kind": "screenshot",
+            "screenshot_id": shot.id,
+            "compact": self._is_subtitle_list_compact(),
+            "meta": f"[{self._format_clock(shot.time)}]",
+            "body": title,
+            "tags": ["截图"],
+            "note": "",
+            "unmatched": False,
+        }
+        item.setData(PAYLOAD_ROLE, payload)
+        item.setData(Qt.ItemDataRole.UserRole, float(shot.time))
+        item.setText(title)
+        item.setToolTip("截图")
+
+    def _find_screenshot(self, shot_id: str) -> Screenshot | None:
+        for shot in self._screenshot_document.entries:
+            if shot.id == shot_id:
+                return shot
+        return None
+
+    def _video_loaded(self) -> bool:
+        return (
+            self._media_path is not None
+            and self._media_path.suffix.lower() not in AUDIO_EXTENSIONS
+        )
+
+    def _can_capture_screenshot(self) -> bool:
+        if not self._video_loaded():
+            return False
+        preview = getattr(self, "_screenshot_preview", None)
+        if preview is not None and preview.isVisible():
+            return False
+        if self._open_frame_nudge or self._open_preview_should_pause:
+            return False
+        return self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState
+
+    def _update_screenshot_actions(self) -> None:
+        button = getattr(self, "screenshot_btn", None)
+        if button is not None:
+            button.setEnabled(self._can_capture_screenshot())
+        preview_button = getattr(self, "_screenshot_preview_btn", None)
+        if preview_button is None:
+            return
+        video = self._video_loaded()
+        preview_button.setEnabled(video and bool(self._screenshot_document.entries))
+
+    def _layout_screenshot_preview(self) -> None:
+        preview = getattr(self, "_screenshot_preview", None)
+        if preview is None or not preview.isVisible() or not hasattr(self, "_media_host"):
+            return
+        preview.setGeometry(self._media_host.rect())
+        preview.raise_()
+
+    def _save_screenshot_note_style(
+        self,
+        opacity: float,
+        font_size: float,
+        color: str,
+        align: str,
+        background: str,
+    ) -> None:
+        from core.screenshots import (
+            SCREENSHOT_NOTE_BACKGROUND_DEFAULT,
+            normalize_font_ratio,
+            normalize_note_align,
+            normalize_note_color,
+        )
+
+        self._config.screenshot_note_opacity = max(0.15, min(1.0, float(opacity)))
+        self._config.screenshot_note_font_size = normalize_font_ratio(font_size)
+        self._config.screenshot_note_color = normalize_note_color(color)
+        self._config.screenshot_note_align = normalize_note_align(align)
+        self._config.screenshot_note_background = normalize_note_color(
+            background,
+            SCREENSHOT_NOTE_BACKGROUND_DEFAULT,
+        )
+        save_config(self._config)
+
+    def _save_screenshot_note_box(self) -> None:
+        self._persist_screenshots()
+
+    def _subtitle_title_at(self, seconds: float) -> str:
+        if not self._segments:
+            return ""
+        row = find_segment_index_at_time(self._segments, seconds)
+        if row < 0:
+            return ""
+        return " ".join((self._segments[row].text or "").replace("\r\n", "\n").split())
+
+    def _nearest_subtitle_row(self, seconds: float) -> int:
+        nearest = -1
+        nearest_gap: float | None = None
+        for index, segment in enumerate(self._segments):
+            text = " ".join((segment.text or "").replace("\r\n", "\n").split())
+            if not text:
+                continue
+            if segment.start <= seconds <= segment.end:
+                return index
+            gap = min(abs(seconds - segment.start), abs(seconds - segment.end))
+            if nearest_gap is None or gap < nearest_gap:
+                nearest = index
+                nearest_gap = gap
+        return nearest
+
+    def _nearby_subtitle_picks(self, seconds: float) -> list[tuple[str, str, bool]]:
+        """离截图最近的一句，以及它上面 100 条、下面 100 条。"""
+        if not self._segments:
+            return []
+        row = self._nearest_subtitle_row(seconds)
+        if row < 0:
+            return []
+        start = max(0, row - 100)
+        end = min(len(self._segments), row + 101)
+        picks: list[tuple[str, str, bool]] = []
+        for index in range(start, end):
+            segment = self._segments[index]
+            text = " ".join((segment.text or "").replace("\r\n", "\n").split())
+            if not text:
+                continue
+            picks.append((self._format_clock(segment.start), text, index == row))
+        return picks
+
+    def _estimate_frame_index(self, seconds: float) -> int | None:
+        try:
+            value = self._player.metaData().value(QMediaMetaData.Key.VideoFrameRate)
+            fps = float(value)
+        except (TypeError, ValueError):
+            return None
+        if fps <= 0:
+            return None
+        return int(round(float(seconds) * fps))
+
+    def _capture_screenshot(self) -> None:
+        if not self._can_capture_screenshot() or self._media_path is None:
+            return
+        frame = self._video_widget.current_frame()
+        if frame.isNull():
+            QMessageBox.information(self, "截图", "当前没有画面。请先暂停在有画面的位置。")
+            return
+        seconds = max(0.0, self._player.position() / 1000.0)
+        dialog = ScreenshotDialog(
+            self,
+            title=self._subtitle_title_at(seconds),
+            notes=[],
+            can_delete=False,
+            anchor=self._video_widget,
+            subtitles=self._nearby_subtitle_picks(seconds),
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted or dialog.deleted():
+            return
+        moment = now_ms()
+        shot_id = new_screenshot_id()
+        image_path = screenshot_image_path(self._media_path, shot_id)
+        try:
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            if not frame.save(str(image_path), "PNG"):
+                raise OSError("图片保存失败。")
+            shot = Screenshot(
+                id=shot_id,
+                title=dialog.title_text(),
+                time=seconds,
+                frame=self._estimate_frame_index(seconds),
+                image=f"{shot_id}.png",
+                created_at=moment,
+                updated_at=moment,
+                notes=dialog.notes(),
+            )
+            self._screenshot_document.entries.append(shot)
+            save_screenshots(self._media_path, self._screenshot_document)
+        except OSError as exc:
+            self._screenshot_document.entries = [
+                item for item in self._screenshot_document.entries if item.id != shot_id
+            ]
+            if image_path.is_file():
+                image_path.unlink()
+            self._error_box("截图", str(exc))
+            return
+        self._refresh_after_screenshot_change(shot_id)
+
+    def _edit_screenshot(self, shot_id: str) -> None:
+        shot = self._find_screenshot(shot_id)
+        if shot is None or self._media_path is None:
+            return
+        self._player.pause()
+        self._seek_to(shot.time, play=False)
+        dialog = ScreenshotDialog(
+            self,
+            title=shot.title,
+            notes=[
+                ScreenshotNote(
+                    note.id,
+                    note.text,
+                    note.created_at,
+                    note.updated_at,
+                    frame=note.frame,
+                )
+                for note in shot.notes
+            ],
+            can_delete=True,
+            anchor=self._video_widget,
+            subtitles=self._nearby_subtitle_picks(shot.time),
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        if dialog.deleted():
+            self._delete_screenshot(shot_id)
+            return
+        title = dialog.title_text()
+        notes = dialog.notes()
+        if screenshot_content_matches(shot, title, notes):
+            return
+        shot.title = title
+        shot.notes = notes
+        shot.updated_at = now_ms()
+        if not self._persist_screenshots():
+            return
+        self._refresh_after_screenshot_change(shot_id)
+
+    def _open_screenshot_menu(self, shot_id: str, pos) -> None:
+        menu = QMenu(self)
+        edit_action = menu.addAction("编辑")
+        delete_action = menu.addAction("删除")
+        chosen = menu.exec(self.subtitle_list.mapToGlobal(pos))
+        if chosen == edit_action:
+            self._edit_screenshot(shot_id)
+        elif chosen == delete_action:
+            self._confirm_delete_screenshot(shot_id)
+
+    def _confirm_delete_screenshot(self, shot_id: str) -> None:
+        answer = QMessageBox.question(self, "删除截图", "删除这张截图和它的笔记？")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._delete_screenshot(shot_id)
+
+    def _delete_screenshot(self, shot_id: str) -> None:
+        if self._media_path is None or self._find_screenshot(shot_id) is None:
+            return
+        preview = getattr(self, "_screenshot_preview", None)
+        if preview is not None:
+            preview.release_images()
+        try:
+            remove_screenshot(self._media_path, self._screenshot_document, shot_id)
+        except OSError as exc:
+            self._screenshot_document = load_screenshots(self._media_path)
+            self._error_box("截图", str(exc))
+            return
+        if not self._screenshot_document.entries:
+            self._remember_screenshot_catalog_cleared()
+        self._refresh_after_screenshot_change("")
+
+    def _remember_screenshot_catalog_cleared(self) -> None:
+        if self._media_path is None:
+            return
+        username = (self._config.cloud_username or "").strip()
+        if not username:
+            return
+        try:
+            digest = video_content_hash(self._media_path)
+        except OSError:
+            return
+        mark_screenshot_catalog_cleared(username, digest, self._media_path)
+
+    def _persist_screenshots(self) -> bool:
+        if self._media_path is None:
+            return False
+        try:
+            save_screenshots(self._media_path, self._screenshot_document)
+        except OSError as exc:
+            self._screenshot_document = load_screenshots(self._media_path)
+            self._error_box("截图", str(exc))
+            return False
+        return True
+
+    def _refresh_after_screenshot_change(self, shot_id: str) -> None:
+        self._populate_subtitle_list()
+        self._sync_subtitle_highlight(self._player.position() / 1000.0, force=True)
+        if shot_id:
+            list_row = self._list_row_for_screenshot(shot_id)
+            if list_row >= 0:
+                self.subtitle_list.setCurrentRow(list_row)
+                item = self.subtitle_list.item(list_row)
+                if item is not None:
+                    self.subtitle_list.scrollToItem(item, QListWidget.ScrollHint.PositionAtCenter)
+        self._update_screenshot_actions()
+        self._reload_open_screenshot_preview()
+        self._schedule_screenshot_sync()
+
+    def _screenshot_preview_paths(self, shots: list[Screenshot]) -> list[Path]:
+        if self._media_path is None:
+            return []
+        paths: list[Path] = []
+        for shot in shots:
+            found = screenshot_image_file(self._media_path, shot.id)
+            paths.append(found or screenshot_image_path(self._media_path, shot.id))
+        return paths
+
+    def _reload_screenshots_from_disk(self) -> None:
+        if self._media_path is None:
+            return
+        self._screenshot_document = load_screenshots(self._media_path)
+        self._populate_subtitle_list()
+        self._sync_subtitle_highlight(self._player.position() / 1000.0, force=True)
+        self._update_screenshot_actions()
+        self._reload_open_screenshot_preview()
+
+    def _schedule_screenshot_sync(self) -> None:
+        if self._media_path is None:
+            return
+        if not (self._config.cloud_username or "").strip() or not self._config.cloud_password:
+            return
+        if not self._network_looks_online():
+            return
+        media = self._media_path
+        account = self._account_snapshot()
+
+        def work():
+            ensure_online(account[0])
+            client = load_account_client(*account)
+            return sync_screenshots(client, media)
+
+        task = CloudTask(work, self)
+        task.succeeded.connect(lambda changed, media=media: self._on_screenshot_sync(media, bool(changed)))
+        task.failed.connect(lambda _message: None)
+        task.finished.connect(task.deleteLater)
+        self._screenshot_sync_task = task
+        task.start()
+
+    def _on_screenshot_sync(self, media: Path, changed: bool) -> None:
+        if not changed or self._media_path is None or self._media_path != media:
+            return
+        self._reload_screenshots_from_disk()
+
+    def _reload_open_screenshot_preview(self) -> None:
+        preview = getattr(self, "_screenshot_preview", None)
+        if preview is None or not preview.isVisible() or self._media_path is None:
+            return
+        shots = sorted_screenshots(self._screenshot_document.entries)
+        if not shots:
+            preview.close_preview()
+            return
+        preview.release_images()
+        index = min(preview.current_index(), len(shots) - 1)
+        preview.show_shots(
+            shots,
+            self._screenshot_preview_paths(shots),
+            index,
+            opacity=float(self._config.screenshot_note_opacity),
+            font_size=float(self._config.screenshot_note_font_size),
+            color=str(self._config.screenshot_note_color),
+            align=str(self._config.screenshot_note_align),
+            background=str(self._config.screenshot_note_background),
+        )
+        self._layout_screenshot_preview()
+
+    def _open_screenshot_preview(self) -> None:
+        if not self._video_loaded() or self._media_path is None:
+            return
+        shots = sorted_screenshots(self._screenshot_document.entries)
+        if not shots:
+            return
+        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._player.pause()
+        seconds = max(0.0, self._player.position() / 1000.0)
+        self._screenshot_preview.show_shots(
+            shots,
+            self._screenshot_preview_paths(shots),
+            nearest_screenshot_index(shots, seconds),
+            opacity=float(self._config.screenshot_note_opacity),
+            font_size=float(self._config.screenshot_note_font_size),
+            color=str(self._config.screenshot_note_color),
+            align=str(self._config.screenshot_note_align),
+            background=str(self._config.screenshot_note_background),
+        )
+        self._layout_screenshot_preview()
+        self._update_screenshot_actions()
+
+    def _export_preview_screenshot(self) -> None:
+        preview = self._screenshot_preview
+        image = preview.render_composite()
+        if image is None or image.isNull() or self._media_path is None:
+            QMessageBox.information(self, "普通截图", "这张截图没有图片，没法保存。")
+            return
+        folder = self._config.resolved_screenshot_export_dir(self._media_path)
+        filename = screenshot_export_filename(self._media_path.stem, preview.current_title())
+        chosen, _selected = QFileDialog.getSaveFileName(
+            self,
+            "保存截图",
+            str(folder / filename),
+            "JPEG 图片 (*.jpg)",
+        )
+        if not chosen:
+            return
+        path = Path(chosen)
+        if path.suffix.lower() not in {".jpg", ".jpeg"}:
+            path = path.with_suffix(".jpg")
+        if not image.save(str(path), "JPG", 92):
+            QMessageBox.warning(self, "普通截图", "图片没有写入成功。")
+            return
+        self._config.screenshot_export_dir = str(path.parent)
+        save_config(self._config)
 
     def _rows_have_tags(self, rows: list[int]) -> bool:
         return any(row in self._tag_by_row for row in rows)
@@ -1588,7 +2506,13 @@ class PlayerWindow(QMainWindow):
             self._show_all_subtitle_rows()
             return
         for row in range(self.subtitle_list.count()):
-            entry = self._tag_by_row.get(row)
+            item = self.subtitle_list.item(row)
+            payload = self._item_payload(item)
+            if payload.get("kind") == "screenshot":
+                self.subtitle_list.setRowHidden(row, True)
+                continue
+            segment_row = self._segment_row_from_item(item)
+            entry = self._tag_by_row.get(segment_row) if segment_row is not None else None
             visible = entry is not None and any(
                 tag in entry.tags for tag in self._selected_tag_filters
             )
@@ -1632,7 +2556,7 @@ class PlayerWindow(QMainWindow):
         rows = [
             row
             for row in range(len(self._segments))
-            if not self.subtitle_list.isRowHidden(row) and row in self._tag_by_row
+            if not self._segment_row_hidden(row) and row in self._tag_by_row
         ]
         if self._tag_filter_mode == "all":
             rows = [row for row in range(len(self._segments)) if row in self._tag_by_row]
@@ -1651,9 +2575,12 @@ class PlayerWindow(QMainWindow):
             prev = [row for row in rows if row < anchor]
             nxt = prev[-1] if prev else rows[-1]
         self._stop_subtitle_repeat()
+        list_row = self._list_row_for_segment(nxt)
+        if list_row < 0:
+            return
         self.subtitle_list.clearSelection()
-        self.subtitle_list.setCurrentRow(nxt)
-        item = self.subtitle_list.item(nxt)
+        self.subtitle_list.setCurrentRow(list_row)
+        item = self.subtitle_list.item(list_row)
         if item is not None:
             item.setSelected(True)
             self.subtitle_list.scrollToItem(item, QListWidget.ScrollHint.PositionAtCenter)
@@ -1825,20 +2752,34 @@ class PlayerWindow(QMainWindow):
             # Multi-select: do not seek.
             return
         row = self.subtitle_list.row(item)
-        if row < 0 or row >= len(self._segments):
+        payload = self._item_payload(item)
+        if payload.get("kind") == "screenshot":
+            shot_id = str(payload.get("screenshot_id") or "")
+            if shot_id:
+                self._edit_screenshot(shot_id)
             return
+        segment_row = self._segment_row_from_item(item)
+        if segment_row is None:
+            if row < 0 or row >= len(self._segments):
+                return
+            segment_row = row
         self._stop_subtitle_repeat()
-        self._seek_to(self._segments[row].start)
+        self._seek_to(self._segments[segment_row].start)
 
     def _selected_subtitle_rows(self) -> list[int]:
-        rows = sorted(
-            {
-                self.subtitle_list.row(item)
-                for item in self.subtitle_list.selectedItems()
-                if item is not None
-            }
-        )
-        return [row for row in rows if 0 <= row < len(self._segments)]
+        rows = []
+        for item in self.subtitle_list.selectedItems():
+            if item is None:
+                continue
+            segment_row = self._segment_row_from_item(item)
+            if segment_row is None:
+                list_row = self.subtitle_list.row(item)
+                payload = self._item_payload(item)
+                if payload.get("kind") != "screenshot" and 0 <= list_row < len(self._segments):
+                    segment_row = list_row
+            if segment_row is not None:
+                rows.append(segment_row)
+        return sorted(set(rows))
 
     def _plain_text_for_subtitle_rows(self, rows: list[int]) -> str:
         texts: list[str] = []
@@ -1856,27 +2797,38 @@ class PlayerWindow(QMainWindow):
             item = self.subtitle_list.itemAt(pos)
             if item is None:
                 return
-            row = self.subtitle_list.row(item)
-            if row < 0 or row >= len(self._segments):
+            payload = self._item_payload(item)
+            if payload.get("kind") == "screenshot":
+                shot_id = str(payload.get("screenshot_id") or "")
+                if shot_id:
+                    self._open_screenshot_menu(shot_id, pos)
                 return
+            segment_row = self._segment_row_from_item(item)
+            if segment_row is None:
+                row = self.subtitle_list.row(item)
+                if row < 0 or row >= len(self._segments):
+                    return
+                segment_row = row
 
             selected_rows = self._selected_subtitle_rows()
             # Right-click on an unselected row: select only that row (standard UX).
-            if row not in selected_rows:
+            if segment_row not in selected_rows:
                 self.subtitle_list.clearSelection()
                 item.setSelected(True)
                 self.subtitle_list.setCurrentItem(item)
-                selected_rows = [row]
+                selected_rows = [segment_row]
 
             multi = len(selected_rows) > 1
-            editing_allowed = self._subtitle_editing_allowed()
+            text_allowed = self._subtitle_text_editing_allowed()
+            tag_allowed = self._subtitle_editing_allowed()
             menu = QMenu(self)
             edit_action = None
             tag_action = None
             clear_tag_action = None
-            if editing_allowed:
+            if text_allowed:
                 edit_action = menu.addAction("编辑")
                 edit_action.setEnabled(not multi)
+            if tag_allowed:
                 tag_action = menu.addAction("标签")
                 clear_tag_action = menu.addAction("清除标签")
                 clear_tag_action.setEnabled(self._rows_have_tags(selected_rows))
@@ -1890,16 +2842,21 @@ class PlayerWindow(QMainWindow):
             elif chosen == translate_action:
                 self._translate_subtitle_rows(selected_rows)
             elif edit_action is not None and chosen == edit_action and not multi:
-                self._edit_subtitle_text(row)
+                self._edit_subtitle_text(segment_row)
             elif tag_action is not None and chosen == tag_action:
                 self._edit_subtitle_tags(selected_rows)
             elif clear_tag_action is not None and chosen == clear_tag_action:
                 self._clear_tags_on_rows(selected_rows)
             elif chosen == repeat_action and not multi:
-                self._start_subtitle_repeat(row)
+                self._start_subtitle_repeat(segment_row)
         finally:
             self._subtitle_menu_open = False
             QTimer.singleShot(0, self._maybe_resume_subtitle_auto_follow)
+
+    def _subtitle_text_editing_allowed(self) -> bool:
+        if self._timeline_mode:
+            return False
+        return self._subtitle_editing_allowed()
 
     def _subtitle_editing_allowed(self) -> bool:
         save_path = self._current_subtitle_save_path()
@@ -1995,8 +2952,9 @@ class PlayerWindow(QMainWindow):
         self._repeat_start_ms = start_ms
         self._repeat_end_ms = end_ms
         self.subtitle_list.clearSelection()
-        self.subtitle_list.setCurrentRow(row)
-        item = self.subtitle_list.item(row)
+        list_row = self._list_row_for_segment(row)
+        self.subtitle_list.setCurrentRow(list_row if list_row >= 0 else row)
+        item = self.subtitle_list.item(list_row if list_row >= 0 else row)
         if item is not None:
             item.setSelected(True)
         self._seek_to(start_ms / 1000.0, play=True)
@@ -2060,7 +3018,13 @@ class PlayerWindow(QMainWindow):
         if entry is not None:
             snapshot_entry(entry, self._segments[row])
             self._save_subtitle_tags()
-        item = self.subtitle_list.item(row)
+        if self._screenshot_document.entries and new_start != seg.start:
+            self._persist_subtitle_edits()
+            self._populate_subtitle_list()
+            self._sync_subtitle_highlight(self._player.position() / 1000.0, force=True)
+            return
+        list_row = self._list_row_for_segment(row)
+        item = self.subtitle_list.item(list_row if list_row >= 0 else row)
         if item is not None:
             self._apply_subtitle_item_payload(item, self._segments[row], row)
         self._persist_subtitle_edits()
@@ -2083,6 +3047,8 @@ class PlayerWindow(QMainWindow):
         return self._config.output_format or "srt"
 
     def _persist_subtitle_edits(self) -> None:
+        if self._timeline_mode:
+            return
         path = self._current_subtitle_save_path()
         if path is None:
             QMessageBox.information(self, "提示", "当前没有可保存的字幕文件。")
@@ -2093,6 +3059,9 @@ class PlayerWindow(QMainWindow):
             write_subtitle_file(self._segments, path, fmt)
         except OSError as exc:
             self._error_box("保存失败", str(exc))
+            return
+        self._subtitle_dirty = True
+        self._edit_generation += 1
 
     def toggle_playback_from_video(self) -> None:
         if self._media_path is None:
@@ -2110,6 +3079,9 @@ class PlayerWindow(QMainWindow):
             self._toggle_play()
 
     def _toggle_play(self) -> None:
+        preview = getattr(self, "_screenshot_preview", None)
+        if preview is not None and preview.isVisible():
+            preview.close_preview()
         if self._open_frame_nudge or self._open_preview_should_pause:
             self._release_open_preview(keep_playing=True)
             return
@@ -2142,6 +3114,9 @@ class PlayerWindow(QMainWindow):
         if playing and not self._open_frame_nudge and not self._open_preview_should_pause:
             self._holding_open_pause = False
             self._open_pause_pending = False
+            self._note_playback_started()
+        elif not playing and not self._open_frame_nudge and not self._open_preview_should_pause:
+            self._note_playback_stopped()
         if (
             state == QMediaPlayer.PlaybackState.PausedState
             and not self._open_frame_nudge
@@ -2153,6 +3128,15 @@ class PlayerWindow(QMainWindow):
 
     def _on_duration_changed(self, duration_ms: int) -> None:
         self.position_slider.setRange(0, max(0, duration_ms))
+        if self._timeline_mode and duration_ms > 0:
+            duration_seconds = duration_ms / 1000.0
+            current_end = self._segments[-1].end if self._segments else 0.0
+            if abs(current_end - duration_seconds) > 0.2:
+                if self._timeline_step_user_set:
+                    step = int(self._timeline_step_combo.currentData() or default_timeline_step(duration_seconds))
+                    self._rebuild_timeline(step, duration_seconds)
+                else:
+                    self._apply_default_timeline_step(duration_seconds)
         if (
             self._holding_open_pause
             and duration_ms > 0
@@ -2212,12 +3196,17 @@ class PlayerWindow(QMainWindow):
         if row < 0 or row == self._current_subtitle_row:
             return
         self._current_subtitle_row = row
-        if self.subtitle_list.isRowHidden(row) or self._tag_filter_mode == "unmatched":
+        list_row = self._list_row_for_segment(row)
+        if (
+            list_row < 0
+            or self.subtitle_list.isRowHidden(list_row)
+            or self._tag_filter_mode == "unmatched"
+        ):
             return
         self.subtitle_list.blockSignals(True)
         self.subtitle_list.clearSelection()
-        self.subtitle_list.setCurrentRow(row)
-        current_item = self.subtitle_list.item(row)
+        self.subtitle_list.setCurrentRow(list_row)
+        current_item = self.subtitle_list.item(list_row)
         if current_item is not None:
             current_item.setSelected(True)
             self.subtitle_list.scrollToItem(
@@ -2279,8 +3268,10 @@ class PlayerWindow(QMainWindow):
             return False
 
         if obj is getattr(self, "_media_host", None):
-            if event.type() == QEvent.Type.Resize and self._immersive_list_active:
-                self._layout_immersive_list_panel()
+            if event.type() == QEvent.Type.Resize:
+                if self._immersive_list_active:
+                    self._layout_immersive_list_panel()
+                self._layout_screenshot_preview()
             return super().eventFilter(obj, event)
         if obj in (self._audio_placeholder,):
             if (
@@ -2752,6 +3743,7 @@ class PlayerWindow(QMainWindow):
             self._begin_open_pause()
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
             self._remember_playback_position()
+            self._offer_exit_sync(blocking=False)
         if not self._awaiting_reload_seek:
             if status == QMediaPlayer.MediaStatus.InvalidMedia:
                 self._open_pause_pending = False
@@ -2957,6 +3949,15 @@ class PlayerWindow(QMainWindow):
         return False
 
     def _start_cloud_task(self, work, on_success, title: str | None) -> None:
+        if not self._network_looks_online():
+            QMessageBox.information(self, "云同步", "当前设备未联网，未进行同步。")
+            return
+        server_url = self._config.cloud_server_url or DEFAULT_CLOUD_SERVER
+
+        def wrapped():
+            ensure_online(server_url)
+            return work()
+
         progress = None
         host = QApplication.activeModalWidget() or self
         if title:
@@ -2966,7 +3967,7 @@ class PlayerWindow(QMainWindow):
             progress.setCancelButton(None)
             progress.setMinimumDuration(0)
             progress.show()
-        task = CloudTask(work, self)
+        task = CloudTask(wrapped, self)
 
         def ok(result) -> None:
             if progress is not None:
@@ -3131,6 +4132,8 @@ class PlayerWindow(QMainWindow):
             return
         if not self._config.cloud_username.strip() or not self._config.cloud_password:
             return
+        if not self._network_looks_online():
+            return
         media = self._media_path
         account = (
             self._config.cloud_server_url or DEFAULT_CLOUD_SERVER,
@@ -3139,8 +4142,14 @@ class PlayerWindow(QMainWindow):
         )
 
         def work():
+            ensure_online(account[0])
             client = load_account_client(*account)
-            return inspect_open_media(client, media)
+            update = inspect_open_media(client, media)
+            try:
+                update.screenshots_changed = bool(sync_screenshots(client, media))
+            except Exception:
+                update.screenshots_changed = False
+            return update
 
         task = CloudTask(work, self)
         task.succeeded.connect(lambda result, media=media, username=account[1]: self._offer_cloud_updates(media, username, result))
@@ -3152,19 +4161,21 @@ class PlayerWindow(QMainWindow):
     def _offer_cloud_updates(self, media: Path, username: str, update) -> None:
         if self._media_path is None or self._media_path != media:
             return
+        if getattr(update, "screenshots_changed", False):
+            self._reload_screenshots_from_disk()
         if update.subtitles and confirm_subtitle_download(self, update.subtitles):
-            for item in update.subtitles:
-                apply_subtitle_download(username, item)
-            current = None
+            written = [apply_subtitle_download(username, item) for item in update.subtitles]
+            previous = None
             index = self.subtitle_combo.currentIndex()
             if index >= 0:
                 current = self.subtitle_combo.itemData(index)
-            self._refresh_subtitle_options()
-            if current:
-                self._select_subtitle_path(Path(str(current)))
-            elif self.subtitle_combo.count() > 0:
-                self.subtitle_combo.setCurrentIndex(0)
-                self._load_subtitle_at_index(0)
+                if current:
+                    previous = Path(str(current))
+            chosen = subtitle_path_after_download(previous, timeline_virtual_path(media), written)
+            if chosen is not None:
+                self._select_subtitle_path(chosen)
+            else:
+                self._show_subtitles_or_timeline()
         if self._media_path != media:
             return
         if update.tags and confirm_tag_download(self, update.tags):
@@ -3333,9 +4344,25 @@ class PlayerWindow(QMainWindow):
             self._on_transcription_finished()
 
     def _refresh_subtitles_keep_selection(self, load_new: bool = False) -> None:
+        if self._media_path is not None:
+            self._resolve_subtitle_locations()
+        was_timeline = self._timeline_mode
         previous = self.subtitle_combo.currentData()
-        old_count = self.subtitle_combo.count()
+        old_count = 0 if was_timeline else self.subtitle_combo.count()
         self._refresh_subtitle_options()
+        real = find_valid_subtitles(self._media_path) if self._media_path else []
+        if not real:
+            if not self._timeline_mode:
+                self._enter_timeline_mode()
+            elif self.subtitle_combo.count() == 0 and self._media_path is not None:
+                self.subtitle_combo.blockSignals(True)
+                self.subtitle_combo.addItem("时间线", str(timeline_virtual_path(self._media_path)))
+                self.subtitle_combo.setCurrentIndex(0)
+                self.subtitle_combo.blockSignals(False)
+            return
+        if was_timeline or self._timeline_mode:
+            self._show_subtitles_or_timeline()
+            return
         if previous:
             for index in range(self.subtitle_combo.count()):
                 if self.subtitle_combo.itemData(index) == previous:
@@ -3796,6 +4823,8 @@ class PlayerWindow(QMainWindow):
         event.acceptProposedAction()
 
     def closeEvent(self, event) -> None:
+        self._note_playback_stopped(wait=True)
+        self._offer_exit_sync(blocking=True)
         self._study_countdown_timer.stop()
         self._playback_save_timer.stop()
         self._remember_playback_position()

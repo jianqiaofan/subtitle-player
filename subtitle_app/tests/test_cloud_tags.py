@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from core.cloud_sync import SubtitleFile, classify_subtitles, content_hash
+from core.cloud_sync import SubtitleFile, classify_subtitles, content_hash, subtitle_path_after_download
 from core.video_hash import language_suffix, video_content_hash
 from core.cloud_tags import build_upload_document, merge_server_document
 from core.subtitle_tags import SubtitleTagDocument, SubtitleTagEntry
@@ -100,7 +100,9 @@ class VideoHashTests(unittest.TestCase):
             first = video_content_hash(media)
             second = video_content_hash(media)
             self.assertEqual(first, second)
-            self.assertTrue((Path(folder) / "1.mp4.videohash.json").is_file())
+            bundle = Path(folder) / "1.mp4.data" / "1.mp4.videohash.json"
+            self.assertTrue(bundle.is_file())
+            self.assertFalse((Path(folder) / "1.mp4.videohash.json").is_file())
             media.write_bytes(b"edited-bytes")
             self.assertNotEqual(video_content_hash(media), first)
 
@@ -312,6 +314,33 @@ class OpenMediaTagTests(unittest.TestCase):
             with patch("core.cloud_sync.tag_baseline_hash", return_value="c" * 64):
                 update = inspect_open_media(FakeClient(), media)
             self.assertEqual(update.tags, [])
+
+
+class SubtitleSelectionAfterDownloadTests(unittest.TestCase):
+    def test_timeline_placeholder_is_replaced_by_downloaded_subtitle(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            timeline = root / "hahaha.mp4.data" / "hahaha_时间线.srt"
+            downloaded = root / "hahaha.mp4.data" / "hahaha_中文.srt"
+            downloaded.parent.mkdir()
+            downloaded.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+            chosen = subtitle_path_after_download(timeline, timeline, [downloaded])
+            self.assertEqual(chosen, downloaded)
+
+    def test_existing_subtitle_stays_selected(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            current = root / "hahaha_英文.srt"
+            downloaded = root / "hahaha_中文.srt"
+            current.write_text("en", encoding="utf-8")
+            downloaded.write_text("zh", encoding="utf-8")
+            timeline = root / "hahaha_时间线.srt"
+            chosen = subtitle_path_after_download(current, timeline, [downloaded])
+            self.assertEqual(chosen, current)
 
 
 if __name__ == "__main__":

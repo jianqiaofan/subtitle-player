@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -69,3 +69,51 @@ class TagDocumentRow(Base):
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     disk_path: Mapped[str] = mapped_column(String(512), nullable=False)
+
+
+class PlaybackSession(Base):
+    """一部视频的一段播放。只属于上传的用户，不向其他用户提供。"""
+
+    __tablename__ = "playback_sessions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "session_id", name="uq_playback_user_session"),
+        Index("idx_playback_user_hash", "user_id", "video_hash"),
+        _MYSQL,
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    video_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    video_stem: Mapped[str] = mapped_column(String(255), nullable=False)
+    started_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ended_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class ScreenshotShot(Base):
+    """一个用户、一部视频、一张截图一行。图片在磁盘，这里只记说明和路径。"""
+
+    __tablename__ = "screenshot_shots"
+    __table_args__ = (
+        UniqueConstraint("user_id", "video_hash", "shot_id", name="uq_screenshot_user_hash_shot"),
+        Index("idx_screenshot_user_hash", "user_id", "video_hash"),
+        _MYSQL,
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    video_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    shot_id: Mapped[str] = mapped_column(String(12), nullable=False)
+    video_stem: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    time_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    frame_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    notes_json: Mapped[str] = mapped_column(Text, nullable=False)
+    image_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    disk_path: Mapped[str] = mapped_column(String(512), nullable=False, default="")

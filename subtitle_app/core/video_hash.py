@@ -11,7 +11,10 @@ _CHUNK = 1024 * 1024
 
 
 def hash_cache_path(media_path: Path) -> Path:
-    return media_path.with_name(media_path.name + ".videohash.json")
+    from core.media_bundle import adopt_hash_cache, hash_cache_file
+
+    adopt_hash_cache(media_path)
+    return hash_cache_file(media_path)
 
 
 def video_content_hash(media_path: Path) -> str:
@@ -28,6 +31,7 @@ def video_content_hash(media_path: Path) -> str:
     digest = _sha256_file(media_path)
     payload = {"hash": digest, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
     try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
     except OSError:
         return digest
@@ -46,11 +50,18 @@ def cached_video_for_subtitle(subtitle_path: Path) -> tuple[CachedVideoIdentity 
     """从字幕同目录的「视频文件名.videohash.json」取出合法视频哈希。失败时说明原因。"""
     from core.config import MEDIA_EXTENSIONS
 
-    folder = subtitle_path.parent
+    from core.media_bundle import hash_search_dirs
+
     subtitle_name = subtitle_path.name
-    try:
-        entries = list(folder.iterdir())
-    except OSError:
+    entries: list[Path] = []
+    readable = False
+    for folder in hash_search_dirs(subtitle_path):
+        try:
+            entries.extend(list(folder.iterdir()))
+            readable = True
+        except OSError:
+            continue
+    if not readable:
         return None, f"无法读取「{subtitle_name}」所在的文件夹，所以找不到视频哈希文件。"
 
     caches: list[tuple[Path, str, str]] = []

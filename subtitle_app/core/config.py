@@ -131,6 +131,12 @@ class AppConfig:
     immersive_subtitle_list_width_percent: int = 36
     # 字幕列表显示密度：normal 普通 | compact 紧凑
     subtitle_list_density: str = "normal"
+    # 还没单独调整过的截图笔记，用这些样式当文本框的初始值。字号是底图高度的比例。
+    screenshot_note_opacity: float = 0.85
+    screenshot_note_font_size: float = 0.06
+    screenshot_note_color: str = "#1A1A1A"
+    screenshot_note_align: str = "center"
+    screenshot_note_background: str = "#FFFFFF"
     # 用户添加过的自定义字幕标签，下次对话框里继续出现
     subtitle_custom_tags: list[str] = field(default_factory=list)
     # 批量同步标签：上次选择的标签文件和视频文件夹
@@ -139,10 +145,15 @@ class AppConfig:
     # 提取全部标签：上次的来源文件夹和保存位置
     tag_extract_source_dir: str = ""
     tag_extract_dest_dir: str = ""
+    # 预览里把底图和笔记合成图片后，上次保存到的文件夹
+    screenshot_export_dir: str = ""
     # 云同步账号。同一用户名在不同设备上是同一个用户。
     cloud_server_url: str = "https://subtitle.gcsfg.work"
     cloud_username: str = ""
     cloud_password: str = ""
+    # 本机记住：某视频退出时是否还要询问同步。键是视频路径。
+    cloud_sync_policy: dict = field(default_factory=dict)
+    cloud_sync_pending: dict = field(default_factory=dict)
 
     def get_ai_notes_user_context(self, subtitle_type: str) -> str:
         return str(self.ai_notes_user_context.get(subtitle_type, "") or "").strip()
@@ -177,6 +188,15 @@ class AppConfig:
             self.ai_notes_subcategory[type_id] = value
         elif type_id in self.ai_notes_subcategory:
             del self.ai_notes_subcategory[type_id]
+
+    def resolved_screenshot_export_dir(self, media_path: Path | None = None) -> Path:
+        if self.screenshot_export_dir.strip():
+            folder = Path(self.screenshot_export_dir)
+            if folder.is_dir():
+                return folder
+        if media_path is not None:
+            return media_path.parent
+        return Path.home()
 
     def resolved_last_media_dir(self) -> Path:
         if self.last_media_dir.strip():
@@ -327,6 +347,25 @@ def load_config() -> AppConfig:
     if density not in {"normal", "compact"}:
         density = "normal"
     cfg.subtitle_list_density = density
+    try:
+        cfg.screenshot_note_opacity = max(0.15, min(1.0, float(cfg.screenshot_note_opacity)))
+    except (TypeError, ValueError):
+        cfg.screenshot_note_opacity = 0.85
+    from core.screenshots import (
+        SCREENSHOT_NOTE_BACKGROUND_DEFAULT,
+        normalize_font_ratio,
+        normalize_note_align,
+        normalize_note_color,
+    )
+
+    cfg.screenshot_note_font_size = normalize_font_ratio(cfg.screenshot_note_font_size)
+
+    cfg.screenshot_note_color = normalize_note_color(str(cfg.screenshot_note_color or ""))
+    cfg.screenshot_note_align = normalize_note_align(str(cfg.screenshot_note_align or ""))
+    cfg.screenshot_note_background = normalize_note_color(
+        str(cfg.screenshot_note_background or ""),
+        SCREENSHOT_NOTE_BACKGROUND_DEFAULT,
+    )
     if not isinstance(cfg.subtitle_custom_tags, list):
         cfg.subtitle_custom_tags = []
     custom_tags: list[str] = []
@@ -368,10 +407,30 @@ def load_config() -> AppConfig:
     cfg.batch_tag_sync_video_dir = str(cfg.batch_tag_sync_video_dir or "").strip()
     cfg.tag_extract_source_dir = str(cfg.tag_extract_source_dir or "").strip()
     cfg.tag_extract_dest_dir = str(cfg.tag_extract_dest_dir or "").strip()
+    cfg.screenshot_export_dir = str(cfg.screenshot_export_dir or "").strip()
     cfg.cloud_server_url = str(cfg.cloud_server_url or "").strip() or "https://subtitle.gcsfg.work"
     cfg.cloud_username = str(cfg.cloud_username or "").strip()
     cfg.cloud_password = str(cfg.cloud_password or "")
+    cfg.cloud_sync_policy = _clean_sync_choices(getattr(cfg, "cloud_sync_policy", None))
+    cfg.cloud_sync_pending = _clean_sync_choices(getattr(cfg, "cloud_sync_pending", None))
     return cfg
+
+
+def _clean_sync_choices(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, dict[str, bool]] = {}
+    for key, value in raw.items():
+        path = str(key or "").strip()
+        if not path or not isinstance(value, dict):
+            continue
+        cleaned[path] = {
+            "subtitles": bool(value.get("subtitles")),
+            "tags": bool(value.get("tags")),
+        }
+        if len(cleaned) >= 200:
+            break
+    return cleaned
 
 
 def save_config(config: AppConfig) -> None:

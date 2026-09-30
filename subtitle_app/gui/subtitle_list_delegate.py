@@ -36,6 +36,7 @@ TAG_COLORS: dict[str, tuple[str, str]] = {
     "俚语": ("#4a3040", "#ffc0d8"),
     "文化背景": ("#3a4030", "#e0e8b0"),
     "名场面": ("#4a2840", "#ffc0b0"),
+    "截图": ("#3a2458", "#e2c6ff"),
 }
 CUSTOM_TAG_COLOR = ("#3a3a3a", "#dddddd")
 NOTE_COLOR = QColor("#ffd56a")

@@ -447,9 +447,10 @@ def find_batch_tag_matches(
 ) -> list[TagVideoMatch]:
     """用选中的标签文件，匹配视频文件夹（含子目录）中的同名视频。
 
-    只保留视频旁边已经有对应字幕文件的结果，否则无法写入标签。
+    只保留已经有对应字幕文件的结果，字幕可以在视频旁边，也可以在配套文件夹里。
     """
     from core.config import MEDIA_EXTENSIONS
+    from core.media_bundle import locate_subtitle_file
 
     videos = sorted(
         path
@@ -464,8 +465,8 @@ def find_batch_tag_matches(
         for video_path in videos:
             if not subtitle_matches_video(subtitle_name, video_path):
                 continue
-            subtitle_path = video_path.parent / subtitle_name
-            if not subtitle_path.is_file():
+            subtitle_path = locate_subtitle_file(video_path, subtitle_name)
+            if subtitle_path is None:
                 continue
             destination = tag_path_for_subtitle(subtitle_path)
             try:
@@ -594,13 +595,29 @@ def collect_tag_files(source_dir: Path, dest_dir: Path) -> TagExtractResult:
     return result
 
 
+def _find_subtitle_named(folder: Path, subtitle_name: str) -> Path | None:
+    direct = folder / subtitle_name
+    if direct.is_file():
+        return direct
+    try:
+        children = list(folder.iterdir())
+    except OSError:
+        return None
+    for item in children:
+        if item.is_dir() and item.name.endswith(".data"):
+            candidate = item / subtitle_name
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def sync_tag_file_into_folder(source: Path, folder: Path) -> tuple[str, str]:
     """把一个标签文件同步到视频所在文件夹。返回 (copied|merged|skipped, 说明)。"""
     subtitle_name = subtitle_name_for_tag_path(source)
     if not subtitle_name:
         return "skipped", f"{source.name}：不是标签文件"
-    subtitle_path = folder / subtitle_name
-    if not subtitle_path.is_file():
+    subtitle_path = _find_subtitle_named(folder, subtitle_name)
+    if subtitle_path is None:
         return "skipped", f"{source.name}：当前视频文件夹中没有 {subtitle_name}"
     incoming = read_tag_document_for_import(source)
     if incoming is None:

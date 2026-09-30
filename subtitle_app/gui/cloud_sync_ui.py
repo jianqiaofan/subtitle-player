@@ -209,3 +209,116 @@ def confirm_tag_download(parent: QWidget, rows: list[dict]) -> bool:
     lines.append("是否同步到本机？")
     answer = QMessageBox.question(parent, "同步标签", "\n".join(lines))
     return answer == QMessageBox.StandardButton.Yes
+
+
+def _format_local_time(timestamp: float) -> str:
+    try:
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError):
+        return "未知"
+
+
+class SubtitleConflictDialog(QDialog):
+    """同名字幕在配套文件夹和视频旁边各有一份时，让用户留一份。"""
+
+    def __init__(self, conflicts: list, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        from PyQt6.QtWidgets import QButtonGroup, QGroupBox, QRadioButton
+
+        self.setWindowTitle("选择字幕")
+        self.setStyleSheet(DARK_STYLE)
+        self.resize(640, min(520, 180 + 150 * len(conflicts)))
+        self._choices: list[tuple[str, QButtonGroup, object, object]] = []
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("同名字幕在两个位置都有。请为每个文件选择要留下的一份。留下的会放到配套文件夹，另一份会删除。"))
+        for conflict in conflicts:
+            box = QGroupBox(conflict.name)
+            box_layout = QVBoxLayout(box)
+            group = QButtonGroup(box)
+            bundled = QRadioButton(self._spot_text("配套文件夹中的这份", conflict.bundled))
+            legacy = QRadioButton(self._spot_text("视频旁边的这份", conflict.legacy))
+            bundled.setChecked(conflict.bundled.updated_at >= conflict.legacy.updated_at)
+            legacy.setChecked(not bundled.isChecked())
+            group.addButton(bundled)
+            group.addButton(legacy)
+            box_layout.addWidget(bundled)
+            box_layout.addWidget(legacy)
+            layout.addWidget(box)
+            self._choices.append((conflict.name, group, bundled, legacy))
+        buttons = QHBoxLayout()
+        ok_button = QPushButton("使用选中的字幕")
+        cancel_button = QPushButton("取消")
+        ok_button.clicked.connect(self.accept)
+        cancel_button.clicked.connect(self.reject)
+        buttons.addStretch(1)
+        buttons.addWidget(ok_button)
+        buttons.addWidget(cancel_button)
+        layout.addLayout(buttons)
+
+    @staticmethod
+    def _spot_text(title: str, spot) -> str:
+        return (
+            f"{title}\n{spot.path}\n"
+            f"创建：{_format_local_time(spot.created_at)}\n"
+            f"最后更新：{_format_local_time(spot.updated_at)}"
+        )
+
+    def choices(self) -> dict[str, str]:
+        for name, _group, bundled, _legacy in self._choices:
+            picked[name] = "bundle" if bundled.isChecked() else "legacy"
+        return picked
+
+
+def ask_subtitle_conflicts(parent: QWidget, conflicts: list) -> dict[str, str] | None:
+    if not conflicts:
+        return {}
+    dialog = SubtitleConflictDialog(conflicts, parent)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return dialog.choices()
+
+
+class ExitSyncDialog(QDialog):
+    def __init__(self, *, subtitles: bool, tags: bool, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        from PyQt6.QtWidgets import QCheckBox
+
+        self.setWindowTitle("同步到云端")
+        self.setStyleSheet(DARK_STYLE)
+        self.resize(460, 220)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("观看过程中有内容改过。勾选要同步到云端的项目。"))
+        self.subtitle_box = QCheckBox("同步字幕")
+        self.tag_box = QCheckBox("同步标签")
+        self.subtitle_box.setChecked(subtitles)
+        self.subtitle_box.setEnabled(subtitles)
+        self.tag_box.setChecked(tags)
+        self.tag_box.setEnabled(tags)
+        self.remember_box = QCheckBox("不再询问，在本设备，该视频下回采用相同的同步策略")
+        layout.addWidget(self.subtitle_box)
+        layout.addWidget(self.tag_box)
+        layout.addWidget(self.remember_box)
+        buttons = QHBoxLayout()
+        sync_button = QPushButton("同步")
+        later_button = QPushButton("暂不同步")
+        sync_button.clicked.connect(self.accept)
+        later_button.clicked.connect(self.reject)
+        buttons.addStretch(1)
+        buttons.addWidget(sync_button)
+        buttons.addWidget(later_button)
+        layout.addLayout(buttons)
+
+    def result_value(self) -> tuple[bool, bool, bool]:
+        return (
+            self.subtitle_box.isChecked(),
+            self.tag_box.isChecked(),
+            self.remember_box.isChecked(),
+        )
+
+
+def ask_exit_sync(parent: QWidget, *, subtitles: bool, tags: bool) -> tuple[bool, bool, bool] | None:
+    dialog = ExitSyncDialog(subtitles=subtitles, tags=tags, parent=parent)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return dialog.result_value()
+

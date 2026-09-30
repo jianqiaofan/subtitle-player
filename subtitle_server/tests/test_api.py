@@ -368,3 +368,162 @@ def test_library_lists_edits_share_flag_and_deletes_only_own_files(tmp_path):
         assert removed.status_code == 200
         assert client.get("/api/library/subtitles", headers=auth(alice)).json()["subtitles"] == []
         assert client.get("/api/shares", headers=auth(bob), params={"video_hash": VIDEO_HASH}).json()["shares"] == []
+
+
+def test_playback_log_appends_for_the_owner_only(tmp_path):
+    with make_client(tmp_path) as client:
+        alice = register(client, "alice_play")
+        bob = register(client, "bob_play")
+        first = {
+            "id": "a" * 32,
+            "started_at": 1_758_000_000_000,
+            "ended_at": 1_758_000_060_000,
+        }
+        created = client.put(
+            "/api/playback",
+            headers=auth(alice),
+            json={"video_hash": VIDEO_HASH, "video_stem": "电脑", "sessions": [first]},
+        )
+        assert created.status_code == 200, created.text
+        assert created.json()["sessions"] == [first]
+        again = client.put(
+            "/api/playback",
+            headers=auth(alice),
+            json={
+                "video_hash": VIDEO_HASH,
+                "video_stem": "电脑",
+                "sessions": [
+                    first,
+                    {"id": "b" * 32, "started_at": 1_758_000_100_000, "ended_at": 1_758_000_130_000},
+                ],
+            },
+        )
+        assert again.status_code == 200, again.text
+        assert [item["id"] for item in again.json()["sessions"]] == ["b" * 32, "a" * 32]
+        assert again.json()["sessions"][1] == first
+        hidden = client.get("/api/playback", headers=auth(bob), params={"video_hash": VIDEO_HASH})
+        assert hidden.status_code == 200
+        assert hidden.json()["sessions"] == []
+        own = client.get("/api/playback", headers=auth(alice), params={"video_hash": VIDEO_HASH})
+        assert len(own.json()["sessions"]) == 2
+        bad = client.put(
+            "/api/playback",
+            headers=auth(alice),
+            json={"video_hash": VIDEO_HASH, "video_stem": "电脑", "sessions": [{"id": "c" * 32, "started_at": 10, "ended_at": 20}]},
+        )
+        assert bad.status_code == 400
+
+
+def _shot(shot_id: str, updated_at: int, title: str = "画面", frame: int | None = 12) -> dict:
+    return {
+        "id": shot_id,
+        "title": title,
+        "time": 3.5,
+        "frame": frame,
+        "created_at": 1_700_000_000_000,
+        "updated_at": updated_at,
+        "notes": [
+            {
+                "id": "b" * 12,
+                "text": "笔记",
+                "created_at": 1_700_000_000_000,
+                "updated_at": updated_at,
+                "box": {"x": 0.2, "y": 0.3, "width": 0.4, "height": 0.2, "font": 0.06, "align": "center"},
+            }
+        ],
+    }
+
+
+def _webp() -> bytes:
+    body = b"WEBPTEST"
+    return b"RIFF" + len(body).to_bytes(4, "little") + body
+
+
+def test_screenshot_merge_keeps_newer_notes_and_deletes_only_baseline(tmp_path):
+    with make_client(tmp_path) as client:
+        alice = register(client, "shot_alice")
+        bob = register(client, "shot_bob")
+        first = client.put(
+            "/api/screenshots",
+            headers=auth(alice),
+            json={
+                "video_hash": VIDEO_HASH,
+                "video_stem": "第1课",
+                "shots": [_shot("a" * 12, 20, "新标题"), _shot("c" * 12, 20, "保留")],
+                "baseline_ids": [],
+            },
+        )
+        assert first.status_code == 200, first.text
+        assert [item["title"] for item in first.json()["shots"]] == ["新标题", "保留"]
+        older = client.put(
+            "/api/screenshots",
+            headers=auth(alice),
+            json={
+                "video_hash": VIDEO_HASH,
+                "video_stem": "第1课",
+                "shots": [_shot("a" * 12, 10, "旧标题")],
+                "baseline_ids": ["a" * 12],
+            },
+        )
+        assert older.status_code == 200, older.text
+        titles = {item["id"]: item["title"] for item in older.json()["shots"]}
+        assert titles["a" * 12] == "新标题"
+        assert titles["c" * 12] == "保留"
+        removed = client.put(
+            "/api/screenshots",
+            headers=auth(alice),
+            json={
+                "video_hash": VIDEO_HASH,
+                "video_stem": "第1课",
+                "shots": [_shot("a" * 12, 20, "新标题")],
+                "baseline_ids": ["a" * 12, "c" * 12],
+            },
+        )
+        assert [item["id"] for item in removed.json()["shots"]] == ["a" * 12]
+        hidden = client.get("/api/screenshots", headers=auth(bob), params={"video_hash": VIDEO_HASH})
+        assert hidden.json()["shots"] == []
+
+
+def test_screenshot_image_is_private_and_not_replaced(tmp_path):
+    with make_client(tmp_path) as client:
+        alice = register(client, "img_alice")
+        bob = register(client, "img_bob")
+        created = client.put(
+            "/api/screenshots",
+            headers=auth(alice),
+            json={
+                "video_hash": VIDEO_HASH,
+                "video_stem": "第1课",
+                "shots": [_shot("d" * 12, 30, frame=8)],
+                "baseline_ids": [],
+            },
+        )
+        assert created.status_code == 200
+        image = _webp()
+        uploaded = client.put(
+            f"/api/screenshots/{VIDEO_HASH}/{'d' * 12}/image",
+            headers={**auth(alice), "Content-Type": "image/webp"},
+            content=image,
+        )
+        assert uploaded.status_code == 200, uploaded.text
+        assert uploaded.json()["has_image"] is True
+        replaced = client.put(
+            f"/api/screenshots/{VIDEO_HASH}/{'d' * 12}/image",
+            headers={**auth(alice), "Content-Type": "image/webp"},
+            content=_webp() + b"MORE",
+        )
+        assert replaced.json()["image_hash"] == uploaded.json()["image_hash"]
+        downloaded = client.get(
+            f"/api/screenshots/{VIDEO_HASH}/{'d' * 12}/image",
+            headers=auth(alice),
+        )
+        assert downloaded.status_code == 200
+        assert downloaded.content == image
+        forbidden = client.get(
+            f"/api/screenshots/{VIDEO_HASH}/{'d' * 12}/image",
+            headers=auth(bob),
+        )
+        assert forbidden.status_code == 404
+        manifest = tmp_path / "users" / "1" / "screenshots" / VIDEO_HASH / "screenshots.json"
+        assert manifest.is_file()
+        assert (manifest.parent / f"{'d' * 12}.webp").read_bytes() == image

@@ -110,6 +110,54 @@ class CloudClient:
             },
         )
 
+    def put_playback(self, video_hash: str, video_stem: str, sessions: list[dict]) -> dict:
+        return self._request(
+            "PUT",
+            "/api/playback",
+            {"video_hash": video_hash, "video_stem": video_stem, "sessions": sessions},
+        )
+
+    def get_playback(self, video_hash: str) -> dict:
+        return self._request("GET", "/api/playback?video_hash=" + quote(video_hash, safe=""))
+
+    def put_screenshots(
+        self,
+        video_hash: str,
+        video_stem: str,
+        shots: list[dict],
+        baseline_ids: list[str],
+    ) -> dict:
+        return self._request(
+            "PUT",
+            "/api/screenshots",
+            {
+                "video_hash": video_hash,
+                "video_stem": video_stem,
+                "shots": shots,
+                "baseline_ids": baseline_ids,
+            },
+        )
+
+    def put_screenshot_image(self, video_hash: str, shot_id: str, data: bytes) -> dict:
+        raw = self._request_bytes(
+            "PUT",
+            f"/api/screenshots/{video_hash}/{shot_id}/image",
+            data,
+            "image/webp",
+        )
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise CloudError("服务器返回的内容无法识别") from exc
+        if not isinstance(payload, dict):
+            raise CloudError("服务器返回的内容无法识别")
+        return payload
+
+    def get_screenshot_image(self, video_hash: str, shot_id: str) -> bytes:
+        return self._request_bytes("GET", f"/api/screenshots/{video_hash}/{shot_id}/image")
+
     def _request(self, method: str, path: str, body: dict | None = None, auth: bool = True) -> dict:
         if not self.base_url.startswith(("http://", "https://")):
             raise CloudError("服务器地址需要以 http:// 或 https:// 开头")
@@ -148,6 +196,41 @@ class CloudClient:
         if not isinstance(payload, dict):
             raise CloudError("服务器返回的内容无法识别")
         return payload
+
+    def _request_bytes(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        content_type: str = "",
+    ) -> bytes:
+        if not self.base_url.startswith(("http://", "https://")):
+            raise CloudError("服务器地址需要以 http:// 或 https:// 开头")
+        if not self.token:
+            self.login()
+        try:
+            return self._send_bytes(method, path, body, content_type)
+        except CloudError as exc:
+            if exc.status == 401:
+                self.token = ""
+                self.login()
+                return self._send_bytes(method, path, body, content_type)
+            raise
+
+    def _send_bytes(self, method: str, path: str, body: bytes | None, content_type: str) -> bytes:
+        request = Request(self.base_url + path, data=body, method=method)
+        if content_type:
+            request.add_header("Content-Type", content_type)
+        if self.token:
+            request.add_header("Authorization", "Bearer " + self.token)
+        try:
+            with urlopen(request, timeout=60) as response:
+                return response.read()
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise CloudError(_error_message(detail, exc.code), exc.code) from exc
+        except URLError as exc:
+            raise CloudError(f"无法连接服务器：{exc.reason}") from exc
 
 
 def _error_message(raw: str, status: int) -> str:

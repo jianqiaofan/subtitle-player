@@ -6,6 +6,12 @@ GET  /api/auth/me
 PUT  /api/subtitles          同一种语言覆盖，其它语言保留
 PUT  /api/tags               按标签操作时间合并，未出现的标签保持原样
 GET  /api/sync?video_hash=  一次取回这部视频的各语言字幕和标签
+GET  /api/playback?video_hash=  只取回当前用户自己的播放记录
+PUT  /api/playback         追加当前用户的播放记录，不改已有记录，不对其他用户可见
+GET  /api/screenshots?video_hash=  取回当前用户这部视频的截图说明
+PUT  /api/screenshots      按更新时间合并说明；基线里有、这次没有的截图从云端删除
+PUT  /api/screenshots/{video_hash}/{shot_id}/image  上传压缩后的 WebP，已有图片不再覆盖
+GET  /api/screenshots/{video_hash}/{shot_id}/image  下载压缩图，只给这张图的主人
 GET  /api/shares?video_hash= 其他用户分享的同一视频字幕；带 username 时返回正文
 GET  /api/library/subtitles  本人字幕列表
 GET  /api/library/tags       本人标签列表
@@ -17,6 +23,7 @@ import json
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -35,10 +42,13 @@ from app.names import (
 from app.catalog import (
     SUBTITLE_LIMIT,
     Conflict,
+    InvalidPlayback,
     delete_stored_row,
+    list_playback_sessions,
     list_shared_subtitles,
     list_user_subtitles,
     list_user_tags,
+    merge_playback_sessions,
     owned_subtitle,
     owned_tag,
     save_subtitle,
@@ -47,6 +57,7 @@ from app.catalog import (
     sync_bundle,
 )
 from app.security import AuthError, create_token, hash_password, read_user_id, verify_password
+from app.shot_catalog import ScreenshotRejected, list_screenshot_document, read_screenshot_image, save_screenshot_image, sync_screenshot_document
 from app.storage import StorageError, absolute_path, load_document, read_bytes
 from app.tagmerge import InvalidTagDocument, document_to_dict, parse_document
 from app.timeutil import iso_z_seconds, utc_now_naive
@@ -76,6 +87,35 @@ class TagUpload(BaseModel):
 
 class ShareFlag(BaseModel):
     shared: bool
+
+
+class PlaybackSessionIn(BaseModel):
+    id: str
+    started_at: int
+    ended_at: int
+
+
+class PlaybackUpload(BaseModel):
+    video_hash: str
+    video_stem: str
+    sessions: list[PlaybackSessionIn]
+
+
+class ScreenshotShotIn(BaseModel):
+    id: str
+    title: str = ""
+    time: float
+    frame: int | None = None
+    created_at: int
+    updated_at: int
+    notes: list[dict] = []
+
+
+class ScreenshotUpload(BaseModel):
+    video_hash: str
+    video_stem: str
+    shots: list[ScreenshotShotIn] = []
+    baseline_ids: list[str] = []
 
 
 def get_db(request: Request):
@@ -412,6 +452,133 @@ def read_shares(
         "video_hash": digest,
         "shares": [_share_payload(share, include_content=include_content) for share in shares],
     }
+
+
+@router.get("/api/playback")
+def read_playback(
+    video_hash: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        digest = validate_video_hash(video_hash)
+    except InvalidName as exc:
+        raise _bad_name(exc) from exc
+    return {"video_hash": digest, "sessions": list_playback_sessions(db, user, digest)}
+
+
+@router.put("/api/playback")
+def put_playback(
+    body: PlaybackUpload,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        digest = validate_video_hash(body.video_hash)
+        video_stem = validate_video_stem(body.video_stem)
+        sessions = merge_playback_sessions(
+            db,
+            user,
+            digest,
+            video_stem,
+            [item.model_dump() for item in body.sessions],
+        )
+    except InvalidName as exc:
+        raise _bad_name(exc) from exc
+    except InvalidPlayback as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Conflict as exc:
+        raise HTTPException(status_code=409, detail="正在被另一台设备写入，请重试") from exc
+    return {"video_hash": digest, "sessions": sessions}
+
+
+@router.get("/api/screenshots")
+def read_screenshots(
+    video_hash: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        digest = validate_video_hash(video_hash)
+    except InvalidName as exc:
+        raise _bad_name(exc) from exc
+    return {"video_hash": digest, "shots": list_screenshot_document(db, user, digest)}
+
+
+@router.put("/api/screenshots")
+def put_screenshots(
+    body: ScreenshotUpload,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        digest = validate_video_hash(body.video_hash)
+        video_stem = validate_video_stem(body.video_stem)
+        shots = sync_screenshot_document(
+            db,
+            request.app.state.settings,
+            user,
+            digest,
+            video_stem,
+            [item.model_dump() for item in body.shots],
+            list(body.baseline_ids),
+        )
+    except InvalidName as exc:
+        raise _bad_name(exc) from exc
+    except ScreenshotRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=500, detail="云端文件写入失败") from exc
+    return {"video_hash": digest, "shots": shots}
+
+
+@router.put("/api/screenshots/{video_hash}/{shot_id}/image")
+async def put_screenshot_image(
+    video_hash: str,
+    shot_id: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        digest = validate_video_hash(video_hash)
+        payload = save_screenshot_image(
+            db,
+            request.app.state.settings,
+            user,
+            digest,
+            shot_id,
+            await request.body(),
+        )
+    except InvalidName as exc:
+        raise _bad_name(exc) from exc
+    except ScreenshotRejected as exc:
+        status = 404 if str(exc) == "请先同步截图说明" else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=500, detail="云端文件写入失败") from exc
+    return payload
+
+
+@router.get("/api/screenshots/{video_hash}/{shot_id}/image")
+def get_screenshot_image(
+    video_hash: str,
+    shot_id: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    try:
+        digest = validate_video_hash(video_hash)
+        data = read_screenshot_image(db, request.app.state.settings, user, digest, shot_id)
+    except InvalidName as exc:
+        raise _bad_name(exc) from exc
+    except ScreenshotRejected as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=500, detail="云端文件读取失败") from exc
+    return Response(content=data, media_type="image/webp")
 
 
 @router.get("/api/sync")

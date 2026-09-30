@@ -2113,16 +2113,30 @@ class PlayerWindow(QMainWindow):
 
     def _open_screenshot_menu(self, shot_id: str, pos) -> None:
         menu = QMenu(self)
+        view_action = menu.addAction("查看截图")
         edit_action = menu.addAction("编辑")
         delete_action = menu.addAction("删除")
         chosen = menu.exec(self.subtitle_list.mapToGlobal(pos))
-        if chosen == edit_action:
+        if chosen == view_action:
+            self._open_screenshot_preview(shot_id)
+        elif chosen == edit_action:
             self._edit_screenshot(shot_id)
         elif chosen == delete_action:
             self._confirm_delete_screenshot(shot_id)
 
     def _confirm_delete_screenshot(self, shot_id: str) -> None:
-        answer = QMessageBox.question(self, "删除截图", "删除这张截图和它的笔记？")
+        answer = QMessageBox.question(
+            self,
+            "删除截图",
+            "删除这张截图和它的笔记？\n云端的这张截图也会一并删除，今后无法再从线上同步回来。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除截图",
+            "确定删除？本机和云端的这张截图都会去掉，以后不能再线上同步。",
+        )
         if answer != QMessageBox.StandardButton.Yes:
             return
         self._delete_screenshot(shot_id)
@@ -2247,7 +2261,9 @@ class PlayerWindow(QMainWindow):
         )
         self._layout_screenshot_preview()
 
-    def _open_screenshot_preview(self) -> None:
+    def _open_screenshot_preview(self, shot_id: str | None = None) -> None:
+        if not isinstance(shot_id, str):
+            shot_id = ""
         if not self._video_loaded() or self._media_path is None:
             return
         shots = sorted_screenshots(self._screenshot_document.entries)
@@ -2255,11 +2271,16 @@ class PlayerWindow(QMainWindow):
             return
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._player.pause()
-        seconds = max(0.0, self._player.position() / 1000.0)
+        index = nearest_screenshot_index(shots, max(0.0, self._player.position() / 1000.0))
+        if shot_id:
+            for shot_index, shot in enumerate(shots):
+                if shot.id == shot_id:
+                    index = shot_index
+                    break
         self._screenshot_preview.show_shots(
             shots,
             self._screenshot_preview_paths(shots),
-            nearest_screenshot_index(shots, seconds),
+            index,
             opacity=float(self._config.screenshot_note_opacity),
             font_size=float(self._config.screenshot_note_font_size),
             color=str(self._config.screenshot_note_color),
@@ -2754,9 +2775,6 @@ class PlayerWindow(QMainWindow):
         row = self.subtitle_list.row(item)
         payload = self._item_payload(item)
         if payload.get("kind") == "screenshot":
-            shot_id = str(payload.get("screenshot_id") or "")
-            if shot_id:
-                self._edit_screenshot(shot_id)
             return
         segment_row = self._segment_row_from_item(item)
         if segment_row is None:

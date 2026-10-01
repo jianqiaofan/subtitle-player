@@ -18,6 +18,7 @@ TAG_COLORS: dict[str, tuple[str, str]] = {
     "已掌握": ("#1e3d32", "#9ddeb8"),
     "待复习": ("#5a3a1e", "#ffcc88"),
     "存疑": ("#5a2048", "#ffb0d0"),
+    "还没想好": ("#3a3a42", "#d0d0d8"),
     "真题": ("#5c2840", "#ffb3c7"),
     "得分点": ("#6b3a28", "#ffc2a8"),
     "技巧": ("#4a3820", "#f0d0a0"),
@@ -36,7 +37,7 @@ TAG_COLORS: dict[str, tuple[str, str]] = {
     "俚语": ("#4a3040", "#ffc0d8"),
     "文化背景": ("#3a4030", "#e0e8b0"),
     "名场面": ("#4a2840", "#ffc0b0"),
-    "截图": ("#3a2458", "#e2c6ff"),
+    "有截图": ("#3a2458", "#e2c6ff"),
 }
 CUSTOM_TAG_COLOR = ("#3a3a3a", "#dddddd")
 NOTE_COLOR = QColor("#ffd56a")

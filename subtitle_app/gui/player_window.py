@@ -128,6 +128,7 @@ from core.cloud_sync import (
 from core.playback_log import begin_playback_session, end_playback_session
 from core.screenshot_sync import sync_screenshots
 from core.screenshots import (
+    ManagedScreenshotFile,
     Screenshot,
     ScreenshotDocument,
     ScreenshotNote,
@@ -143,6 +144,7 @@ from core.screenshots import (
     screenshot_image_file,
     screenshot_image_path,
     sorted_screenshots,
+    suggested_screenshot_title,
 )
 from core.media_bundle import (
     apply_subtitle_choice,
@@ -209,7 +211,8 @@ from gui.styles import DARK_STYLE, PLAYER_LIST_STYLE, build_immersive_subtitle_p
 from gui.tag_filter_bar import TagFilterBar
 from gui.subtitle_edit_dialog import SubtitleEditDialog
 from gui.screenshot_dialog import ScreenshotDialog
-from gui.screenshot_preview import ScreenshotPreview
+from gui.screenshot_manage_dialog import ScreenshotManageDialog
+from gui.screenshot_viewer import ScreenshotViewerWindow
 from gui.subtitle_list_delegate import PAYLOAD_ROLE, SubtitleListDelegate
 from gui.subtitle_note_popup import NotePreviewPopup, SubtitleNoteDialog
 from gui.subtitle_tag_dialog import SubtitleTagDialog
@@ -226,6 +229,10 @@ class PlayerWindow(QMainWindow):
         self._media_path: Path | None = None
         self._segments: list[SubtitleSegment] = []
         self._screenshot_document = ScreenshotDocument()
+        self._screenshot_manage_dialog: ScreenshotManageDialog | None = None
+        self._manage_preview_entries: list[ManagedScreenshotFile] = []
+        self._manage_preview_docs: dict[str, ScreenshotDocument] = {}
+        self._manage_preview_shots: list[Screenshot] = []
         self._current_subtitle_row = -1
         self._seeking = False
         self._subtitle_auto_follow = True
@@ -402,6 +409,11 @@ class PlayerWindow(QMainWindow):
         bar.addWidget(self._open_dir_btn)
 
         bar.addStretch(1)
+
+        self._screenshot_manage_btn = QPushButton("截图管理")
+        self._screenshot_manage_btn.setToolTip("管理本机视频配套文件夹里的截图")
+        self._screenshot_manage_btn.clicked.connect(self._open_screenshot_manage)
+        bar.addWidget(self._screenshot_manage_btn)
 
         self._screenshot_preview_btn = QPushButton("截图预览")
         self._screenshot_preview_btn.setToolTip("查看本视频的截图")
@@ -591,11 +603,7 @@ class PlayerWindow(QMainWindow):
         self._onscreen_overlay.set_style(OnScreenSubtitleStyle.from_config(self._config))
         media_host_layout.addWidget(self._media_viewport, stretch=1)
 
-        self._screenshot_preview = ScreenshotPreview(self._media_host)
-        self._screenshot_preview.closed.connect(self._update_screenshot_actions)
-        self._screenshot_preview.style_changed.connect(self._save_screenshot_note_style)
-        self._screenshot_preview.box_changed.connect(self._save_screenshot_note_box)
-        self._screenshot_preview.export_requested.connect(self._export_preview_screenshot)
+        self._screenshot_viewer: ScreenshotViewerWindow | None = None
 
         self._subtitle_panel = QWidget()
         self._subtitle_panel.setObjectName("subtitlePanel")
@@ -918,10 +926,7 @@ class PlayerWindow(QMainWindow):
         )
         handle.show()
         handle.raise_()
-        preview = getattr(self, "_screenshot_preview", None)
-        if preview is not None and preview.isVisible():
-            preview.setGeometry(host.rect())
-            preview.raise_()
+        self._layout_screenshot_viewer()
         self._refresh_subtitle_list_item_layout()
         self._sync_onscreen_immersive_metrics()
 
@@ -1223,9 +1228,7 @@ class PlayerWindow(QMainWindow):
         self._sync_prompted_generation = 0
         self._timeline_step_user_set = False
         self._screenshot_document = load_screenshots(media_path)
-        preview = getattr(self, "_screenshot_preview", None)
-        if preview is not None and preview.isVisible():
-            preview.hide()
+        self._close_screenshot_viewer()
         self._resolve_subtitle_locations()
         self._set_subtitle_list_visible(True)
         self._persist_last_media_dir(media_path)
@@ -1898,20 +1901,45 @@ class PlayerWindow(QMainWindow):
             "compact": self._is_subtitle_list_compact(),
             "meta": f"[{self._format_clock(shot.time)}]",
             "body": title,
-            "tags": ["截图"],
+            "tags": ["有截图"],
             "note": "",
             "unmatched": False,
         }
         item.setData(PAYLOAD_ROLE, payload)
         item.setData(Qt.ItemDataRole.UserRole, float(shot.time))
         item.setText(title)
-        item.setToolTip("截图")
+        item.setToolTip("有截图")
 
     def _find_screenshot(self, shot_id: str) -> Screenshot | None:
+        if self._manage_preview_shots:
+            for shot in self._manage_preview_shots:
+                if shot.id == shot_id:
+                    return shot
         for shot in self._screenshot_document.entries:
             if shot.id == shot_id:
                 return shot
         return None
+
+    def _manage_preview_active(self) -> bool:
+        viewer = getattr(self, "_screenshot_viewer", None)
+        return bool(self._manage_preview_entries) and viewer is not None and viewer.isVisible()
+
+    def _manage_entry_for_shot(self, shot_id: str) -> ManagedScreenshotFile | None:
+        for entry in self._manage_preview_entries:
+            if entry.shot_id == shot_id:
+                return entry
+        return None
+
+    def _manage_doc_key(self, media_path: Path) -> str:
+        try:
+            return str(media_path.resolve())
+        except OSError:
+            return str(media_path)
+
+    def _clear_manage_preview_state(self) -> None:
+        self._manage_preview_entries = []
+        self._manage_preview_docs = {}
+        self._manage_preview_shots = []
 
     def _video_loaded(self) -> bool:
         return (
@@ -1921,9 +1949,6 @@ class PlayerWindow(QMainWindow):
 
     def _can_capture_screenshot(self) -> bool:
         if not self._video_loaded():
-            return False
-        preview = getattr(self, "_screenshot_preview", None)
-        if preview is not None and preview.isVisible():
             return False
         if self._open_frame_nudge or self._open_preview_should_pause:
             return False
@@ -1939,12 +1964,56 @@ class PlayerWindow(QMainWindow):
         video = self._video_loaded()
         preview_button.setEnabled(video and bool(self._screenshot_document.entries))
 
-    def _layout_screenshot_preview(self) -> None:
-        preview = getattr(self, "_screenshot_preview", None)
-        if preview is None or not preview.isVisible() or not hasattr(self, "_media_host"):
+    def _ensure_screenshot_viewer(self) -> ScreenshotViewerWindow:
+        viewer = getattr(self, "_screenshot_viewer", None)
+        if viewer is not None:
+            return viewer
+        viewer = ScreenshotViewerWindow(self._media_host)
+        viewer.closed.connect(self._on_screenshot_viewer_closed)
+        viewer.style_changed.connect(self._save_screenshot_note_style)
+        viewer.box_changed.connect(self._save_screenshot_note_box)
+        viewer.notes_changed.connect(self._save_screenshot_notes_content)
+        viewer.export_requested.connect(self._export_preview_screenshot)
+        viewer.edit_requested.connect(self._edit_screenshot)
+        viewer.jump_requested.connect(self._jump_to_screenshot)
+        self._screenshot_viewer = viewer
+        return viewer
+
+    def _on_screenshot_viewer_closed(self) -> None:
+        self._update_screenshot_actions()
+        dialog = self._screenshot_manage_dialog
+        if dialog is None:
+            self._clear_manage_preview_state()
             return
-        preview.setGeometry(self._media_host.rect())
-        preview.raise_()
+        dialog.refresh_current_folder()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _close_screenshot_viewer(self) -> None:
+        viewer = getattr(self, "_screenshot_viewer", None)
+        if viewer is None or not viewer.isVisible():
+            return
+        viewer.close()
+
+    def _layout_screenshot_viewer(self) -> None:
+        viewer = getattr(self, "_screenshot_viewer", None)
+        if viewer is None or not viewer.isVisible() or not hasattr(self, "_media_host"):
+            return
+        viewer.setGeometry(self._media_host.rect())
+        viewer.raise_()
+
+    def _jump_to_screenshot(self, shot_id: str) -> None:
+        entry = self._manage_entry_for_shot(shot_id) if self._manage_preview_active() else None
+        if entry is not None:
+            if self._media_path is None or self._manage_doc_key(entry.media_path) != self._manage_doc_key(
+                self._media_path
+            ):
+                return
+        shot = self._find_screenshot(shot_id)
+        if shot is None:
+            return
+        self._seek_to(float(shot.time), play=False)
 
     def _save_screenshot_note_style(
         self,
@@ -1972,15 +2041,32 @@ class PlayerWindow(QMainWindow):
         save_config(self._config)
 
     def _save_screenshot_note_box(self) -> None:
-        self._persist_screenshots()
+        if not self._persist_screenshots():
+            return
+        self._schedule_screenshot_sync(self._persist_target_media())
 
-    def _subtitle_title_at(self, seconds: float) -> str:
-        if not self._segments:
-            return ""
-        row = find_segment_index_at_time(self._segments, seconds)
-        if row < 0:
-            return ""
-        return " ".join((self._segments[row].text or "").replace("\r\n", "\n").split())
+    def _save_screenshot_notes_content(self) -> None:
+        if not self._persist_screenshots():
+            return
+        self._schedule_screenshot_sync(self._persist_target_media())
+
+    def _persist_target_media(self) -> Path | None:
+        if self._manage_preview_active():
+            viewer = self._screenshot_viewer
+            index = viewer.current_index() if viewer is not None else -1
+            if 0 <= index < len(self._manage_preview_entries):
+                return self._manage_preview_entries[index].media_path
+        return self._media_path
+
+    def _suggested_screenshot_title(self, seconds: float) -> str:
+        stem = self._media_path.stem if self._media_path is not None else ""
+        tags: list[str] = []
+        if self._segments:
+            row = find_segment_index_at_time(self._segments, seconds)
+            entry = self._tag_by_row.get(row) if row >= 0 else None
+            if entry is not None:
+                tags = list(entry.tags)
+        return suggested_screenshot_title(stem, tags)
 
     def _nearest_subtitle_row(self, seconds: float) -> int:
         nearest = -1
@@ -1998,14 +2084,14 @@ class PlayerWindow(QMainWindow):
         return nearest
 
     def _nearby_subtitle_picks(self, seconds: float) -> list[tuple[str, str, bool]]:
-        """离截图最近的一句，以及它上面 100 条、下面 100 条。"""
+        """离截图最近的一句，以及它上面 200 条、下面 200 条。"""
         if not self._segments:
             return []
         row = self._nearest_subtitle_row(seconds)
         if row < 0:
             return []
-        start = max(0, row - 100)
-        end = min(len(self._segments), row + 101)
+        start = max(0, row - 200)
+        end = min(len(self._segments), row + 201)
         picks: list[tuple[str, str, bool]] = []
         for index in range(start, end):
             segment = self._segments[index]
@@ -2035,11 +2121,12 @@ class PlayerWindow(QMainWindow):
         seconds = max(0.0, self._player.position() / 1000.0)
         dialog = ScreenshotDialog(
             self,
-            title=self._subtitle_title_at(seconds),
+            title=self._suggested_screenshot_title(seconds),
             notes=[],
             can_delete=False,
             anchor=self._video_widget,
             subtitles=self._nearby_subtitle_picks(seconds),
+            custom_tags=self._custom_tags_for_current_media(),
         )
         if dialog.exec() != dialog.DialogCode.Accepted or dialog.deleted():
             return
@@ -2074,10 +2161,24 @@ class PlayerWindow(QMainWindow):
 
     def _edit_screenshot(self, shot_id: str) -> None:
         shot = self._find_screenshot(shot_id)
-        if shot is None or self._media_path is None:
+        if shot is None:
             return
-        self._player.pause()
-        self._seek_to(shot.time, play=False)
+        manage_entry = self._manage_entry_for_shot(shot_id) if self._manage_preview_entries else None
+        media_path = manage_entry.media_path if manage_entry is not None else self._media_path
+        if media_path is None:
+            return
+        same_media = (
+            self._media_path is not None
+            and self._manage_doc_key(media_path) == self._manage_doc_key(self._media_path)
+        )
+        if same_media:
+            self._player.pause()
+            self._seek_to(shot.time, play=False)
+            subtitles = self._nearby_subtitle_picks(shot.time)
+            custom_tags = self._custom_tags_for_current_media()
+        else:
+            subtitles = []
+            custom_tags = custom_tags_for_media(media_path, None, [])
         dialog = ScreenshotDialog(
             self,
             title=shot.title,
@@ -2093,7 +2194,8 @@ class PlayerWindow(QMainWindow):
             ],
             can_delete=True,
             anchor=self._video_widget,
-            subtitles=self._nearby_subtitle_picks(shot.time),
+            subtitles=subtitles,
+            custom_tags=custom_tags,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
@@ -2107,15 +2209,19 @@ class PlayerWindow(QMainWindow):
         shot.title = title
         shot.notes = notes
         shot.updated_at = now_ms()
-        if not self._persist_screenshots():
+        if not self._persist_screenshots(media_path=media_path):
             return
-        self._refresh_after_screenshot_change(shot_id)
+        if same_media:
+            self._refresh_after_screenshot_change(shot_id)
+        else:
+            self._reload_open_screenshot_preview()
+            self._schedule_screenshot_sync(media_path)
 
     def _open_screenshot_menu(self, shot_id: str, pos) -> None:
         menu = QMenu(self)
         view_action = menu.addAction("查看截图")
-        edit_action = menu.addAction("编辑")
-        delete_action = menu.addAction("删除")
+        edit_action = menu.addAction("编辑截图")
+        delete_action = menu.addAction("删除截图")
         chosen = menu.exec(self.subtitle_list.mapToGlobal(pos))
         if chosen == view_action:
             self._open_screenshot_preview(shot_id)
@@ -2142,20 +2248,52 @@ class PlayerWindow(QMainWindow):
         self._delete_screenshot(shot_id)
 
     def _delete_screenshot(self, shot_id: str) -> None:
-        if self._media_path is None or self._find_screenshot(shot_id) is None:
+        if self._find_screenshot(shot_id) is None:
             return
-        preview = getattr(self, "_screenshot_preview", None)
-        if preview is not None:
-            preview.release_images()
+        manage_entry = self._manage_entry_for_shot(shot_id) if self._manage_preview_entries else None
+        media_path = manage_entry.media_path if manage_entry is not None else self._media_path
+        if media_path is None:
+            return
+        same_media = (
+            self._media_path is not None
+            and self._manage_doc_key(media_path) == self._manage_doc_key(self._media_path)
+        )
+        document = (
+            self._manage_preview_docs.get(self._manage_doc_key(media_path))
+            if manage_entry is not None
+            else self._screenshot_document
+        )
+        if document is None:
+            document = load_screenshots(media_path)
+            if manage_entry is not None:
+                self._manage_preview_docs[self._manage_doc_key(media_path)] = document
+        viewer = getattr(self, "_screenshot_viewer", None)
+        if viewer is not None:
+            viewer.release_images()
         try:
-            remove_screenshot(self._media_path, self._screenshot_document, shot_id)
+            remove_screenshot(media_path, document, shot_id)
         except OSError as exc:
-            self._screenshot_document = load_screenshots(self._media_path)
+            reloaded = load_screenshots(media_path)
+            if same_media:
+                self._screenshot_document = reloaded
+            if manage_entry is not None:
+                self._manage_preview_docs[self._manage_doc_key(media_path)] = reloaded
             self._error_box("截图", str(exc))
             return
-        if not self._screenshot_document.entries:
-            self._remember_screenshot_catalog_cleared()
-        self._refresh_after_screenshot_change("")
+        if same_media:
+            self._screenshot_document = document
+            if not self._screenshot_document.entries:
+                self._remember_screenshot_catalog_cleared()
+            self._refresh_after_screenshot_change("")
+        else:
+            self._manage_preview_entries = [
+                item for item in self._manage_preview_entries if item.shot_id != shot_id
+            ]
+            self._manage_preview_shots = [
+                item for item in self._manage_preview_shots if item.id != shot_id
+            ]
+            self._reload_open_screenshot_preview()
+            self._schedule_screenshot_sync(media_path)
 
     def _remember_screenshot_catalog_cleared(self) -> None:
         if self._media_path is None:
@@ -2169,15 +2307,32 @@ class PlayerWindow(QMainWindow):
             return
         mark_screenshot_catalog_cleared(username, digest, self._media_path)
 
-    def _persist_screenshots(self) -> bool:
-        if self._media_path is None:
+    def _persist_screenshots(self, media_path: Path | None = None) -> bool:
+        target = media_path or self._persist_target_media()
+        if target is None:
             return False
+        key = self._manage_doc_key(target)
+        document = self._manage_preview_docs.get(key) if self._manage_preview_entries else None
+        same_media = (
+            self._media_path is not None and self._manage_doc_key(self._media_path) == key
+        )
+        if document is None:
+            if same_media:
+                document = self._screenshot_document
+            else:
+                return False
         try:
-            save_screenshots(self._media_path, self._screenshot_document)
+            save_screenshots(target, document)
         except OSError as exc:
-            self._screenshot_document = load_screenshots(self._media_path)
+            reloaded = load_screenshots(target)
+            if same_media:
+                self._screenshot_document = reloaded
+            if key in self._manage_preview_docs:
+                self._manage_preview_docs[key] = reloaded
             self._error_box("截图", str(exc))
             return False
+        if same_media:
+            self._screenshot_document = document
         return True
 
     def _refresh_after_screenshot_change(self, shot_id: str) -> None:
@@ -2212,14 +2367,14 @@ class PlayerWindow(QMainWindow):
         self._update_screenshot_actions()
         self._reload_open_screenshot_preview()
 
-    def _schedule_screenshot_sync(self) -> None:
-        if self._media_path is None:
+    def _schedule_screenshot_sync(self, media_path: Path | None = None) -> None:
+        media = media_path or self._media_path
+        if media is None:
             return
         if not (self._config.cloud_username or "").strip() or not self._config.cloud_password:
             return
         if not self._network_looks_online():
             return
-        media = self._media_path
         account = self._account_snapshot()
 
         def work():
@@ -2228,7 +2383,7 @@ class PlayerWindow(QMainWindow):
             return sync_screenshots(client, media)
 
         task = CloudTask(work, self)
-        task.succeeded.connect(lambda changed, media=media: self._on_screenshot_sync(media, bool(changed)))
+        task.succeeded.connect(lambda changed, target=media: self._on_screenshot_sync(target, bool(changed)))
         task.failed.connect(lambda _message: None)
         task.finished.connect(task.deleteLater)
         self._screenshot_sync_task = task
@@ -2240,16 +2395,27 @@ class PlayerWindow(QMainWindow):
         self._reload_screenshots_from_disk()
 
     def _reload_open_screenshot_preview(self) -> None:
-        preview = getattr(self, "_screenshot_preview", None)
-        if preview is None or not preview.isVisible() or self._media_path is None:
+        viewer = getattr(self, "_screenshot_viewer", None)
+        if viewer is None or not viewer.isVisible():
+            return
+        if self._manage_preview_entries:
+            self._show_manage_preview_shots(viewer.current_shot_id(), viewer.current_index())
+            return
+        if self._media_path is None:
             return
         shots = sorted_screenshots(self._screenshot_document.entries)
         if not shots:
-            preview.close_preview()
+            viewer.close()
             return
-        preview.release_images()
-        index = min(preview.current_index(), len(shots) - 1)
-        preview.show_shots(
+        viewer.release_images()
+        current_id = viewer.current_shot_id()
+        index = min(viewer.current_index(), len(shots) - 1)
+        if current_id:
+            for shot_index, shot in enumerate(shots):
+                if shot.id == current_id:
+                    index = shot_index
+                    break
+        viewer.show_shots(
             shots,
             self._screenshot_preview_paths(shots),
             index,
@@ -2258,26 +2424,144 @@ class PlayerWindow(QMainWindow):
             color=str(self._config.screenshot_note_color),
             align=str(self._config.screenshot_note_align),
             background=str(self._config.screenshot_note_background),
+            extra_tags=self._custom_tags_for_current_media(),
         )
-        self._layout_screenshot_preview()
+        self._layout_screenshot_viewer()
+
+    def _open_screenshot_manage(self) -> None:
+        start_dir = str(self._media_path.parent) if self._media_path is not None else ""
+        dialog = ScreenshotManageDialog(self, config=self._config, start_dir=start_dir)
+        self._screenshot_manage_dialog = dialog
+        dialog.view_requested.connect(self._open_manage_screenshot_preview)
+        try:
+            dialog.exec()
+        finally:
+            self._screenshot_manage_dialog = None
+            if not self._manage_preview_active():
+                self._clear_manage_preview_state()
+
+    def _open_manage_screenshot_preview(
+        self,
+        entries: object,
+        index: int,
+    ) -> None:
+        items = [item for item in list(entries or []) if isinstance(item, ManagedScreenshotFile)]
+        if not items:
+            dialog = self._screenshot_manage_dialog
+            if dialog is not None:
+                dialog.show()
+            return
+        self._manage_preview_docs = {}
+        shots: list[Screenshot] = []
+        paths: list[Path] = []
+        kept: list[ManagedScreenshotFile] = []
+        for entry in items:
+            key = self._manage_doc_key(entry.media_path)
+            document = self._manage_preview_docs.get(key)
+            if document is None:
+                document = load_screenshots(entry.media_path)
+                self._manage_preview_docs[key] = document
+                if self._media_path is not None and key == self._manage_doc_key(self._media_path):
+                    self._screenshot_document = document
+            shot = next((item for item in document.entries if item.id == entry.shot_id), None)
+            if shot is None:
+                continue
+            image = screenshot_image_file(entry.media_path, shot.id) or entry.path
+            if not image.is_file():
+                continue
+            kept.append(entry)
+            shots.append(shot)
+            paths.append(image)
+        if not shots:
+            dialog = self._screenshot_manage_dialog
+            if dialog is not None:
+                dialog.show()
+            return
+        self._manage_preview_entries = kept
+        self._manage_preview_shots = shots
+        safe_index = max(0, min(int(index), len(shots) - 1))
+        viewer = self._ensure_screenshot_viewer()
+        viewer.show_shots(
+            shots,
+            paths,
+            safe_index,
+            opacity=float(self._config.screenshot_note_opacity),
+            font_size=float(self._config.screenshot_note_font_size),
+            color=str(self._config.screenshot_note_color),
+            align=str(self._config.screenshot_note_align),
+            background=str(self._config.screenshot_note_background),
+            extra_tags=self._custom_tags_for_current_media(),
+        )
+        self._layout_screenshot_viewer()
+        self._update_screenshot_actions()
+
+    def _show_manage_preview_shots(self, current_id: str, preferred_index: int) -> None:
+        viewer = getattr(self, "_screenshot_viewer", None)
+        if viewer is None:
+            return
+        if not self._manage_preview_entries:
+            viewer.close()
+            return
+        shots: list[Screenshot] = []
+        paths: list[Path] = []
+        kept: list[ManagedScreenshotFile] = []
+        for entry in self._manage_preview_entries:
+            key = self._manage_doc_key(entry.media_path)
+            document = self._manage_preview_docs.get(key)
+            if document is None:
+                document = load_screenshots(entry.media_path)
+                self._manage_preview_docs[key] = document
+            shot = next((item for item in document.entries if item.id == entry.shot_id), None)
+            if shot is None:
+                continue
+            image = screenshot_image_file(entry.media_path, shot.id) or entry.path
+            if not image.is_file():
+                continue
+            kept.append(entry)
+            shots.append(shot)
+            paths.append(image)
+        self._manage_preview_entries = kept
+        self._manage_preview_shots = shots
+        if not shots:
+            viewer.close()
+            return
+        index = max(0, min(preferred_index, len(shots) - 1))
+        if current_id:
+            for shot_index, shot in enumerate(shots):
+                if shot.id == current_id:
+                    index = shot_index
+                    break
+        viewer.release_images()
+        viewer.show_shots(
+            shots,
+            paths,
+            index,
+            opacity=float(self._config.screenshot_note_opacity),
+            font_size=float(self._config.screenshot_note_font_size),
+            color=str(self._config.screenshot_note_color),
+            align=str(self._config.screenshot_note_align),
+            background=str(self._config.screenshot_note_background),
+            extra_tags=self._custom_tags_for_current_media(),
+        )
+        self._layout_screenshot_viewer()
 
     def _open_screenshot_preview(self, shot_id: str | None = None) -> None:
         if not isinstance(shot_id, str):
             shot_id = ""
         if not self._video_loaded() or self._media_path is None:
             return
+        self._clear_manage_preview_state()
         shots = sorted_screenshots(self._screenshot_document.entries)
         if not shots:
             return
-        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self._player.pause()
         index = nearest_screenshot_index(shots, max(0.0, self._player.position() / 1000.0))
         if shot_id:
             for shot_index, shot in enumerate(shots):
                 if shot.id == shot_id:
                     index = shot_index
                     break
-        self._screenshot_preview.show_shots(
+        viewer = self._ensure_screenshot_viewer()
+        viewer.show_shots(
             shots,
             self._screenshot_preview_paths(shots),
             index,
@@ -2286,21 +2570,33 @@ class PlayerWindow(QMainWindow):
             color=str(self._config.screenshot_note_color),
             align=str(self._config.screenshot_note_align),
             background=str(self._config.screenshot_note_background),
+            extra_tags=self._custom_tags_for_current_media(),
         )
-        self._layout_screenshot_preview()
+        self._layout_screenshot_viewer()
         self._update_screenshot_actions()
 
     def _export_preview_screenshot(self) -> None:
-        preview = self._screenshot_preview
-        image = preview.render_composite()
+        from gui.tip_dialog import TIP_SCREENSHOT_EXPORT, show_tip_once
+
+        viewer = getattr(self, "_screenshot_viewer", None)
+        if viewer is None:
+            return
+        show_tip_once(
+            self,
+            TIP_SCREENSHOT_EXPORT,
+            "此功能是将当前笔记和图片截屏保存为一张普通图片。",
+            title="tip",
+            config=self._config,
+        )
+        image = viewer.render_composite()
         if image is None or image.isNull() or self._media_path is None:
-            QMessageBox.information(self, "普通截图", "这张截图没有图片，没法保存。")
+            QMessageBox.information(self, "截屏保存", "这张截图没有图片，没法保存。")
             return
         folder = self._config.resolved_screenshot_export_dir(self._media_path)
-        filename = screenshot_export_filename(self._media_path.stem, preview.current_title())
+        filename = screenshot_export_filename(viewer.current_title())
         chosen, _selected = QFileDialog.getSaveFileName(
             self,
-            "保存截图",
+            "截屏保存",
             str(folder / filename),
             "JPEG 图片 (*.jpg)",
         )
@@ -2310,7 +2606,7 @@ class PlayerWindow(QMainWindow):
         if path.suffix.lower() not in {".jpg", ".jpeg"}:
             path = path.with_suffix(".jpg")
         if not image.save(str(path), "JPG", 92):
-            QMessageBox.warning(self, "普通截图", "图片没有写入成功。")
+            QMessageBox.warning(self, "截屏保存", "图片没有写入成功。")
             return
         self._config.screenshot_export_dir = str(path.parent)
         save_config(self._config)
@@ -3097,9 +3393,6 @@ class PlayerWindow(QMainWindow):
             self._toggle_play()
 
     def _toggle_play(self) -> None:
-        preview = getattr(self, "_screenshot_preview", None)
-        if preview is not None and preview.isVisible():
-            preview.close_preview()
         if self._open_frame_nudge or self._open_preview_should_pause:
             self._release_open_preview(keep_playing=True)
             return
@@ -3289,7 +3582,7 @@ class PlayerWindow(QMainWindow):
             if event.type() == QEvent.Type.Resize:
                 if self._immersive_list_active:
                     self._layout_immersive_list_panel()
-                self._layout_screenshot_preview()
+                self._layout_screenshot_viewer()
             return super().eventFilter(obj, event)
         if obj in (self._audio_placeholder,):
             if (
@@ -4841,6 +5134,16 @@ class PlayerWindow(QMainWindow):
         event.acceptProposedAction()
 
     def closeEvent(self, event) -> None:
+        answer = QMessageBox.question(
+            self,
+            "退出确认",
+            "确定要退出当前字幕播放器应用程序吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
         self._note_playback_stopped(wait=True)
         self._offer_exit_sync(blocking=True)
         self._study_countdown_timer.stop()

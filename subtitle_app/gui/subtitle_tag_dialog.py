@@ -36,6 +36,8 @@ class SubtitleTagDialog(QDialog):
         custom_tags: list[str],
         row_count: int,
         notes_differ: bool,
+        intro: str | None = None,
+        show_note: bool = True,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("标签")
@@ -47,7 +49,9 @@ class SubtitleTagDialog(QDialog):
         selected = set(selected_tags)
 
         layout = QVBoxLayout(self)
-        if row_count > 1:
+        if intro:
+            layout.addWidget(QLabel(intro))
+        elif row_count > 1:
             layout.addWidget(QLabel(f"将把所选 {row_count} 条字幕设为下面这些标签"))
         else:
             layout.addWidget(QLabel("选择标签，确认后显示在这条字幕上"))
@@ -109,24 +113,27 @@ class SubtitleTagDialog(QDialog):
         scroll.setWidget(host)
         layout.addWidget(scroll, stretch=1)
 
-        layout.addWidget(QLabel("备注"))
+        self._apply_note = show_note and row_count == 1
         self.note_edit = QPlainTextEdit()
-        self.note_edit.setMinimumHeight(120)
-        self.note_edit.setPlaceholderText("可选。列表里只显示一行，鼠标移上去可看全文")
-        if row_count > 1 and notes_differ:
-            self.note_edit.setPlaceholderText("多条备注不同")
-        else:
-            self.note_edit.setPlainText(note)
-        layout.addWidget(self.note_edit)
-
-        self._apply_note = row_count == 1
         self.note_toggle = QCheckBox("把备注设为上面的内容")
-        self.note_toggle.setChecked(False)
-        self.note_toggle.toggled.connect(self._on_note_toggle)
-        if row_count > 1:
-            layout.addWidget(self.note_toggle)
-            self.note_edit.setEnabled(False)
+        if show_note:
+            layout.addWidget(QLabel("备注"))
+            self.note_edit.setMinimumHeight(120)
+            self.note_edit.setPlaceholderText("可选。列表里只显示一行，鼠标移上去可看全文")
+            if row_count > 1 and notes_differ:
+                self.note_edit.setPlaceholderText("多条备注不同")
+            else:
+                self.note_edit.setPlainText(note)
+            layout.addWidget(self.note_edit)
+            self.note_toggle.setChecked(False)
+            self.note_toggle.toggled.connect(self._on_note_toggle)
+            if row_count > 1:
+                layout.addWidget(self.note_toggle)
+                self.note_edit.setEnabled(False)
+            else:
+                self.note_toggle.hide()
         else:
+            self.note_edit.hide()
             self.note_toggle.hide()
 
         buttons = QDialogButtonBox(

@@ -19,10 +19,30 @@ TAG_FILE_SUFFIX = ".tags.json"
 TAG_DOCUMENT_VERSION = 1
 
 # 分类只用于选标签界面。存进文件的是标签名字，同名即同一个标签。
+# 「还没想好」固定在「通用」最后一位。这一类以后增删标签，也不能把它挤到中间。
+UNDECIDED_TAG = "还没想好"
+
+
+def _general_tags(*names: str) -> tuple[str, ...]:
+    ordered = [name for name in names if name != UNDECIDED_TAG]
+    ordered.append(UNDECIDED_TAG)
+    return tuple(ordered)
+
+
 TAG_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "通用",
-        ("重点", "难点", "易错", "新章节", "新页面", "重要断点", "已掌握", "待复习", "存疑"),
+        _general_tags(
+            "重点",
+            "难点",
+            "易错",
+            "新章节",
+            "新页面",
+            "重要断点",
+            "已掌握",
+            "待复习",
+            "存疑",
+        ),
     ),
     ("备考", ("真题", "得分点", "技巧", "必背", "口诀", "案例")),
     ("语言学习", ("单词", "语法", "发音", "短语", "地道表达")),

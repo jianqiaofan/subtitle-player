@@ -11,16 +11,23 @@ from core.screenshots import (
     Screenshot,
     ScreenshotDocument,
     ScreenshotNote,
+    append_screenshot_title_tags,
     default_note_slots,
     interleave_screenshots,
     load_screenshots,
+    note_ordinal_labels,
     remove_screenshot,
     save_screenshots,
+    scan_screenshots_under,
     screenshot_dir,
     screenshot_export_filename,
     screenshot_image_path,
+    suggested_screenshot_title,
+    tags_in_title,
+    title_has_known_tag,
 )
 from core.subtitle import SubtitleSegment
+from core.subtitle_tags import TAG_CATEGORIES, _general_tags
 
 
 def _segment(index: int, start: float) -> SubtitleSegment:
@@ -179,21 +186,220 @@ class ScreenshotStoreTests(unittest.TestCase):
             save_screenshots(media, loaded)
             self.assertIsNone(load_screenshots(media).entries[0].frame)
 
-    def test_export_filename_uses_video_and_title(self) -> None:
-        self.assertEqual(screenshot_export_filename("我的课程", "第一张"), "我的课程-第一张.jpg")
-        self.assertEqual(screenshot_export_filename("a:b", "c/d"), "a_b-c_d.jpg")
-        self.assertEqual(screenshot_export_filename("  ", ""), "视频-截图.jpg")
+    def test_export_filename_uses_zm_prefix_and_title(self) -> None:
+        self.assertEqual(screenshot_export_filename("第一张"), "zm-第一张.jpg")
+        self.assertEqual(screenshot_export_filename("c/d"), "zm-c_d.jpg")
+        self.assertEqual(screenshot_export_filename(""), "zm-截图.jpg")
+        self.assertEqual(screenshot_export_filename("  "), "zm-截图.jpg")
+
+    def test_scan_screenshots_under_uses_video_and_json(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            media = root / "课程.mp4"
+            nested_dir = root / "子目录"
+            nested_dir.mkdir()
+            nested_media = nested_dir / "练习.mp4"
+            media.write_bytes(b"video")
+            nested_media.write_bytes(b"video")
+            (root / "zm-无关.jpg").write_bytes(b"jpg")
+
+            save_screenshots(
+                media,
+                ScreenshotDocument(
+                    entries=[
+                        Screenshot(
+                            id="aaaaaaaaaaaa",
+                            title="第一张",
+                            time=1.0,
+                            frame=1,
+                            image="aaaaaaaaaaaa.png",
+                            created_at=100,
+                            updated_at=200,
+                            notes=[],
+                        )
+                    ]
+                ),
+            )
+            image = screenshot_image_path(media, "aaaaaaaaaaaa")
+            image.write_bytes(b"png")
+
+            save_screenshots(
+                nested_media,
+                ScreenshotDocument(
+                    entries=[
+                        Screenshot(
+                            id="bbbbbbbbbbbb",
+                            title="笔记图",
+                            time=2.0,
+                            frame=2,
+                            image="bbbbbbbbbbbb.png",
+                            created_at=300,
+                            updated_at=400,
+                            notes=[ScreenshotNote("cccccccccccc", "一条笔记", 300, 400)],
+                        )
+                    ]
+                ),
+            )
+            nested_image = screenshot_image_path(nested_media, "bbbbbbbbbbbb")
+            nested_image.write_bytes(b"png")
+
+            # 只有 json、没有对应视频的不算
+            orphan_bundle = root / "失踪.mp4.data" / "screenshot"
+            orphan_bundle.mkdir(parents=True)
+            (orphan_bundle / "screenshots.json").write_text(
+                '{"version":1,"screenshots":[]}',
+                encoding="utf-8",
+            )
+
+            found = scan_screenshots_under(root)
+            self.assertEqual(
+                [
+                    (
+                        item.title,
+                        item.relative_path,
+                        item.created_at,
+                        item.modified_at,
+                        item.note_count,
+                    )
+                    for item in found
+                ],
+                [
+                    ("第一张", f"课程.mp4.data/screenshot/{image.name}", 100, 200, 0),
+                    ("笔记图", f"子目录/练习.mp4.data/screenshot/{nested_image.name}", 300, 400, 1),
+                ],
+            )
+
+            from core.screenshots import paginate_screenshots_by_path
+
+            path_page, path_index, path_pages = paginate_screenshots_by_path(found, 0)
+            self.assertEqual(path_pages, 2)
+            self.assertEqual(path_index, 0)
+            self.assertEqual([item.title for item in path_page], ["第一张"])
+            self.assertEqual(
+                [item.title for item in paginate_screenshots_by_path(found, 1)[0]],
+                ["笔记图"],
+            )
+
+            # 时间缺失时用图片保存时间补全
+            bad_media = root / "补全.mp4"
+            bad_media.write_bytes(b"video")
+            save_screenshots(
+                bad_media,
+                ScreenshotDocument(
+                    entries=[
+                        Screenshot(
+                            id="dddddddddddd",
+                            title="补时间",
+                            time=3.0,
+                            frame=3,
+                            image="dddddddddddd.png",
+                            created_at=0,
+                            updated_at=0,
+                            notes=[],
+                        )
+                    ]
+                ),
+            )
+            bad_image = screenshot_image_path(bad_media, "dddddddddddd")
+            bad_image.write_bytes(b"png")
+            stamped = next(item for item in scan_screenshots_under(root) if item.shot_id == "dddddddddddd")
+            self.assertGreater(stamped.created_at, 0)
+            self.assertGreater(stamped.modified_at, 0)
+
+            # 广度优先：同层先于更深一层；同层按视频名排序
+            deep_dir = nested_dir / "更深层"
+            deep_dir.mkdir()
+            deep_media = deep_dir / "深层.mp4"
+            deep_media.write_bytes(b"video")
+            save_screenshots(
+                deep_media,
+                ScreenshotDocument(
+                    entries=[
+                        Screenshot(
+                            id="eeeeeeeeeeee",
+                            title="深层图",
+                            time=4.0,
+                            frame=4,
+                            image="eeeeeeeeeeee.png",
+                            created_at=500,
+                            updated_at=600,
+                            notes=[],
+                        )
+                    ]
+                ),
+            )
+            screenshot_image_path(deep_media, "eeeeeeeeeeee").write_bytes(b"png")
+            ordered = [item.title for item in scan_screenshots_under(root)]
+            # 根目录内按视频文件名排序：补全.mp4 在 课程.mp4 前
+            self.assertEqual(ordered[:3], ["补时间", "第一张", "笔记图"])
+            self.assertIn("深层图", ordered)
+            self.assertLess(ordered.index("笔记图"), ordered.index("深层图"))
+
+    def test_suggested_title_uses_filename_and_tags(self) -> None:
+        self.assertEqual(suggested_screenshot_title("考试介绍", ["真题"]), "考试介绍-真题")
+        self.assertEqual(
+            suggested_screenshot_title("考试介绍", ["真题", "待复习"]),
+            "考试介绍-待复习-真题",
+        )
+        self.assertEqual(suggested_screenshot_title("考试介绍", []), "考试介绍")
+        self.assertEqual(suggested_screenshot_title("  ", []), "视频")
+
+    def test_chosen_tags_are_appended_with_hyphens(self) -> None:
+        self.assertEqual(append_screenshot_title_tags("考试介绍-真题", ["重点", "易错"]), "考试介绍-真题-重点-易错")
+        self.assertEqual(append_screenshot_title_tags("", ["真题", "重点"]), "重点-真题")
+        self.assertEqual(append_screenshot_title_tags("考试介绍-", ["真题"]), "考试介绍-真题")
+
+    def test_title_without_a_known_tag_is_detected(self) -> None:
+        self.assertFalse(title_has_known_tag("考试介绍"))
+        self.assertTrue(title_has_known_tag("考试介绍-真题"))
+        self.assertTrue(title_has_known_tag("考试介绍-还没想好"))
+        self.assertTrue(title_has_known_tag("考试介绍-课堂", ["课堂"]))
+        self.assertFalse(title_has_known_tag("考试介绍-课堂"))
+        self.assertEqual(tags_in_title("考试介绍-真题-重点"), ["真题", "重点"])
+        self.assertEqual(tags_in_title("考试介绍-课堂", ["课堂"]), ["课堂"])
+
+    def test_undecided_tag_stays_last_in_general_category(self) -> None:
+        general = dict(TAG_CATEGORIES)["通用"]
+        self.assertEqual(general[-1], "还没想好")
+        self.assertLess(general.index("存疑"), general.index("还没想好"))
+        self.assertEqual(_general_tags("重点", "还没想好", "新标签")[-1], "还没想好")
+
+    def test_note_labels_follow_creation_order(self) -> None:
+        older = ScreenshotNote("aaaaaaaaaaaa", "先", 100, 500)
+        newer = ScreenshotNote("bbbbbbbbbbbb", "后", 200, 200)
+        alone = ScreenshotNote("cccccccccccc", "单", 300, 300)
+        self.assertEqual(note_ordinal_labels([alone]), {})
+        self.assertEqual(
+            note_ordinal_labels([newer, older]),
+            {"aaaaaaaaaaaa": "Note 1", "bbbbbbbbbbbb": "Note 2"},
+        )
+
+    def test_reused_style_keeps_position(self) -> None:
+        from gui.note_overlay import apply_reused_frame_style
+
+        target = NoteFrame(x=0.1, y=0.2, width=0.3, height=0.25, opacity=0.5, font=0.04, color="#FFFFFF", background="#000000")
+        source = NoteFrame(x=0.5, y=0.6, width=0.4, height=0.35, opacity=0.9, font=0.08, color="#E53935", background="#FFFFFF", align="left")
+        apply_reused_frame_style(target, source)
+        self.assertEqual(target.x, 0.1)
+        self.assertEqual(target.y, 0.2)
+        self.assertEqual(target.width, 0.4)
+        self.assertEqual(target.height, 0.35)
+        self.assertEqual(target.opacity, 0.9)
+        self.assertEqual(target.font, 0.08)
+        self.assertEqual(target.color, "#E53935")
+        self.assertEqual(target.background, "#FFFFFF")
+        self.assertEqual(target.align, "left")
 
 
 class ScreenshotCompositeTests(unittest.TestCase):
-    def test_visible_notes_are_painted_and_hidden_notes_are_not(self) -> None:
+    def test_visible_notes_are_painted_on_composite(self) -> None:
         import os
 
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PyQt6.QtGui import QColor, QPixmap
         from PyQt6.QtWidgets import QApplication
 
-        from gui.screenshot_preview import ScreenshotPreview
+        from gui.screenshot_viewer import ScreenshotViewerWindow
 
         if QApplication.instance() is None:
             ScreenshotCompositeTests._app = QApplication([])
@@ -205,32 +411,37 @@ class ScreenshotCompositeTests(unittest.TestCase):
             left = ScreenshotNote(
                 "aaaaaaaaaaaa",
                 "左",
-                1,
-                1,
+                1_700_000_000_000,
+                1_700_000_000_000,
                 NoteFrame(x=0.0, y=0.2, width=0.4, height=0.6, opacity=1.0, background="#FFFFFF", font=0.04),
             )
             right = ScreenshotNote(
                 "bbbbbbbbbbbb",
                 "右",
-                1,
-                1,
+                1_700_000_000_000,
+                1_700_000_000_000,
                 NoteFrame(x=0.6, y=0.2, width=0.4, height=0.6, opacity=1.0, background="#FFFFFF", font=0.04),
             )
-            shot = Screenshot("c1c1c1c1c1c1", "标题", 1.0, 1, "c1c1c1c1c1c1.png", 1, 1, [left, right])
-            preview = ScreenshotPreview()
-            preview.resize(640, 360)
-            preview.show_shots([shot], [image_path], 0, opacity=1, font_size=0.04, color="#1A1A1A", align="center", background="#FFFFFF")
-            both = preview.render_composite()
+            shot = Screenshot("c1c1c1c1c1c1", "标题-真题", 1.0, 1, "c1c1c1c1c1c1.png", 1_700_000_000_000, 1_700_000_000_000, [left, right])
+            viewer = ScreenshotViewerWindow()
+            viewer.resize(640, 360)
+            viewer.show_shots(
+                [shot],
+                [image_path],
+                0,
+                opacity=1,
+                font_size=0.04,
+                color="#1A1A1A",
+                align="center",
+                background="#FFFFFF",
+            )
+            both = viewer.render_composite()
             self.assertIsNotNone(both)
             assert both is not None
             self.assertTrue(self._is_white(both.pixelColor(40, 50)))
             self.assertTrue(self._is_white(both.pixelColor(160, 50)))
-            preview._show_notes(["aaaaaaaaaaaa"])
-            only_left = preview.render_composite()
-            self.assertIsNotNone(only_left)
-            assert only_left is not None
-            self.assertTrue(self._is_white(only_left.pixelColor(40, 50)))
-            self.assertTrue(self._is_red(only_left.pixelColor(160, 50)))
+            self.assertEqual(viewer.current_title(), "标题-真题")
+            viewer.close()
 
     @staticmethod
     def _is_white(color) -> bool:

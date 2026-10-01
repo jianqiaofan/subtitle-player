@@ -9,12 +9,14 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from core.media_bundle import bundle_dir
 from core.subtitle import SubtitleSegment
+from core.subtitle_tags import PRESET_TAGS, order_tags
 
 SCREENSHOT_DIR_NAME = "screenshot"
 SCREENSHOT_FILE = "screenshots.json"
@@ -139,19 +141,237 @@ def screenshot_document_path(media_path: Path) -> Path:
     return screenshot_dir(media_path) / SCREENSHOT_FILE
 
 
-def screenshot_export_filename(video_name: str, title: str) -> str:
-    """预览合成图的默认文件名：视频名-截图标题.jpg。"""
-    video = _export_name_part(video_name, "视频")
+def _known_title_tags(extra_tags: list[str] | None = None) -> set[str]:
+    known = set(PRESET_TAGS)
+    for tag in extra_tags or []:
+        cleaned = str(tag).strip()
+        if cleaned:
+            known.add(cleaned)
+    return known
+
+
+def tags_in_title(title: str, extra_tags: list[str] | None = None) -> list[str]:
+    """标题里按短横线拆开后、属于已知标签的那些段，按出现顺序去重。"""
+    known = _known_title_tags(extra_tags)
+    found: list[str] = []
+    seen: set[str] = set()
+    for part in str(title or "").split("-"):
+        name = part.strip()
+        if not name or name not in known or name in seen:
+            continue
+        seen.add(name)
+        found.append(name)
+    return found
+
+
+def title_has_known_tag(title: str, extra_tags: list[str] | None = None) -> bool:
+    """标题被短横线分开的某一段是已知标签时，算已经给主题打过标签。"""
+    return bool(tags_in_title(title, extra_tags))
+
+
+def suggested_screenshot_title(video_name: str, tags: list[str]) -> str:
+    """新建截图时的建议标题：文件名，当前字幕有标签时再接上「-标签」。"""
+    stem = " ".join(str(video_name or "").split()) or "视频"
+    return append_screenshot_title_tags(stem, tags)
+
+
+def append_screenshot_title_tags(title: str, tags: list[str]) -> str:
+    """把选中的标签接到标题后面，多个标签之间用短横线隔开。"""
+    names = order_tags([str(tag) for tag in tags])
+    if not names:
+        return title.strip()
+    suffix = "-".join(names)
+    base = title.strip()
+    if not base:
+        return suffix
+    if base.endswith("-"):
+        return f"{base}{suffix}"
+    return f"{base}-{suffix}"
+
+
+def screenshot_export_filename(title: str) -> str:
+    """预览合成图的默认文件名：zm-截图标题.jpg（zm = 字幕，方便筛选）。"""
     shot = _export_name_part(title, "截图")
-    stem = f"{video}-{shot}".rstrip(" .")
+    stem = f"zm-{shot}".rstrip(" .")
     if len(stem) > 180:
         stem = stem[:180].rstrip(" .")
-    return f"{stem or '截图'}.jpg"
+    return f"{stem or 'zm-截图'}.jpg"
+
+
+@dataclass(frozen=True)
+class ManagedScreenshotFile:
+    """某部视频在配套文件夹里登记过的截图图片。"""
+
+    path: Path
+    relative_path: str
+    title: str
+    created_at: float
+    modified_at: float
+    media_path: Path
+    shot_id: str
+    note_count: int = 0
+
+
+def managed_screenshot_path_key(relative_path: str) -> str:
+    """按路径分页时，同一目录下的截图归为一页。"""
+    parent = Path(str(relative_path or "")).parent.as_posix()
+    return parent if parent not in {"", "."} else "."
+
+
+def _image_save_times(path: Path) -> tuple[float, float]:
+    """图片文件的创建/保存时间；保存时间优先用 mtime。"""
+    st = path.stat()
+    modified = float(st.st_mtime)
+    created = getattr(st, "st_birthtime", None)
+    if created is None:
+        created = st.st_ctime
+    created = float(created)
+    if created <= 0:
+        created = modified
+    if modified <= 0:
+        modified = created
+    return created, modified
+
+
+def _coerce_timestamp(value: object, fallback: float) -> float:
+    try:
+        stamp = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+    if stamp <= 0:
+        return fallback
+    try:
+        datetime.fromtimestamp(stamp)
+    except (OverflowError, OSError, ValueError):
+        return fallback
+    return stamp
+
+
+def scan_screenshots_under(root: Path) -> list[ManagedScreenshotFile]:
+    """扫描文件夹及其子文件夹：有对应视频，且 screenshots.json 里登记过的截图。
+
+    按广度优先：先当前文件夹里的视频截图，再第二层子文件夹，再第三层……
+    「截屏保存」导出的普通 JPEG 不在此范围。
+    """
+    from core.config import MEDIA_EXTENSIONS
+    from core.media_bundle import is_bundle_dir
+
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        return []
+
+    found: list[ManagedScreenshotFile] = []
+    seen_media: set[Path] = set()
+    queue: deque[Path] = deque([root])
+
+    while queue:
+        folder = queue.popleft()
+        try:
+            children = list(folder.iterdir())
+        except OSError:
+            continue
+        children.sort(key=lambda item: item.name.lower())
+        subdirs: list[Path] = []
+        for item in children:
+            if item.is_dir():
+                # 配套 .data 不算用户目录层级，不往里继续找视频
+                if is_bundle_dir(item):
+                    continue
+                subdirs.append(item)
+                continue
+            if not item.is_file() or item.suffix.lower() not in MEDIA_EXTENSIONS:
+                continue
+            try:
+                media_resolved = item.resolve()
+            except OSError:
+                continue
+            if media_resolved in seen_media:
+                continue
+            seen_media.add(media_resolved)
+            found.extend(_managed_shots_for_media(item, root_resolved))
+        queue.extend(subdirs)
+
+    return found
+
+
+def _managed_shots_for_media(
+    media: Path,
+    root_resolved: Path,
+) -> list[ManagedScreenshotFile]:
+    entries: list[ManagedScreenshotFile] = []
+    document = load_screenshots(media)
+    for shot in document.entries:
+        image = screenshot_image_file(media, shot.id)
+        if image is None:
+            continue
+        try:
+            relative = image.resolve().relative_to(root_resolved)
+        except ValueError:
+            continue
+        try:
+            file_created, file_modified = _image_save_times(image)
+        except OSError:
+            file_created = file_modified = 0.0
+        title = str(shot.title or "").strip() or "截图"
+        entries.append(
+            ManagedScreenshotFile(
+                path=image,
+                relative_path=relative.as_posix(),
+                title=title,
+                created_at=_coerce_timestamp(shot.created_at, file_created),
+                modified_at=_coerce_timestamp(shot.updated_at, file_modified),
+                media_path=media,
+                shot_id=shot.id,
+                note_count=len(list(shot.notes or [])),
+            )
+        )
+    return entries
+
+
+def paginate_screenshots_by_path(
+    entries: list[ManagedScreenshotFile],
+    page_index: int,
+) -> tuple[list[ManagedScreenshotFile], int, int]:
+    """按路径分页：同一目录下的截图在同一页。"""
+    if not entries:
+        return [], 0, 1
+    groups: list[list[ManagedScreenshotFile]] = []
+    current_key = None
+    bucket: list[ManagedScreenshotFile] = []
+    for item in entries:
+        key = managed_screenshot_path_key(item.relative_path)
+        if current_key is None:
+            current_key = key
+            bucket = [item]
+            continue
+        if key == current_key:
+            bucket.append(item)
+            continue
+        groups.append(bucket)
+        current_key = key
+        bucket = [item]
+    if bucket:
+        groups.append(bucket)
+    pages = max(1, len(groups))
+    index = max(0, min(int(page_index), pages - 1))
+    return list(groups[index]), index, pages
 
 
 def _export_name_part(text: str, fallback: str) -> str:
     cleaned = _EXPORT_FILENAME_CHARS.sub("_", " ".join(str(text or "").split()))
     return cleaned.strip(" .") or fallback
+
+
+def note_ordinal_labels(notes: list[ScreenshotNote]) -> dict[str, str]:
+    """多条笔记时按创建时间编号为 Note 1、Note 2…；只有一条时不加标题。"""
+    if len(notes) <= 1:
+        return {}
+    ordered = sorted(notes, key=lambda note: (int(note.created_at), note.id))
+    return {note.id: f"Note {index}" for index, note in enumerate(ordered, start=1)}
 
 
 def screenshot_image_path(media_path: Path, shot_id: str) -> Path:

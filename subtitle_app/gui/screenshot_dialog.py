@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMenu,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -26,7 +27,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core.screenshots import ScreenshotNote, format_local_time, new_screenshot_id, now_ms
+from core.screenshots import (
+    ScreenshotNote,
+    append_screenshot_title_tags,
+    format_local_time,
+    new_screenshot_id,
+    now_ms,
+    title_has_known_tag,
+)
+from gui.subtitle_tag_dialog import SubtitleTagDialog
 
 _CENTER_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 _CENTER_COLOR = QColor("#7a4eb5")
@@ -199,6 +208,7 @@ class ScreenshotDialog(QDialog):
         can_delete: bool,
         anchor: QWidget | None = None,
         subtitles: list[tuple[str, str, bool]] | None = None,
+        custom_tags: list[str] | None = None,
     ) -> None:
         super().__init__(parent)
         self._deleted = False
@@ -214,6 +224,7 @@ class ScreenshotDialog(QDialog):
         self._tags: list[_NoteTag] = []
         self._insert_subtitle_button: QPushButton | None = None
         self._current_pick_row = -1
+        self._custom_tags = list(custom_tags or [])
         subtitle_rows = list(subtitles or [])
 
         dialog_title = "创建/编辑截图"
@@ -272,11 +283,22 @@ class ScreenshotDialog(QDialog):
         self._title_edit.setText(title)
         self._title_edit.setMinimumHeight(36)
         title_row.addWidget(self._title_edit, stretch=1)
+        choose_tags = QPushButton("选择标签")
+        choose_tags.clicked.connect(lambda: self._choose_title_tags())
+        title_row.addWidget(choose_tags)
         layout.addLayout(title_row)
 
         label_row = QHBoxLayout()
         label_row.setSpacing(12)
-        label_row.addWidget(QLabel("从笔记中提取"), stretch=1)
+        extract_header = QHBoxLayout()
+        extract_header.setSpacing(8)
+        extract_header.addWidget(QLabel("从笔记中提取"))
+        extract_header.addStretch(1)
+        self._center_button = QPushButton("回到中心")
+        self._center_button.setEnabled(False)
+        self._center_button.clicked.connect(self._scroll_to_center_subtitle)
+        extract_header.addWidget(self._center_button)
+        label_row.addLayout(extract_header, stretch=1)
         label_row.addWidget(QLabel("笔记内容"), stretch=1)
         layout.addLayout(label_row)
 
@@ -308,6 +330,7 @@ class ScreenshotDialog(QDialog):
             if current:
                 self._current_pick_row = index
             self._subtitle_list.addItem(item)
+        self._center_button.setEnabled(self._current_pick_row >= 0)
         self._note_edit = QPlainTextEdit()
         self._note_edit.setPlaceholderText("笔记内容")
         self._note_edit.setMinimumWidth(280)
@@ -384,7 +407,7 @@ class ScreenshotDialog(QDialog):
         cancel_button.clicked.connect(self.reject)
         save_button = QPushButton("保存")
         save_button.setDefault(True)
-        save_button.clicked.connect(self.accept)
+        save_button.clicked.connect(self._save_screenshot)
         self._dialog_actions = QWidget()
         self._dialog_actions.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         dialog_actions_layout = QHBoxLayout(self._dialog_actions)
@@ -418,12 +441,7 @@ class ScreenshotDialog(QDialog):
         if hasattr(self, "_drag_hint"):
             self._update_drag_hint()
         if self._subtitle_list is not None and self._current_pick_row >= 0:
-            current = self._subtitle_list.item(self._current_pick_row)
-            if current is not None:
-                self._subtitle_list.scrollToItem(
-                    current,
-                    QListWidget.ScrollHint.PositionAtCenter,
-                )
+            self._scroll_to_center_subtitle()
         if self._placed or self._anchor is None:
             return
         self._placed = True
@@ -455,11 +473,84 @@ class ScreenshotDialog(QDialog):
         self._drag_offset = None
         super().mouseReleaseEvent(event)
 
+    def _scroll_to_center_subtitle(self) -> None:
+        listing = self._subtitle_list
+        if listing is None or self._current_pick_row < 0:
+            return
+        current = listing.item(self._current_pick_row)
+        if current is None:
+            return
+        listing.scrollToItem(current, QListWidget.ScrollHint.PositionAtCenter)
+
     def deleted(self) -> bool:
         return self._deleted
 
     def title_text(self) -> str:
         return self._title_edit.text().strip()
+
+    def _save_screenshot(self) -> None:
+        if self._title_has_tag():
+            self.accept()
+            return
+        choice = self._ask_for_title_tag()
+        if choice == "tag":
+            self._choose_title_tags(save_after=True)
+            return
+        if choice == "skip":
+            self.accept()
+
+    def _title_has_tag(self) -> bool:
+        return title_has_known_tag(self._title_edit.text(), self._custom_tags)
+
+    def _ask_for_title_tag(self) -> str:
+        box = QMessageBox(self)
+        box.setWindowTitle("截图标题")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("系统检测到你没有为此截图主题备注标签，这将很不利于后期复习整理，你确定不需要加上标签备注吗？")
+        box.setStyleSheet(
+            """
+            QMessageBox { background-color: #2b2b2b; }
+            QLabel { color: #f3f3f3; background: transparent; }
+            QPushButton {
+                color: #ffffff;
+                background-color: #3c3c3c;
+                border: 1px solid rgba(255, 255, 255, 0.35);
+                border-radius: 4px;
+                padding: 4px 14px;
+                min-width: 88px;
+            }
+            """
+        )
+        tag_button = box.addButton("我要打标签", QMessageBox.ButtonRole.AcceptRole)
+        skip_button = box.addButton("不需要标签", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(tag_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is tag_button:
+            return "tag"
+        if clicked is skip_button:
+            return "skip"
+        return ""
+
+    def _choose_title_tags(self, save_after: bool = False) -> None:
+        dialog = SubtitleTagDialog(
+            self,
+            selected_tags=[],
+            note="",
+            custom_tags=self._custom_tags,
+            row_count=1,
+            notes_differ=False,
+            intro="选择标签，确认后接到标题后面",
+            show_note=False,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        chosen = dialog.tags()
+        if not chosen:
+            return
+        self._title_edit.setText(append_screenshot_title_tags(self._title_edit.text(), chosen))
+        if save_after:
+            self.accept()
 
     def notes(self) -> list[ScreenshotNote]:
         return [

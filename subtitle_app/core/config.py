@@ -147,6 +147,12 @@ class AppConfig:
     tag_extract_dest_dir: str = ""
     # 预览里把底图和笔记合成图片后，上次保存到的文件夹
     screenshot_export_dir: str = ""
+    # 截图管理对话框上次选择的文件夹
+    screenshot_manage_dir: str = ""
+    # 截图管理：最近打开过的文件夹
+    recent_screenshot_manage_dirs: list[str] = field(default_factory=list)
+    # 本机已勾选「下回不再提醒」的 tip_id 列表
+    dismissed_tips: list[str] = field(default_factory=list)
     # 云同步账号。同一用户名在不同设备上是同一个用户。
     cloud_server_url: str = "https://subtitle.gcsfg.work"
     cloud_username: str = ""
@@ -408,6 +414,31 @@ def load_config() -> AppConfig:
     cfg.tag_extract_source_dir = str(cfg.tag_extract_source_dir or "").strip()
     cfg.tag_extract_dest_dir = str(cfg.tag_extract_dest_dir or "").strip()
     cfg.screenshot_export_dir = str(cfg.screenshot_export_dir or "").strip()
+    cfg.screenshot_manage_dir = str(cfg.screenshot_manage_dir or "").strip()
+    raw_manage_dirs = getattr(cfg, "recent_screenshot_manage_dirs", None)
+    manage_dirs: list[str] = []
+    if isinstance(raw_manage_dirs, list):
+        for item in raw_manage_dirs:
+            path = str(item or "").strip()
+            if path and path not in manage_dirs:
+                manage_dirs.append(path)
+            if len(manage_dirs) >= 15:
+                break
+    remembered_manage = cfg.screenshot_manage_dir
+    if remembered_manage and remembered_manage not in manage_dirs:
+        manage_dirs.insert(0, remembered_manage)
+        manage_dirs = manage_dirs[:15]
+    cfg.recent_screenshot_manage_dirs = manage_dirs
+    raw_tips = getattr(cfg, "dismissed_tips", None)
+    tips: list[str] = []
+    if isinstance(raw_tips, list):
+        for item in raw_tips:
+            tip_id = str(item or "").strip()
+            if tip_id and tip_id not in tips:
+                tips.append(tip_id)
+            if len(tips) >= 200:
+                break
+    cfg.dismissed_tips = tips
     cfg.cloud_server_url = str(cfg.cloud_server_url or "").strip() or "https://subtitle.gcsfg.work"
     cfg.cloud_username = str(cfg.cloud_username or "").strip()
     cfg.cloud_password = str(cfg.cloud_password or "")

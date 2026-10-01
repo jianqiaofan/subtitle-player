@@ -1,20 +1,23 @@
 """笔记文本框的样式面板。
 
 这个面板只编辑一份样式，不关心样式属于哪条笔记。
-宿主决定当前激活的是哪一条，把面板放在它旁边，并在样式变化时写回去。
+宿主决定当前激活的是哪一条，并在样式变化时写回去。
+面板默认出现在底图中央；可用标题栏拖动，下次仍出现在拖过后的位置。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PyQt6.QtCore import QRect, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QRect, QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSlider,
+    QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -45,6 +48,16 @@ QPushButton {
     padding: 2px 8px;
 }
 QPushButton:hover { background-color: rgba(255, 255, 255, 0.16); }
+QToolButton#noteStyleClose {
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 0;
+}
+QToolButton#noteStyleClose:hover {
+    background-color: rgba(255, 255, 255, 0.14);
+    border-radius: 4px;
+}
 """
 
 
@@ -57,30 +70,13 @@ class NoteDisplayStyle:
     align: str = "center"
 
 
-class _ClickText(QLabel):
-    """和普通标签同一套颜色，但可以点击。"""
-
-    clicked = pyqtSignal()
-
-    def __init__(self, text: str, parent: QWidget | None = None) -> None:
-        super().__init__(text, parent)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def mousePressEvent(self, event) -> None:  # noqa: N802
-        event.accept()
-
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
-            self.clicked.emit()
-        super().mouseReleaseEvent(event)
-
-
 class NoteStylePanel(QFrame):
     """调节文本框背景、透明度、字号、文字颜色和对齐。"""
 
     edited = pyqtSignal()
     committed = pyqtSignal()
     dismissed = pyqtSignal()
+    moved = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -89,18 +85,31 @@ class NoteStylePanel(QFrame):
         self.setStyleSheet(_PANEL_STYLE)
         self.setFixedWidth(208)
         self._loading = False
+        self._drag_offset: QPoint | None = None
+        self._header_height = 28
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 10)
         layout.setSpacing(6)
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
         self._title = QLabel("这条笔记")
+        self._title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._title.setToolTip("按住标题栏可拖动面板")
         header.addWidget(self._title, stretch=1)
-        close = _ClickText("X")
+        close = QToolButton()
+        close.setObjectName("noteStyleClose")
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setToolTip("关闭")
+        close.setFixedSize(22, 22)
+        close.setIcon(QWidget.style(self).standardIcon(QStyle.StandardPixmap.SP_TitleBarCloseButton))
+        close.setIconSize(QSize(14, 14))
         close.clicked.connect(self.dismissed.emit)
+        self._close_button = close
         header.addWidget(close, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
+        self.setToolTip("按住标题栏可拖动面板")
 
         self._opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self._opacity_slider.setRange(15, 100)
@@ -146,9 +155,6 @@ class NoteStylePanel(QFrame):
         self._apply_align()
         self.hide()
 
-    def mousePressEvent(self, event) -> None:  # noqa: N802
-        event.accept()
-
     def set_title(self, title: str) -> None:
         self._title.setText(title)
 
@@ -177,26 +183,57 @@ class NoteStylePanel(QFrame):
             align=self._selected_align(),
         )
 
-    def place_near(self, anchor: QRect, bounds: QRect) -> None:
-        """放在文本框上、下、左或右，并保持在底图里面。"""
+    def place_at(self, bounds: QRect, saved: QPoint | None = None) -> None:
+        """首次放到画面中央；已有记忆位置则用记忆位置，并夹在 bounds 内。"""
         self.adjustSize()
         width = self.width()
         height = max(self.height(), self.sizeHint().height())
-        gap = 8
-        candidates = [
-            QRect(anchor.center().x() - width // 2, anchor.bottom() + gap, width, height),
-            QRect(anchor.center().x() - width // 2, anchor.top() - gap - height, width, height),
-            QRect(anchor.right() + gap, anchor.center().y() - height // 2, width, height),
-            QRect(anchor.left() - gap - width, anchor.center().y() - height // 2, width, height),
-        ]
+        if saved is not None:
+            rect = QRect(saved.x(), saved.y(), width, height)
+        else:
+            rect = QRect(
+                bounds.center().x() - width // 2,
+                bounds.center().y() - height // 2,
+                width,
+                height,
+            )
+        self.setGeometry(_shift_inside(rect, bounds))
 
-        def score(rect: QRect) -> tuple[int, int, int]:
-            outside = _outside(rect, bounds)
-            overlap = _overlap_area(rect, anchor)
-            return (0 if outside == 0 else 1, overlap, outside)
+    def clamp_inside(self, bounds: QRect) -> None:
+        if not self.isVisible() or not bounds.isValid():
+            return
+        self.setGeometry(_shift_inside(QRect(self.geometry()), bounds))
 
-        chosen = min(candidates, key=score)
-        self.setGeometry(_shift_inside(chosen, bounds))
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self._in_drag_zone(event.position().toPoint()):
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+            event.accept()
+            return
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._drag_offset is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = None
+            self.unsetCursor()
+            self.moved.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _in_drag_zone(self, pos: QPoint) -> bool:
+        if pos.y() > self._header_height + 8:
+            return False
+        close_geo = self._close_button.geometry()
+        # 关闭按钮周围不开始拖动
+        return not close_geo.adjusted(-4, -4, 4, 4).contains(pos)
 
     def _swatch_row(self, choose) -> tuple[QWidget, list[tuple[QPushButton, str]]]:
         buttons: list[tuple[QPushButton, str]] = []
@@ -295,22 +332,6 @@ class NoteStylePanel(QFrame):
             "padding: 2px 8px;"
             "}"
         )
-
-
-def _outside(rect: QRect, bounds: QRect) -> int:
-    return (
-        max(0, bounds.left() - rect.left())
-        + max(0, bounds.top() - rect.top())
-        + max(0, rect.right() - bounds.right())
-        + max(0, rect.bottom() - bounds.bottom())
-    )
-
-
-def _overlap_area(rect: QRect, other: QRect) -> int:
-    shared = rect.intersected(other)
-    if shared.isEmpty():
-        return 0
-    return shared.width() * shared.height()
 
 
 def _shift_inside(rect: QRect, bounds: QRect) -> QRect:

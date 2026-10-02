@@ -133,9 +133,9 @@ class AppConfig:
     subtitle_list_density: str = "normal"
     # 还没单独调整过的截图笔记，用这些样式当文本框的初始值。字号是底图高度的比例。
     screenshot_note_opacity: float = 0.85
-    screenshot_note_font_size: float = 0.06
+    screenshot_note_font_size: float = 0.045
     screenshot_note_color: str = "#1A1A1A"
-    screenshot_note_align: str = "center"
+    screenshot_note_align: str = "left"
     screenshot_note_background: str = "#FFFFFF"
     # 用户添加过的自定义字幕标签，下次对话框里继续出现
     subtitle_custom_tags: list[str] = field(default_factory=list)

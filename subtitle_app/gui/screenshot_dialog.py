@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -32,6 +33,7 @@ from core.screenshots import (
     append_screenshot_title_tags,
     format_local_time,
     new_screenshot_id,
+    note_ordinal_labels,
     now_ms,
     title_has_known_tag,
 )
@@ -225,6 +227,11 @@ class ScreenshotDialog(QDialog):
         self._insert_subtitle_button: QPushButton | None = None
         self._current_pick_row = -1
         self._custom_tags = list(custom_tags or [])
+        self._undo_stack: list[tuple[str, int | None]] = []
+        self._redo_stack: list[tuple[str, int | None]] = []
+        self._draft_baseline: tuple[str, int | None] = ("", None)
+        self._typing_merge = False
+        self._history_applying = False
         subtitle_rows = list(subtitles or [])
 
         dialog_title = "创建/编辑截图"
@@ -290,15 +297,7 @@ class ScreenshotDialog(QDialog):
 
         label_row = QHBoxLayout()
         label_row.setSpacing(12)
-        extract_header = QHBoxLayout()
-        extract_header.setSpacing(8)
-        extract_header.addWidget(QLabel("从笔记中提取"))
-        extract_header.addStretch(1)
-        self._center_button = QPushButton("回到中心")
-        self._center_button.setEnabled(False)
-        self._center_button.clicked.connect(self._scroll_to_center_subtitle)
-        extract_header.addWidget(self._center_button)
-        label_row.addLayout(extract_header, stretch=1)
+        label_row.addWidget(QLabel("从笔记中提取"), stretch=1)
         label_row.addWidget(QLabel("笔记内容"), stretch=1)
         layout.addLayout(label_row)
 
@@ -330,11 +329,10 @@ class ScreenshotDialog(QDialog):
             if current:
                 self._current_pick_row = index
             self._subtitle_list.addItem(item)
-        self._center_button.setEnabled(self._current_pick_row >= 0)
         self._note_edit = QPlainTextEdit()
         self._note_edit.setPlaceholderText("笔记内容")
         self._note_edit.setMinimumWidth(280)
-        self._note_edit.textChanged.connect(self._sync_note_buttons)
+        self._note_edit.textChanged.connect(self._on_note_text_changed)
         content_row = QHBoxLayout()
         content_row.setSpacing(12)
         content_row.addWidget(self._subtitle_list, stretch=1)
@@ -342,12 +340,60 @@ class ScreenshotDialog(QDialog):
         layout.addLayout(content_row, stretch=1)
 
         command_row = QHBoxLayout()
-        command_row.setSpacing(8)
-        self._insert_subtitle_button = QPushButton("传入右侧输入框内")
+        command_row.setSpacing(12)
+        subtitle_cmds = QHBoxLayout()
+        subtitle_cmds.setContentsMargins(0, 0, 0, 0)
+        subtitle_cmds.setSpacing(8)
+        self._center_button = QPushButton("回到中心字幕")
+        self._center_button.setEnabled(self._current_pick_row >= 0)
+        self._center_button.clicked.connect(self._scroll_to_center_subtitle)
+        self._insert_subtitle_button = QPushButton("传入右侧笔记框中")
         self._insert_subtitle_button.setEnabled(False)
         self._insert_subtitle_button.clicked.connect(self._insert_checked_subtitles)
-        command_row.addWidget(self._insert_subtitle_button, alignment=Qt.AlignmentFlag.AlignLeft)
-        command_row.addStretch(1)
+        subtitle_cmds.addWidget(self._center_button)
+        subtitle_cmds.addWidget(self._insert_subtitle_button)
+        subtitle_cmds.addStretch(1)
+        command_row.addLayout(subtitle_cmds, stretch=1)
+
+        note_cmds = QHBoxLayout()
+        note_cmds.setContentsMargins(0, 0, 0, 0)
+        note_cmds.setSpacing(8)
+        self._clear_note_button = QPushButton("清空")
+        self._clear_note_button.clicked.connect(self._clear_note_draft)
+        note_cmds.addWidget(self._clear_note_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        self._undo_button = QToolButton()
+        self._redo_button = QToolButton()
+        for button, tip, icon, slot in (
+            (
+                self._undo_button,
+                "撤销",
+                QStyle.StandardPixmap.SP_ArrowBack,
+                self._undo_draft,
+            ),
+            (
+                self._redo_button,
+                "反撤销",
+                QStyle.StandardPixmap.SP_ArrowForward,
+                self._redo_draft,
+            ),
+        ):
+            button.setToolTip(tip)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setFixedSize(30, 28)
+            button.setIcon(self.style().standardIcon(icon))
+            button.setStyleSheet(
+                "QToolButton {"
+                "background-color: rgba(0, 0, 0, 120);"
+                "color: #ffffff;"
+                "border: 1px solid rgba(255, 255, 255, 0.35);"
+                "border-radius: 4px;"
+                "}"
+                "QToolButton:hover { background-color: rgba(40, 40, 48, 170); }"
+                "QToolButton:disabled { color: rgba(255,255,255,0.35); }"
+            )
+            button.clicked.connect(slot)
+            note_cmds.addWidget(button)
+        note_cmds.addStretch(1)
         self._add_note_button = QPushButton("添加笔记")
         self._add_note_button.setEnabled(False)
         self._add_note_button.clicked.connect(self._add_note)
@@ -368,14 +414,16 @@ class ScreenshotDialog(QDialog):
         note_actions_layout.addWidget(self._update_note_button)
         note_actions_layout.addWidget(self._save_new_note_button)
         note_actions_layout.addWidget(self._add_note_button)
-        command_row.addWidget(self._note_actions)
+        note_cmds.addWidget(self._note_actions)
         button_width = (
             self._update_note_button.sizeHint().width()
             + note_actions_layout.spacing()
             + self._save_new_note_button.sizeHint().width()
         )
         self._note_actions.setMinimumWidth(button_width)
+        command_row.addLayout(note_cmds, stretch=1)
         layout.addLayout(command_row)
+        self._sync_history_buttons()
 
         self._tag_host = QWidget()
         self._tag_host.setStyleSheet("background: transparent;")
@@ -398,11 +446,6 @@ class ScreenshotDialog(QDialog):
             "color: rgba(255,255,255,0.78); font-size: 11px; background: transparent;"
         )
         self._drag_hint.hide()
-        tag_column = QVBoxLayout()
-        tag_column.setContentsMargins(0, 0, 0, 0)
-        tag_column.setSpacing(2)
-        tag_column.addWidget(self._tag_scroll)
-        tag_column.addWidget(self._drag_hint)
         cancel_button = QPushButton("取消")
         cancel_button.clicked.connect(self.reject)
         save_button = QPushButton("保存")
@@ -419,12 +462,18 @@ class ScreenshotDialog(QDialog):
         dialog_actions_layout.addWidget(cancel_button)
         dialog_actions_layout.addWidget(save_button)
         tag_row = QHBoxLayout()
-        tag_row.setSpacing(0)
-        tag_row.setAlignment(Qt.AlignmentFlag.AlignTop)
-        tag_row.addLayout(tag_column, stretch=1)
-        tag_row.addWidget(self._dialog_actions, alignment=Qt.AlignmentFlag.AlignTop)
-        layout.addLayout(tag_row)
+        tag_row.setSpacing(8)
+        tag_row.setAlignment(Qt.AlignmentFlag.AlignBottom)
+        tag_row.addWidget(self._tag_scroll, stretch=1)
+        tag_row.addWidget(self._dialog_actions, alignment=Qt.AlignmentFlag.AlignBottom)
+        bottom_block = QVBoxLayout()
+        bottom_block.setContentsMargins(0, 0, 0, 0)
+        bottom_block.setSpacing(2)
+        bottom_block.addLayout(tag_row)
+        bottom_block.addWidget(self._drag_hint)
+        layout.addLayout(bottom_block)
         self._rebuild_tags()
+        self._draft_baseline = self._capture_draft()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -568,6 +617,75 @@ class ScreenshotDialog(QDialog):
     def _note_text(self) -> str:
         return self._note_edit.toPlainText().strip()
 
+    def _capture_draft(self) -> tuple[str, int | None]:
+        return (self._note_edit.toPlainText(), self._editing_index)
+
+    def _on_note_text_changed(self) -> None:
+        if self._history_applying:
+            self._sync_note_buttons()
+            return
+        if not self._typing_merge:
+            self._undo_stack.append(self._draft_baseline)
+            self._redo_stack.clear()
+            self._typing_merge = True
+        self._draft_baseline = self._capture_draft()
+        self._sync_note_buttons()
+        self._sync_history_buttons()
+
+    def _push_draft_checkpoint(self) -> None:
+        self._typing_merge = False
+        current = self._capture_draft()
+        if self._undo_stack and self._undo_stack[-1] == current:
+            self._draft_baseline = current
+            return
+        if self._draft_baseline != current:
+            self._draft_baseline = current
+        self._undo_stack.append(current)
+        self._redo_stack.clear()
+        self._sync_history_buttons()
+
+    def _apply_draft(self, state: tuple[str, int | None]) -> None:
+        text, editing_index = state
+        self._history_applying = True
+        self._note_edit.setPlainText(text)
+        if editing_index is None or not 0 <= editing_index < len(self._notes):
+            self._show_add_mode()
+        else:
+            self._show_edit_mode(editing_index)
+        self._history_applying = False
+        self._typing_merge = False
+        self._draft_baseline = self._capture_draft()
+        self._sync_note_buttons()
+        self._sync_history_buttons()
+
+    def _undo_draft(self) -> None:
+        if not self._undo_stack:
+            return
+        self._typing_merge = False
+        self._redo_stack.append(self._draft_baseline)
+        self._apply_draft(self._undo_stack.pop())
+
+    def _redo_draft(self) -> None:
+        if not self._redo_stack:
+            return
+        self._typing_merge = False
+        self._undo_stack.append(self._draft_baseline)
+        self._apply_draft(self._redo_stack.pop())
+
+    def _sync_history_buttons(self) -> None:
+        self._undo_button.setEnabled(bool(self._undo_stack))
+        self._redo_button.setEnabled(bool(self._redo_stack))
+
+    def _clear_note_draft(self) -> None:
+        self._push_draft_checkpoint()
+        self._history_applying = True
+        self._note_edit.clear()
+        self._history_applying = False
+        self._show_add_mode()
+        self._draft_baseline = self._capture_draft()
+        self._sync_note_buttons()
+        self._sync_history_buttons()
+
     def _sync_note_buttons(self) -> None:
         ready = bool(self._note_text())
         self._add_note_button.setEnabled(ready)
@@ -603,9 +721,16 @@ class ScreenshotDialog(QDialog):
                 updated_at=moment,
             )
         )
+        self._history_applying = True
         self._note_edit.clear()
+        self._history_applying = False
         self._append_tag(len(self._notes) - 1)
         self._show_add_mode()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._typing_merge = False
+        self._draft_baseline = self._capture_draft()
+        self._sync_history_buttons()
 
     def _update_note(self) -> None:
         index = self._editing_index
@@ -619,6 +744,11 @@ class ScreenshotDialog(QDialog):
         note.updated_at = now_ms()
         self._tags[index].refresh(_note_preview(note.text), _note_time_line(note), note.text)
         self._show_edit_mode(index)
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._typing_merge = False
+        self._draft_baseline = self._capture_draft()
+        self._sync_history_buttons()
 
     def _save_as_new_note(self) -> None:
         text = self._note_text()
@@ -635,17 +765,31 @@ class ScreenshotDialog(QDialog):
         )
         self._append_tag(len(self._notes) - 1)
         self._show_edit_mode(len(self._notes) - 1)
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._typing_merge = False
+        self._draft_baseline = self._capture_draft()
+        self._sync_history_buttons()
         self._note_edit.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _edit_tag(self, index: int) -> None:
         if not 0 <= index < len(self._notes):
             return
+        self._push_draft_checkpoint()
         if self._editing_index == index:
+            self._history_applying = True
             self._note_edit.clear()
+            self._history_applying = False
             self._show_add_mode()
+            self._draft_baseline = self._capture_draft()
+            self._sync_history_buttons()
             return
+        self._history_applying = True
         self._note_edit.setPlainText(self._notes[index].text)
+        self._history_applying = False
         self._show_edit_mode(index)
+        self._draft_baseline = self._capture_draft()
+        self._sync_history_buttons()
         self._note_edit.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _rebuild_tags(self) -> None:
@@ -719,7 +863,10 @@ class ScreenshotDialog(QDialog):
             index = self._tags.index(tag)
         except ValueError:
             return
-        if not _confirm_delete_note_dialog(self):
+        labels = note_ordinal_labels(self._notes)
+        note_id = self._notes[index].id if 0 <= index < len(self._notes) else ""
+        label = labels.get(note_id, "Note")
+        if not _confirm_delete_note_dialog(self, label):
             return
         self._remove_note_at(index)
 
@@ -774,12 +921,18 @@ class ScreenshotDialog(QDialog):
         addition = _format_subtitle_line(texts)
         if not addition:
             return
+        self._push_draft_checkpoint()
         existing = self._note_edit.toPlainText().rstrip()
         merged = f"{existing}\n{addition}" if existing else addition
+        self._history_applying = True
         self._note_edit.setPlainText(merged)
+        self._history_applying = False
         cursor = self._note_edit.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         self._note_edit.setTextCursor(cursor)
+        self._draft_baseline = self._capture_draft()
+        self._sync_note_buttons()
+        self._sync_history_buttons()
         self._note_edit.setFocus(Qt.FocusReason.OtherFocusReason)
         self._subtitle_list.blockSignals(True)
         for index in range(self._subtitle_list.count()):
@@ -792,10 +945,10 @@ class ScreenshotDialog(QDialog):
 class _DeleteNoteConfirm(QDialog):
     """紧凑的删除确认。不用系统消息框，避免被拉出大片空白。"""
 
-    def __init__(self, parent) -> None:
+    def __init__(self, parent, note_label: str = "Note") -> None:
         super().__init__(parent)
         self.setObjectName("deleteNoteConfirm")
-        self.setWindowTitle("删除笔记")
+        self.setWindowTitle("确认删除")
         self.setModal(True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setWindowFlags(
@@ -819,9 +972,10 @@ class _DeleteNoteConfirm(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
-        title = QLabel("删除这条笔记？")
+        title = QLabel("确认删除")
         title.setStyleSheet("font-size: 14px; color: #ffffff; background: transparent;")
-        detail = QLabel("删除后，这条笔记会从当前截图中去掉。")
+        label = str(note_label or "Note").strip() or "Note"
+        detail = QLabel(f"确定删除 {label} 笔记？删除后不可恢复。")
         detail.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(detail)
@@ -836,13 +990,13 @@ class _DeleteNoteConfirm(QDialog):
         buttons.addWidget(cancel)
         buttons.addWidget(confirm)
         layout.addLayout(buttons)
-        self.setFixedWidth(280)
+        self.setFixedWidth(300)
         self.adjustSize()
         self.setFixedHeight(self.sizeHint().height())
 
 
-def _confirm_delete_note_dialog(parent) -> bool:
-    dialog = _DeleteNoteConfirm(parent)
+def _confirm_delete_note_dialog(parent, note_label: str = "Note") -> bool:
+    dialog = _DeleteNoteConfirm(parent, note_label)
     return dialog.exec() == QDialog.DialogCode.Accepted
 
 

@@ -53,6 +53,15 @@ QPushButton#viewerNavButton:disabled {
     color: rgba(255, 225, 74, 0.35);
     border-color: rgba(255, 225, 74, 0.35);
 }
+QLabel#viewerNavCounter {
+    background-color: rgba(18, 18, 22, 210);
+    color: #FFE14A;
+    border: 2px solid #FFE14A;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+    font-weight: 600;
+}
 """
 
 # 暗色底（黑板）：浅底 + 深紫字 + 亮黄描边，避免和黑板融在一起
@@ -71,6 +80,15 @@ QPushButton#viewerNavButton:hover { background-color: rgba(255, 255, 255, 240); 
 QPushButton#viewerNavButton:disabled {
     color: rgba(58, 36, 88, 0.35);
     border-color: rgba(255, 225, 74, 0.45);
+}
+QLabel#viewerNavCounter {
+    background-color: rgba(245, 245, 248, 220);
+    color: #3A2458;
+    border: 2px solid #FFE14A;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+    font-weight: 600;
 }
 """
 
@@ -162,12 +180,16 @@ class ScreenshotViewerWindow(QWidget):
         nav_layout.setSpacing(10)
         self._prev_btn = QPushButton("上一图", self._nav)
         self._next_btn = QPushButton("下一图", self._nav)
+        self._counter_label = QLabel("0/0", self._nav)
+        self._counter_label.setObjectName("viewerNavCounter")
+        self._counter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         for button in (self._prev_btn, self._next_btn):
             button.setObjectName("viewerNavButton")
             button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._prev_btn.clicked.connect(lambda: self._step_image(-1))
         self._next_btn.clicked.connect(lambda: self._step_image(1))
         nav_layout.addWidget(self._prev_btn)
+        nav_layout.addWidget(self._counter_label)
         nav_layout.addWidget(self._next_btn)
 
         self._close_btn = QToolButton(self._canvas)
@@ -273,6 +295,7 @@ class ScreenshotViewerWindow(QWidget):
         title = (shot.title if shot is not None else "").strip() or "（无标题）"
         count = len(self._shots)
         counter = f"{self._index + 1}/{count}" if count else "0/0"
+        self._counter_label.setText(counter)
         self.setToolTip(f"查看截图 · {counter} · {title}")
         self._prev_btn.setEnabled(self._index > 0)
         self._next_btn.setEnabled(self._index < count - 1)
@@ -383,10 +406,12 @@ class ScreenshotViewerWindow(QWidget):
         if on_light:
             self._prev_btn.setStyleSheet(_NAV_ON_LIGHT)
             self._next_btn.setStyleSheet(_NAV_ON_LIGHT)
+            self._counter_label.setStyleSheet(_NAV_ON_LIGHT)
             self._close_btn.setStyleSheet(_CLOSE_ON_LIGHT)
         else:
             self._prev_btn.setStyleSheet(_NAV_ON_DARK)
             self._next_btn.setStyleSheet(_NAV_ON_DARK)
+            self._counter_label.setStyleSheet(_NAV_ON_DARK)
             self._close_btn.setStyleSheet(_CLOSE_ON_DARK)
 
     def _sample_luminance_behind(self, widget: QWidget) -> float:

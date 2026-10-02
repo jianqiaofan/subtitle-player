@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from core.screenshots import (
     default_note_slots,
     interleave_screenshots,
     load_screenshots,
+    normalize_note_valign,
     note_ordinal_labels,
     remove_screenshot,
     save_screenshots,
@@ -368,17 +370,117 @@ class ScreenshotStoreTests(unittest.TestCase):
         older = ScreenshotNote("aaaaaaaaaaaa", "先", 100, 500)
         newer = ScreenshotNote("bbbbbbbbbbbb", "后", 200, 200)
         alone = ScreenshotNote("cccccccccccc", "单", 300, 300)
-        self.assertEqual(note_ordinal_labels([alone]), {})
+        self.assertEqual(note_ordinal_labels([alone]), {"cccccccccccc": "Note"})
         self.assertEqual(
             note_ordinal_labels([newer, older]),
             {"aaaaaaaaaaaa": "Note 1", "bbbbbbbbbbbb": "Note 2"},
         )
 
+    def test_legacy_box_defaults_match_android(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            media = Path(folder) / "电脑.mp4"
+            media.write_bytes(b"video")
+            folder_path = screenshot_dir(media)
+            folder_path.mkdir(parents=True)
+            (folder_path / "screenshots.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "screenshots": [
+                            {
+                                "id": "a1b2c3d4e5f6",
+                                "title": "旧图",
+                                "time": 1.0,
+                                "frame": None,
+                                "image": "a1b2c3d4e5f6.png",
+                                "created_at": 1,
+                                "updated_at": 1,
+                                "notes": [
+                                    {
+                                        "id": "b1b2c3d4e5f6",
+                                        "text": "旧笔记",
+                                        "created_at": 1,
+                                        "updated_at": 1,
+                                        "box": {
+                                            "x": 0.1,
+                                            "y": 0.2,
+                                            "width": 0.5,
+                                            "height": 0.3,
+                                            "background": "#FFFFFF",
+                                            "opacity": 0.85,
+                                            "color": "#1A1A1A",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            frame = load_screenshots(media).entries[0].notes[0].frame
+            self.assertIsNotNone(frame)
+            assert frame is not None
+            self.assertEqual(frame.align, "left")
+            self.assertEqual(frame.valign, "top")
+            self.assertAlmostEqual(frame.font, 0.045)
+            self.assertEqual(frame.title_background, "")
+            self.assertFalse(frame.title_bold)
+            self.assertFalse(frame.title_italic)
+
+    def test_note_box_roundtrips_title_and_valign(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            media = Path(folder) / "电脑.mp4"
+            media.write_bytes(b"video")
+            shot = _shot("a1b2c3d4e5f6", 4, 10)
+            shot.notes[0].frame = NoteFrame(
+                x=0.2,
+                y=0.3,
+                width=0.5,
+                height=0.25,
+                background="#E8F5E9",
+                opacity=0.9,
+                font=0.05,
+                color="#1B5E20",
+                align="right",
+                valign="bottom",
+                title_background="#A5D6A7",
+                title_bold=True,
+                title_italic=True,
+            )
+            save_screenshots(media, ScreenshotDocument(entries=[shot]))
+            frame = load_screenshots(media).entries[0].notes[0].frame
+            self.assertIsNotNone(frame)
+            assert frame is not None
+            self.assertEqual(frame.background, "#E8F5E9")
+            self.assertEqual(frame.color, "#1B5E20")
+            self.assertEqual(frame.align, "right")
+            self.assertEqual(frame.valign, "bottom")
+            self.assertEqual(frame.title_background, "#A5D6A7")
+            self.assertTrue(frame.title_bold)
+            self.assertTrue(frame.title_italic)
+            self.assertEqual(normalize_note_valign("center"), "middle")
+
     def test_reused_style_keeps_position(self) -> None:
         from gui.note_overlay import apply_reused_frame_style
 
         target = NoteFrame(x=0.1, y=0.2, width=0.3, height=0.25, opacity=0.5, font=0.04, color="#FFFFFF", background="#000000")
-        source = NoteFrame(x=0.5, y=0.6, width=0.4, height=0.35, opacity=0.9, font=0.08, color="#E53935", background="#FFFFFF", align="left")
+        source = NoteFrame(
+            x=0.5,
+            y=0.6,
+            width=0.4,
+            height=0.35,
+            opacity=0.9,
+            font=0.08,
+            color="#E53935",
+            background="#FFFFFF",
+            align="left",
+            valign="middle",
+            title_background="#90CAF9",
+            title_bold=True,
+            title_italic=True,
+        )
         apply_reused_frame_style(target, source)
         self.assertEqual(target.x, 0.1)
         self.assertEqual(target.y, 0.2)
@@ -389,6 +491,10 @@ class ScreenshotStoreTests(unittest.TestCase):
         self.assertEqual(target.color, "#E53935")
         self.assertEqual(target.background, "#FFFFFF")
         self.assertEqual(target.align, "left")
+        self.assertEqual(target.valign, "middle")
+        self.assertEqual(target.title_background, "#90CAF9")
+        self.assertTrue(target.title_bold)
+        self.assertTrue(target.title_italic)
 
 
 class ScreenshotCompositeTests(unittest.TestCase):

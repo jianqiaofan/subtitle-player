@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QEvent, QObject, QPoint, QRect, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QTextCursor
+from PyQt6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+    QTextBlockFormat,
+    QTextCharFormat,
+    QTextCursor,
+    QTextDocument,
+    QTextOption,
+)
 from PyQt6.QtWidgets import QMenu, QPlainTextEdit, QWidget
 
 from core.screenshots import (
@@ -15,6 +27,8 @@ from core.screenshots import (
     normalize_font_ratio,
     normalize_note_align,
     normalize_note_color,
+    normalize_note_valign,
+    normalize_title_background,
     note_frames_match,
     note_ordinal_labels,
     now_ms,
@@ -23,14 +37,60 @@ from gui.note_style_panel import NoteDisplayStyle, NoteStylePanel
 from gui.screenshot_dialog import _confirm_delete_note_dialog
 
 _GRIP = 14
+_BODY_LINE_HEIGHT = 135
 
 
-def _text_flags(align: str) -> int:
-    horizontal = {
+def _horizontal_align(align: str) -> Qt.AlignmentFlag:
+    return {
         "left": Qt.AlignmentFlag.AlignLeft,
         "right": Qt.AlignmentFlag.AlignRight,
-    }.get(align, Qt.AlignmentFlag.AlignHCenter)
-    return int(horizontal | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap)
+    }.get(normalize_note_align(align), Qt.AlignmentFlag.AlignHCenter)
+
+
+def _draw_body_text(
+    painter: QPainter,
+    rect: QRect,
+    text: str,
+    *,
+    font: QFont,
+    color: str,
+    align: str,
+    valign: str,
+) -> None:
+    if rect.width() <= 0 or rect.height() <= 0:
+        return
+    doc = QTextDocument()
+    doc.setDocumentMargin(0)
+    doc.setDefaultFont(font)
+    doc.setPlainText(text)
+    option = QTextOption()
+    option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+    option.setAlignment(_horizontal_align(align))
+    doc.setDefaultTextOption(option)
+    doc.setTextWidth(rect.width())
+    cursor = QTextCursor(doc)
+    cursor.select(QTextCursor.SelectionType.Document)
+    block_fmt = QTextBlockFormat()
+    block_fmt.setLineHeight(
+        _BODY_LINE_HEIGHT,
+        QTextBlockFormat.LineHeightTypes.ProportionalHeight.value,
+    )
+    cursor.mergeBlockFormat(block_fmt)
+    char_fmt = QTextCharFormat()
+    char_fmt.setForeground(QColor(color))
+    cursor.mergeCharFormat(char_fmt)
+    doc_h = doc.size().height()
+    chosen = normalize_note_valign(valign)
+    y_offset = 0.0
+    if chosen == "middle":
+        y_offset = max(0.0, (rect.height() - doc_h) / 2)
+    elif chosen == "bottom":
+        y_offset = max(0.0, rect.height() - doc_h)
+    painter.save()
+    painter.setClipRect(rect)
+    painter.translate(rect.x(), rect.y() + y_offset)
+    doc.drawContents(painter, QRectF(0, 0, rect.width(), max(doc_h, rect.height())))
+    painter.restore()
 
 
 def _hit_edge(pos: QPoint, width: int, height: int) -> str:
@@ -141,34 +201,60 @@ def paint_note_contents(
     border.setAlpha(230)
     painter.setPen(QPen(border, pen_width))
     painter.setBrush(fill)
-    painter.drawRoundedRect(
-        rect.adjusted(_px(1, scale), _px(1, scale), -_px(2, scale), -_px(2, scale)),
-        _px(8, scale),
-        _px(8, scale),
-    )
-    painter.setPen(QColor(frame.color))
+    box = rect.adjusted(_px(1, scale), _px(1, scale), -_px(2, scale), -_px(2, scale))
+    radius = _px(8, scale)
+    painter.drawRoundedRect(box, radius, radius)
     body_size = max(1, round(normalize_font_ratio(frame.font) * max(1, image_span)))
     text_rect = rect.adjusted(_px(12, scale), _px(10, scale), -_px(18, scale), -_px(18, scale))
-    if caption.strip():
+    label = caption.strip()
+    if label:
+        title_bg = normalize_title_background(frame.title_background)
         caption_font = QFont(painter.font())
-        caption_font.setBold(True)
+        if title_bg:
+            caption_font.setBold(bool(frame.title_bold))
+            caption_font.setItalic(bool(frame.title_italic))
+        else:
+            caption_font.setWeight(QFont.Weight.Medium)
+            caption_font.setItalic(False)
         caption_font.setPixelSize(max(1, round(body_size * 0.9)))
         painter.setFont(caption_font)
-        caption_h = painter.fontMetrics().height() + _px(4, scale)
+        caption_h = painter.fontMetrics().height() + _px(6, scale)
+        if title_bg:
+            bar = QColor(title_bg)
+            bar.setAlphaF(max(0.15, min(1.0, float(frame.opacity))))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(bar)
+            bar_rect = QRect(box.x(), box.y(), box.width(), min(box.height(), caption_h + _px(8, scale)))
+            painter.drawRoundedRect(bar_rect, radius, radius)
+            if bar_rect.height() < box.height():
+                painter.fillRect(
+                    QRect(
+                        bar_rect.x(),
+                        bar_rect.bottom() - radius,
+                        bar_rect.width(),
+                        radius + 1,
+                    ),
+                    bar,
+                )
+        painter.setPen(QColor(frame.color))
         painter.drawText(
             QRect(text_rect.x(), text_rect.y(), text_rect.width(), caption_h),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            caption.strip(),
+            label,
         )
-        text_rect = text_rect.adjusted(0, caption_h, 0, 0)
+        text_rect = text_rect.adjusted(0, caption_h + _px(2, scale), 0, 0)
     body_font = QFont(painter.font())
     body_font.setBold(False)
+    body_font.setItalic(False)
     body_font.setPixelSize(body_size)
-    painter.setFont(body_font)
-    painter.drawText(
+    _draw_body_text(
+        painter,
         text_rect,
-        _text_flags(frame.align),
         text,
+        font=body_font,
+        color=frame.color,
+        align=frame.align,
+        valign=frame.valign,
     )
     if not grip:
         return
@@ -187,6 +273,10 @@ def style_of(frame: NoteFrame) -> NoteDisplayStyle:
         font=frame.font,
         color=frame.color,
         align=frame.align,
+        valign=frame.valign,
+        title_background=frame.title_background,
+        title_bold=frame.title_bold,
+        title_italic=frame.title_italic,
     )
 
 
@@ -196,6 +286,10 @@ def apply_style(frame: NoteFrame, style: NoteDisplayStyle) -> None:
     frame.font = style.font
     frame.color = style.color
     frame.align = style.align
+    frame.valign = style.valign
+    frame.title_background = style.title_background
+    frame.title_bold = style.title_bold
+    frame.title_italic = style.title_italic
 
 
 def apply_reused_frame_style(target: NoteFrame, source: NoteFrame) -> None:
@@ -207,6 +301,10 @@ def apply_reused_frame_style(target: NoteFrame, source: NoteFrame) -> None:
     target.font = source.font
     target.color = source.color
     target.align = source.align
+    target.valign = source.valign
+    target.title_background = source.title_background
+    target.title_bold = source.title_bold
+    target.title_italic = source.title_italic
 
 
 class NoteBox(QWidget):
@@ -436,7 +534,7 @@ class NoteBox(QWidget):
             return _px(10, 1.0)
         span = self._bounds.height() if self._bounds.height() > 0 else self.height()
         body_size = max(1, round(normalize_font_ratio(self._frame.font) * max(1, span)))
-        return _px(10, 1.0) + max(1, round(body_size * 0.9)) + _px(4, 1.0)
+        return _px(10, 1.0) + max(1, round(body_size * 0.9)) + _px(8, 1.0)
 
     def _layout_editor(self) -> None:
         top = self._caption_band()
@@ -702,7 +800,7 @@ class NoteOverlay(QObject):
             return
         self._on_box_activated(note_id, show_panel=False)
         labels = note_ordinal_labels(self._notes)
-        own_label = labels.get(note_id, "")
+        own_label = labels.get(note_id, "Note")
         menu = QMenu(self._host)
         edit_action = menu.addAction("编辑笔记")
         reuse_actions: list[tuple[object, str]] = []
@@ -716,8 +814,7 @@ class NoteOverlay(QObject):
             action = menu.addAction(f"复用{label}样式")
             reuse_actions.append((action, note.id))
         menu.addSeparator()
-        delete_label = f"删除{own_label}笔记" if own_label else "删除笔记"
-        delete_action = menu.addAction(delete_label)
+        delete_action = menu.addAction(f"删除 {own_label} 笔记")
         chosen = menu.exec(global_pos)
         if chosen is None:
             return
@@ -731,7 +828,7 @@ class NoteOverlay(QObject):
                 self._reuse_style(note_id, source_id)
                 return
         if chosen == delete_action:
-            self._delete_note(note_id)
+            self._delete_note(note_id, own_label)
 
     def _reuse_style(self, target_id: str, source_id: str) -> None:
         target_box = self._box_for(target_id)
@@ -753,8 +850,8 @@ class NoteOverlay(QObject):
             self._panel.update()
         self._raise_chrome()
 
-    def _delete_note(self, note_id: str) -> None:
-        if not _confirm_delete_note_dialog(self._host):
+    def _delete_note(self, note_id: str, label: str = "Note") -> None:
+        if not _confirm_delete_note_dialog(self._host, label):
             return
         self._finish_all_edits(commit=True)
         self._commit_dirty(save_style=False)
@@ -831,7 +928,7 @@ class NoteOverlay(QObject):
             return
         was_visible = self._panel.isVisible()
         self._panel.set_style(style_of(box.frame()))
-        self._panel.set_title(box.caption() or "这条笔记")
+        self._panel.set_title(box.caption() or "Note")
         self._panel.show()
         if was_visible:
             self._panel.clamp_inside(self._placement_bounds())
@@ -907,7 +1004,11 @@ class NoteOverlay(QObject):
         self._defaults.font = frame.font
         self._defaults.color = frame.color
         self._defaults.align = frame.align
+        self._defaults.valign = frame.valign
         self._defaults.background = frame.background
+        self._defaults.title_background = frame.title_background
+        self._defaults.title_bold = frame.title_bold
+        self._defaults.title_italic = frame.title_italic
         self.style_changed.emit(
             frame.opacity,
             frame.font,

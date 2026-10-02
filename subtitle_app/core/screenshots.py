@@ -39,8 +39,23 @@ SCREENSHOT_NOTE_ALIGNS: tuple[tuple[str, str], ...] = (
     ("中", "center"),
     ("右", "right"),
 )
-SCREENSHOT_NOTE_ALIGN_DEFAULT = "center"
+SCREENSHOT_NOTE_ALIGN_DEFAULT = "left"
+SCREENSHOT_NOTE_VALIGNS: tuple[tuple[str, str], ...] = (
+    ("上", "top"),
+    ("中", "middle"),
+    ("下", "bottom"),
+)
+SCREENSHOT_NOTE_VALIGN_DEFAULT = "top"
+SCREENSHOT_NOTE_FONT_DEFAULT = 0.045
 SCREENSHOT_NOTE_BACKGROUND_DEFAULT = "#FFFFFF"
+# 样式面板四季预设：只改颜色/透明度/标题条，不改位置、字号、对齐。
+SCREENSHOT_NOTE_SEASON_PRESETS: tuple[tuple[str, str, str, str, float, str], ...] = (
+    ("spring", "春日清新", "#E8F5E9", "#1B5E20", 0.90, "#A5D6A7"),
+    ("summer", "夏日火热", "#FFE0B2", "#BF360C", 0.92, "#FFB74D"),
+    ("autumn", "秋天朴素", "#EFEBE9", "#3E2723", 0.90, "#BCAAA4"),
+    ("winter", "冬日静谧", "#E3F2FD", "#0D47A1", 0.92, "#90CAF9"),
+)
+_HEX_COLOR = re.compile(r"^#[0-9A-F]{6}$", re.IGNORECASE)
 
 
 def default_note_slots(count: int) -> list[tuple[float, float, float, float]]:
@@ -78,9 +93,13 @@ class NoteFrame:
     height: float = 0.30
     background: str = SCREENSHOT_NOTE_BACKGROUND_DEFAULT
     opacity: float = 0.85
-    font: float = 0.06
+    font: float = SCREENSHOT_NOTE_FONT_DEFAULT
     color: str = SCREENSHOT_NOTE_COLOR_DEFAULT
     align: str = SCREENSHOT_NOTE_ALIGN_DEFAULT
+    valign: str = SCREENSHOT_NOTE_VALIGN_DEFAULT
+    title_background: str = ""
+    title_bold: bool = False
+    title_italic: bool = False
 
 
 @dataclass
@@ -367,9 +386,11 @@ def _export_name_part(text: str, fallback: str) -> str:
 
 
 def note_ordinal_labels(notes: list[ScreenshotNote]) -> dict[str, str]:
-    """多条笔记时按创建时间编号为 Note 1、Note 2…；只有一条时不加标题。"""
-    if len(notes) <= 1:
+    """每条笔记框顶部标题：单条为 Note，多条按创建时间编号 Note 1、Note 2…。"""
+    if not notes:
         return {}
+    if len(notes) == 1:
+        return {notes[0].id: "Note"}
     ordered = sorted(notes, key=lambda note: (int(note.created_at), note.id))
     return {note.id: f"Note {index}" for index, note in enumerate(ordered, start=1)}
 
@@ -436,10 +457,24 @@ def normalize_note_color(color: str, default: str = SCREENSHOT_NOTE_COLOR_DEFAUL
     chosen = str(color or "").strip().upper()
     if chosen and not chosen.startswith("#"):
         chosen = f"#{chosen}"
-    allowed = {value.upper() for _name, value in SCREENSHOT_NOTE_COLORS}
-    if chosen in allowed:
+    if _HEX_COLOR.match(chosen):
         return chosen
-    return default
+    fallback = str(default or "").strip().upper()
+    if fallback and not fallback.startswith("#"):
+        fallback = f"#{fallback}"
+    if _HEX_COLOR.match(fallback):
+        return fallback
+    return SCREENSHOT_NOTE_COLOR_DEFAULT
+
+
+def normalize_title_background(value: object) -> str:
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return ""
+    chosen = text.upper() if text.startswith("#") else f"#{text.upper()}"
+    if _HEX_COLOR.match(chosen):
+        return chosen
+    return ""
 
 
 def normalize_note_align(align: str) -> str:
@@ -448,6 +483,16 @@ def normalize_note_align(align: str) -> str:
     if chosen in allowed:
         return chosen
     return SCREENSHOT_NOTE_ALIGN_DEFAULT
+
+
+def normalize_note_valign(valign: str) -> str:
+    chosen = str(valign or "").strip().lower()
+    if chosen == "center":
+        chosen = "middle"
+    allowed = {value for _label, value in SCREENSHOT_NOTE_VALIGNS}
+    if chosen in allowed:
+        return chosen
+    return SCREENSHOT_NOTE_VALIGN_DEFAULT
 
 
 def copy_note_frame(frame: NoteFrame) -> NoteFrame:
@@ -461,6 +506,10 @@ def copy_note_frame(frame: NoteFrame) -> NoteFrame:
         font=normalize_font_ratio(frame.font),
         color=normalize_note_color(frame.color),
         align=normalize_note_align(frame.align),
+        valign=normalize_note_valign(frame.valign),
+        title_background=normalize_title_background(frame.title_background),
+        title_bold=bool(frame.title_bold),
+        title_italic=bool(frame.title_italic),
     )
 
 
@@ -479,6 +528,10 @@ def note_frames_match(left: NoteFrame | None, right: NoteFrame | None) -> bool:
         and round(float(left.font), 4) == round(float(right.font), 4)
         and left.color.upper() == right.color.upper()
         and left.align == right.align
+        and left.valign == right.valign
+        and left.title_background.upper() == right.title_background.upper()
+        and bool(left.title_bold) == bool(right.title_bold)
+        and bool(left.title_italic) == bool(right.title_italic)
     )
 
 
@@ -615,6 +668,10 @@ def _note_payload(note: ScreenshotNote) -> dict:
             "font": round(normalize_font_ratio(frame.font), 4),
             "color": normalize_note_color(frame.color),
             "align": normalize_note_align(frame.align),
+            "valign": normalize_note_valign(frame.valign),
+            "title_background": normalize_title_background(frame.title_background),
+            "title_bold": bool(frame.title_bold),
+            "title_italic": bool(frame.title_italic),
         }
     return payload
 
@@ -701,6 +758,10 @@ def _parse_frame(item: object) -> NoteFrame | None:
         font=_font_ratio(item),
         color=normalize_note_color(str(item.get("color") or "")),
         align=normalize_note_align(str(item.get("align") or "")),
+        valign=normalize_note_valign(str(item.get("valign") or "")),
+        title_background=normalize_title_background(item.get("title_background")),
+        title_bold=bool(item.get("title_bold")),
+        title_italic=bool(item.get("title_italic")),
     )
     if frame.x + frame.width > 1:
         frame.x = max(0.0, 1 - frame.width)
@@ -730,7 +791,7 @@ def normalize_font_ratio(value: object) -> float:
     try:
         number = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
-        return 0.06
+        return SCREENSHOT_NOTE_FONT_DEFAULT
     if number > 1:
         number = number / 480
     return max(0.02, min(0.16, number))
@@ -739,7 +800,9 @@ def normalize_font_ratio(value: object) -> float:
 def _font_ratio(item: dict) -> float:
     if "font" in item:
         return normalize_font_ratio(item.get("font"))
-    return normalize_font_ratio(item.get("font_size"))
+    if "font_size" in item:
+        return normalize_font_ratio(item.get("font_size"))
+    return SCREENSHOT_NOTE_FONT_DEFAULT
 
 
 def _safe_id(value: str) -> str:

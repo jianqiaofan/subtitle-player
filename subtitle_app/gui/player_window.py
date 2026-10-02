@@ -2584,7 +2584,7 @@ class PlayerWindow(QMainWindow):
         show_tip_once(
             self,
             TIP_SCREENSHOT_EXPORT,
-            "此功能是将当前笔记和图片截屏保存为一张普通图片。",
+            "把当前笔记和图片保存成普通图片。",
             title="tip",
             config=self._config,
         )

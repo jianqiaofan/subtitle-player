@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from core.ai_notes import SubtitleCorpusItem, collect_valid_subtitle_corpus
+from core.subtitle_translation import source_text
 
 VOCABULARY_FILENAME_SUFFIX = "生词表"
 
@@ -180,8 +181,9 @@ def extract_vocabulary_from_corpus(
 
     for item in items:
         for segment in item.segments:
-            example = _clean_example(segment.text)
-            for token in _extract_tokens(segment.text, options):
+            plain = source_text(segment.text)
+            example = _clean_example(plain)
+            for token in _extract_tokens(plain, options):
                 if options.language == "en":
                     key = token.lower()
                     display = token

@@ -234,6 +234,29 @@ QPushButton#subtitleDensityButton:hover {
     border: 1px solid #b980ff;
     background-color: rgba(185, 128, 255, 0.08);
 }
+QComboBox#subtitleLanguageCombo {
+    color: #b980ff;
+    background-color: #212121;
+    border: 1px solid #555555;
+    border-radius: 4px;
+    padding: 2px 8px;
+    min-height: 18px;
+    max-height: 24px;
+    font-size: 12px;
+}
+QComboBox#subtitleLanguageCombo:enabled:hover {
+    border: 1px solid #b980ff;
+}
+QComboBox#subtitleLanguageCombo:disabled {
+    color: #777777;
+    background-color: #2a2a2a;
+    border: 1px solid #3f3f3f;
+}
+QComboBox#subtitleLanguageCombo QAbstractItemView {
+    background-color: #212121;
+    color: #eeeeee;
+    selection-background-color: rgba(185, 128, 255, 0.28);
+}
 QPushButton#subtitleTagButton {
     color: #dddddd;
     background-color: #212121;

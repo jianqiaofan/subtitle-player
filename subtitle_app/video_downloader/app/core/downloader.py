@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,6 +38,90 @@ def _is_youtube_url(url: str) -> bool:
     return bool(re.search(r"(?:youtube\.com|youtu\.be)/", url or "", re.I))
 
 
+def _is_bilibili_url(url: str) -> bool:
+    return bool(re.search(r"(?:bilibili\.com|b23\.tv)/", url or "", re.I))
+
+
+def _retry_sleep(n: int) -> float:
+    """断线后稍等再重连，避免立刻打满同一个 CDN 节点。"""
+    return float(min(5, 1 + n))
+
+
+# 连接被掐断、CDN 短暂 5xx。这些错误留下的 .part 可以续传。
+_TRANSIENT_MARKERS = (
+    "http error 530",
+    "http error 503",
+    "http error 502",
+    "http error 504",
+    "http error 429",
+    "bytes read",
+    "more expected",
+    "incompleteread",
+    "content too short",
+    "bytes, expected",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection aborted",
+    "connection broken",
+    "remotedisconnected",
+    "eof occurred",
+    "urlopen error",
+    "temporary failure",
+    "network is unreachable",
+    "read timed out",
+)
+
+# 单次 yt-dlp 会话内的 HTTP 重试，以及整段下载失败后的外层续传次数。
+_HTTP_RETRIES = 20
+_OUTER_ATTEMPTS = 4
+
+
+def _error_text(exc: BaseException) -> str:
+    text = _strip_ansi(str(exc)).replace("\r", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    if text.lower().startswith("error:"):
+        text = text.split(":", 1)[1].strip()
+    return text
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    text = _error_text(exc).lower()
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
+class _TaskLogger:
+    """把 yt-dlp 的断线/续传信息收进任务日志，避免只打到控制台。"""
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        self._emit = emit
+
+    def debug(self, msg: str) -> None:
+        text = _strip_ansi(str(msg)).replace("\r", "").strip()
+        if any(
+            key in text
+            for key in ("Got error", "Resuming download", "Unable to resume", "Sleeping")
+        ):
+            self._emit(text)
+
+    def info(self, msg: str) -> None:
+        return
+
+    def warning(self, msg: str) -> None:
+        text = _strip_ansi(str(msg)).replace("\r", "").strip()
+        if text:
+            self._emit(text)
+
+    def error(self, msg: str) -> None:
+        text = _strip_ansi(str(msg)).replace("\r", "").strip()
+        if text.lower().startswith("error:"):
+            text = text.split(":", 1)[1].strip()
+        # 最终放弃由外层续传逻辑说明，这里不重复刷一条 Giving up。
+        if not text or "Giving up after" in text:
+            return
+        self._emit(text)
+
+
 # B 站优先 H.264，避免旧 FFmpeg/播放器只有声音
 _BILIBILI_FORMAT = (
     "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[vcodec^=avc]+ba/bv*+ba/b"
@@ -69,6 +154,15 @@ class YtDlpDownloader:
     def clear_cancel(self, task_id: str) -> None:
         self._cancel_flags.pop(task_id, None)
 
+    def _sleep_interruptible(self, seconds: float, task_id: str) -> bool:
+        """等待时仍响应取消。返回 True 表示用户已取消。"""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self._cancel_flags.get(task_id):
+                return True
+            time.sleep(min(0.4, deadline - time.monotonic()))
+        return bool(self._cancel_flags.get(task_id))
+
     def _resolve_format(self, url: str) -> str:
         custom = (self.settings.get("video_format") or "").strip()
         if _is_youtube_url(url):
@@ -90,16 +184,30 @@ class YtDlpDownloader:
             save_dir.mkdir(parents=True, exist_ok=True)
 
         url = (task.url if task else "") or ""
+        fragments = int(self.settings.get("concurrent_fragments") or 4)
+        if _is_bilibili_url(url):
+            # B 站 CDN 在分片并发很高时容易回 530/503。
+            fragments = min(fragments, 4)
         opts: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
             "ignoreerrors": False,
-            "retries": 10,
-            "fragment_retries": 10,
-            "concurrent_fragment_downloads": int(
-                self.settings.get("concurrent_fragments") or 8
-            ),
+            "continuedl": True,
+            "retries": _HTTP_RETRIES,
+            "fragment_retries": _HTTP_RETRIES,
+            "extractor_retries": 5,
+            "file_access_retries": 5,
+            "socket_timeout": 30,
+            # 小块 Range 下载：连接被掐时已写入的部分还在，下一块会重置重试次数。
+            "http_chunk_size": 2 * 1024 * 1024,
+            "retry_sleep_functions": {
+                "http": _retry_sleep,
+                "fragment": _retry_sleep,
+                "file_access": _retry_sleep,
+                "extractor": _retry_sleep,
+            },
+            "concurrent_fragment_downloads": max(1, fragments),
             "outtmpl": str(save_dir / self.settings.get("filename_template")),
             "merge_output_format": self.settings.get("merge_output") or "mp4",
             "format": self._resolve_format(url),
@@ -332,6 +440,9 @@ class YtDlpDownloader:
             opts = self._base_opts(task, youtube_fallback=youtube_fallback)
             opts["progress_hooks"] = [hook]
             opts["skip_download"] = False
+            opts["logger"] = _TaskLogger(
+                lambda msg, tid=task.id: self.log(f"[{tid}] {msg}")
+            )
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(task.url, download=True)
                 if info:
@@ -350,12 +461,11 @@ class YtDlpDownloader:
                     elif not task.filepath:
                         task.filepath = prepared
 
-        self.log(f"[{task.id}] 开始下载: {task.title}")
-        try:
+        def _attempt_once() -> None:
             try:
                 _run_download(youtube_fallback=False)
             except Exception as first_error:  # noqa: BLE001
-                err_text = _strip_ansi(str(first_error))
+                err_text = _error_text(first_error)
                 is_403 = "403" in err_text or "Forbidden" in err_text
                 if (
                     is_403
@@ -372,6 +482,40 @@ class YtDlpDownloader:
                     _run_download(youtube_fallback=True)
                 else:
                     raise
+
+        self.log(f"[{task.id}] 开始下载: {task.title}")
+        try:
+            for attempt in range(1, _OUTER_ATTEMPTS + 1):
+                try:
+                    _attempt_once()
+                    break
+                except Exception as attempt_error:  # noqa: BLE001
+                    name = type(attempt_error).__name__
+                    if "DownloadCancelled" in name or "Cancelled" in name:
+                        raise
+                    if self._cancel_flags.get(task.id):
+                        raise
+                    can_resume = (
+                        _is_transient_error(attempt_error)
+                        and attempt < _OUTER_ATTEMPTS
+                    )
+                    if not can_resume:
+                        raise
+                    delay = 8 * attempt
+                    detail = _error_text(attempt_error)
+                    detail = detail.replace("[download] Got error:", "").strip()
+                    self.log(
+                        f"[{task.id}] 下载中断（{detail[:160]}）。"
+                        f"保留已下载部分，{delay} 秒后续传"
+                        f"（{attempt}/{_OUTER_ATTEMPTS}）"
+                    )
+                    task.status = TaskStatus.DOWNLOADING
+                    task.speed = "-"
+                    task.eta = "续传"
+                    if self.on_progress:
+                        self.on_progress(task)
+                    if self._sleep_interruptible(delay, task.id):
+                        raise yt_dlp.utils.DownloadCancelled("用户取消")
 
             if self._cancel_flags.get(task.id):
                 task.status = TaskStatus.CANCELLED
@@ -391,9 +535,14 @@ class YtDlpDownloader:
                 self.log(f"[{task.id}] 已取消")
             else:
                 task.status = TaskStatus.FAILED
-                task.error = _strip_ansi(str(e))
+                task.error = _error_text(e)
                 self.log(f"[{task.id}] 失败: {task.error}")
-                if "403" in task.error or "Forbidden" in task.error:
+                if _is_transient_error(e):
+                    self.log(
+                        f"[{task.id}] 提示: 对方服务器多次中断连接。"
+                        "可以再点「开始下载选中」，会从已下载的部分继续。"
+                    )
+                elif "403" in task.error or "Forbidden" in task.error:
                     self.log(
                         f"[{task.id}] 提示: YouTube 反爬较严。"
                         "可在设置填写代理，或填写「从浏览器读取 Cookie」"

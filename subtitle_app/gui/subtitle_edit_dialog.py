@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 from core.config import AppConfig, load_config
 from core.external_translate import get_translator, is_translator_running, send_hotkey
 from core.subtitle import SubtitleSegment, format_timestamp
+from core.subtitle_translation import LANGUAGES, compose_cue, language_code, parse_cue
 from gui.styles import DARK_STYLE
 
 
@@ -51,9 +52,11 @@ class SubtitleEditDialog(QDialog):
         segment: SubtitleSegment,
         parent=None,
         config: AppConfig | None = None,
+        target_lang: str | None = None,
     ) -> None:
         super().__init__(parent)
         self._segment = segment
+        self._hotkey_editor: QPlainTextEdit | None = None
         cfg = config or load_config()
         self._translator = get_translator(cfg.translate_app)
         self._hotkey = (cfg.translate_hotkey or "").strip() or self._translator.default_hotkey
@@ -111,11 +114,23 @@ class SubtitleEditDialog(QDialog):
         form.addRow("起始时间", start_widget)
         form.addRow("终止时间", end_widget)
 
-        self.text_edit = QPlainTextEdit(segment.text)
-        self.text_edit.setMinimumHeight(120)
-        self.text_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.text_edit.customContextMenuRequested.connect(self._show_text_context_menu)
-        form.addRow("字幕内容", self.text_edit)
+        cue = parse_cue(segment.text)
+        self._source_edit = QPlainTextEdit(cue.source)
+        self._source_edit.setMinimumHeight(100)
+        self._bind_translate_menu(self._source_edit)
+        form.addRow("原文", self._source_edit)
+
+        self._translation_edits: list[tuple[str, QPlainTextEdit]] = []
+        codes = list(cue.translations)
+        selected_target = language_code(target_lang)
+        if selected_target and selected_target not in codes:
+            codes.append(selected_target)
+        for code in codes:
+            editor = QPlainTextEdit(cue.translations.get(code, ""))
+            editor.setMinimumHeight(72)
+            self._bind_translate_menu(editor)
+            self._translation_edits.append((code, editor))
+            form.addRow(f"{LANGUAGES[code].name}译文", editor)
 
         layout.addLayout(form)
 
@@ -133,7 +148,8 @@ class SubtitleEditDialog(QDialog):
 
         for edit in self._time_edits:
             edit.installEventFilter(self)
-        self.text_edit.installEventFilter(self)
+        for editor in self._plain_editors():
+            editor.installEventFilter(self)
         buttons.installEventFilter(self)
         for child in buttons.findChildren(QWidget):
             child.installEventFilter(self)
@@ -184,20 +200,29 @@ class SubtitleEditDialog(QDialog):
                 self._focused_time_edit = None
         return super().eventFilter(obj, event)
 
-    def _show_text_context_menu(self, pos) -> None:
-        menu = self.text_edit.createStandardContextMenu()
+    def _plain_editors(self) -> list[QPlainTextEdit]:
+        return [self._source_edit, *[editor for _code, editor in self._translation_edits]]
+
+    def _bind_translate_menu(self, editor: QPlainTextEdit) -> None:
+        editor.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        editor.customContextMenuRequested.connect(
+            lambda pos, editor=editor: self._show_text_context_menu(editor, pos)
+        )
+
+    def _show_text_context_menu(self, editor: QPlainTextEdit, pos) -> None:
+        menu = editor.createStandardContextMenu()
         translate_action = QAction("翻译", menu)
         translate_action.setToolTip(f"调用{self._translator.name}快捷键 {self._hotkey}")
-        selected = self.text_edit.textCursor().selectedText().replace("\u2029", "\n")
+        selected = editor.textCursor().selectedText().replace("\u2029", "\n")
         translate_action.setEnabled(bool(selected.strip()))
-        translate_action.triggered.connect(self._translate_selection)
+        translate_action.triggered.connect(lambda: self._translate_selection(editor))
         first = menu.actions()[0] if menu.actions() else None
         if first is not None:
             menu.insertAction(first, translate_action)
             menu.insertSeparator(first)
         else:
             menu.addAction(translate_action)
-        menu.exec(self.text_edit.mapToGlobal(pos))
+        menu.exec(editor.mapToGlobal(pos))
 
     def _ensure_translator_running(self) -> bool:
         if is_translator_running(self._translator):
@@ -209,20 +234,22 @@ class SubtitleEditDialog(QDialog):
         )
         return False
 
-    def _translate_selection(self) -> None:
-        if not self.text_edit.textCursor().hasSelection():
+    def _translate_selection(self, editor: QPlainTextEdit) -> None:
+        if not editor.textCursor().hasSelection():
             return
         if not self._ensure_translator_running():
             return
-        self.text_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._hotkey_editor = editor
+        editor.setFocus(Qt.FocusReason.OtherFocusReason)
         QTimer.singleShot(80, self._send_translate_hotkey)
 
     def _send_translate_hotkey(self) -> None:
-        if not self.text_edit.textCursor().hasSelection():
+        editor = self._hotkey_editor
+        if editor is None or not editor.textCursor().hasSelection():
             return
         if not self._ensure_translator_running():
             return
-        self.text_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+        editor.setFocus(Qt.FocusReason.OtherFocusReason)
         if send_hotkey(self._hotkey):
             return
         QMessageBox.warning(
@@ -480,15 +507,24 @@ class SubtitleEditDialog(QDialog):
         start = self._parse_start_seconds()
         end = self._parse_end_seconds()
         assert start is not None and end is not None
-        return start, end, self.text_edit.toPlainText()
+        translations = {
+            code: editor.toPlainText() for code, editor in self._translation_edits
+        }
+        text = compose_cue(self._source_edit.toPlainText(), translations)
+        original = parse_cue(self._segment.text)
+        current = parse_cue(text)
+        if current.source == original.source and current.translations == original.translations:
+            text = self._segment.text
+        return start, end, text
 
     @staticmethod
     def edit_segment(
         segment: SubtitleSegment,
         parent=None,
         config: AppConfig | None = None,
+        target_lang: str | None = None,
     ) -> tuple[float, float, str] | None:
-        dialog = SubtitleEditDialog(segment, parent, config=config)
+        dialog = SubtitleEditDialog(segment, parent, config=config, target_lang=target_lang)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
         return dialog.values()

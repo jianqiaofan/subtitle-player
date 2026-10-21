@@ -14,6 +14,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from core.subtitle import SubtitleSegment
+from core.subtitle_translation import source_text
 
 TAG_FILE_SUFFIX = ".tags.json"
 TAG_DOCUMENT_VERSION = 1
@@ -172,6 +173,11 @@ def time_ms(seconds: float) -> int:
     return int(round(float(seconds) * 1000 + 1e-9))
 
 
+def _tag_match_text(segment: SubtitleSegment) -> str:
+    """标签只和原文比对。译文写在标记下面，不参与相似度。"""
+    return source_text(segment.text or "")
+
+
 def normalize_tag_text(text: str) -> str:
     return " ".join((text or "").replace("\r\n", "\n").replace("\n", " ").split())
 
@@ -302,7 +308,7 @@ def entry_from_segment(
         index=int(segment.index),
         start=float(segment.start),
         end=float(segment.end),
-        text=segment.text or "",
+        text=source_text(segment.text or ""),
         tags=order_tags(tags),
         note=note.strip(),
     )
@@ -312,7 +318,7 @@ def snapshot_entry(entry: SubtitleTagEntry, segment: SubtitleSegment) -> None:
     entry.index = int(segment.index)
     entry.start = float(segment.start)
     entry.end = float(segment.end)
-    entry.text = segment.text or ""
+    entry.text = source_text(segment.text or "")
 
 
 def load_tag_document(tag_path: Path, subtitle_name: str) -> SubtitleTagDocument:
@@ -695,12 +701,12 @@ def assign_tags(
             for index, segment in enumerate(segments)
             if index not in by_row
             and times_close(segment.start, entry.start)
-            and text_close(segment.text, entry.text)
+            and text_close(_tag_match_text(segment), entry.text)
         ]
         if len(hits) == 1:
             claim(entry, hits[0])
         elif len(hits) > 1:
-            best = max(hits, key=lambda index: text_similarity(segments[index].text, entry.text))
+            best = max(hits, key=lambda index: text_similarity(_tag_match_text(segments[index]), entry.text))
             claim(entry, best)
 
     for entry in list(pool):
@@ -709,7 +715,7 @@ def assign_tags(
             for index, segment in enumerate(segments)
             if index not in by_row
             and int(segment.index) == int(entry.index)
-            and text_close(segment.text, entry.text)
+            and text_close(_tag_match_text(segment), entry.text)
         ]
         if len(hits) == 1:
             claim(entry, hits[0])
@@ -721,7 +727,7 @@ def assign_tags(
         hits = [
             index
             for index, segment in enumerate(segments)
-            if index not in by_row and normalize_tag_text(segment.text) == key
+            if index not in by_row and normalize_tag_text(_tag_match_text(segment)) == key
         ]
         if len(hits) == 1:
             claim(entry, hits[0])

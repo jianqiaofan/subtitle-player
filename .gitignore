@@ -2,6 +2,7 @@
 subtitle_app/config.json
 subtitle_app/cloud_baselines/
 subtitle_app/video_downloader/config/user_settings.json
+subtitle_app/video_downloader/config/failed_tasks.json
 subtitle_app/video_downloader/downloads/
 subtitle_server/.env
 subtitle_server/data/

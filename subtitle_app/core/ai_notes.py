@@ -16,6 +16,7 @@ from core.ai_notes_templates import (
 from core.ai_notes_subtitle_types import get_subtitle_type
 from core.config import AppConfig, CONFIG_PATH, is_deepseek_api_key_configured
 from core.subtitle import SubtitleSegment, load_subtitle_file
+from core.subtitle_translation import source_text
 from core.subtitle_loader import find_subtitles_for_media
 
 MAX_CORPUS_CHARS = 120_000
@@ -72,7 +73,7 @@ def corpus_to_text(items: list[SubtitleCorpusItem]) -> str:
         for seg in item.segments:
             start = _format_clock(seg.start)
             end = _format_clock(seg.end)
-            text = seg.text.replace("\n", " / ")
+            text = source_text(seg.text).replace("\n", " / ")
             parts.append(f"[{start} → {end}] {text}")
         parts.append("")
     text = "\n".join(parts).strip()

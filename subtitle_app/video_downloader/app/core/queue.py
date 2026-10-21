@@ -5,6 +5,7 @@ from collections import deque
 from typing import Callable
 
 from .downloader import YtDlpDownloader
+from .failed_tasks import forget_ids, load_failed_tasks, remember_tasks
 from .settings import Settings
 from .task import DownloadTask, TaskStatus
 
@@ -58,6 +59,9 @@ class TaskQueue:
                 task.error = str(e)
                 self._log(f"[{task.id}] 解析失败: {e}")
                 self._emit(task)
+                with self._lock:
+                    if self.tasks.get(task.id) is task:
+                        self._remember_tasks([task])
 
         threading.Thread(target=worker, daemon=True, name=f"parse-{task.id}").start()
         return task
@@ -131,6 +135,7 @@ class TaskQueue:
         self._pump()
 
     def cancel(self, task_id: str) -> None:
+        dropped = False
         with self._lock:
             task = self.tasks.get(task_id)
             if not task:
@@ -139,8 +144,11 @@ class TaskQueue:
                 self._pending = deque(x for x in self._pending if x != task_id)
                 task.status = TaskStatus.CANCELLED
                 task.error = "已取消"
+                dropped = True
+                self._forget(task_id)
                 self._emit(task)
-                return
+        if dropped:
+            return
         self.downloader.request_cancel(task_id)
 
     def remove(self, task_id: str) -> None:
@@ -148,6 +156,7 @@ class TaskQueue:
         with self._lock:
             self.tasks.pop(task_id, None)
             self._pending = deque(x for x in self._pending if x != task_id)
+            self._forget(task_id)
 
     def clear_finished(self) -> None:
         with self._lock:
@@ -159,6 +168,29 @@ class TaskQueue:
             ]
             for tid in done:
                 self.tasks.pop(tid, None)
+            self._forget(*done)
+
+    def restore_failed(self) -> int:
+        """把上次留下的失败任务放回列表。"""
+        restored = load_failed_tasks()
+        fresh: list[DownloadTask] = []
+        with self._lock:
+            for task in restored:
+                if task.id in self.tasks:
+                    continue
+                self.tasks[task.id] = task
+                fresh.append(task)
+        for task in fresh:
+            self._emit(task)
+        if fresh:
+            self._log(f"已恢复 {len(fresh)} 条失败记录，选中后可再次下载")
+        return len(fresh)
+
+    def remember_open_failures(self) -> None:
+        """关闭前再写一次当前仍失败的任务。"""
+        with self._lock:
+            failed = [task for task in self.tasks.values() if task.status == TaskStatus.FAILED]
+        self._remember_tasks(failed)
 
     def list_tasks(self) -> list[DownloadTask]:
         with self._lock:
@@ -183,6 +215,7 @@ class TaskQueue:
                 t.start()
 
     def _run_download(self, task_id: str) -> None:
+        task: DownloadTask | None = None
         try:
             task = self.tasks.get(task_id)
             if not task:
@@ -190,5 +223,22 @@ class TaskQueue:
             self.downloader.download(task)
         finally:
             with self._lock:
+                if task is not None and task.id in self.tasks:
+                    if task.status == TaskStatus.FAILED:
+                        self._remember_tasks([task])
+                    elif task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
+                        self._forget(task.id)
                 self._active = max(0, self._active - 1)
             self._pump()
+
+    def _remember_tasks(self, tasks: list[DownloadTask]) -> None:
+        try:
+            remember_tasks(tasks)
+        except OSError as exc:
+            self._log(f"保存失败记录未成功: {exc}")
+
+    def _forget(self, *task_ids: str) -> None:
+        try:
+            forget_ids(set(task_ids))
+        except OSError as exc:
+            self._log(f"更新失败记录未成功: {exc}")

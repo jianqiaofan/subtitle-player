@@ -131,6 +131,13 @@ class AppConfig:
     immersive_subtitle_list_width_percent: int = 36
     # 字幕列表显示密度：normal 普通 | compact 紧凑
     subtitle_list_density: str = "normal"
+    # 旧版画面显示方式，只用于读入后迁移
+    subtitle_display_mode: str = "source"
+    subtitle_target_lang: str = "en"
+    # 画面字幕语种。空字符串表示跟原文一样
+    subtitle_onscreen_lang: str = ""
+    # 字幕路径 -> 用户指定的原文语种
+    subtitle_source_overrides: dict[str, str] = field(default_factory=dict)
     # 还没单独调整过的截图笔记，用这些样式当文本框的初始值。字号是底图高度的比例。
     screenshot_note_opacity: float = 0.85
     screenshot_note_font_size: float = 0.045
@@ -353,6 +360,20 @@ def load_config() -> AppConfig:
     if density not in {"normal", "compact"}:
         density = "normal"
     cfg.subtitle_list_density = density
+    from core.subtitle_translation import (
+        clean_source_overrides,
+        language_code,
+        normalize_display_mode,
+        normalize_language,
+    )
+
+    cfg.subtitle_display_mode = normalize_display_mode(cfg.subtitle_display_mode)
+    cfg.subtitle_target_lang = normalize_language(cfg.subtitle_target_lang)
+    onscreen = language_code(str(cfg.subtitle_onscreen_lang or ""))
+    if onscreen is None and cfg.subtitle_display_mode in {"target", "both"}:
+        onscreen = cfg.subtitle_target_lang
+    cfg.subtitle_onscreen_lang = onscreen or ""
+    cfg.subtitle_source_overrides = clean_source_overrides(cfg.subtitle_source_overrides)
     try:
         cfg.screenshot_note_opacity = max(0.15, min(1.0, float(cfg.screenshot_note_opacity)))
     except (TypeError, ValueError):

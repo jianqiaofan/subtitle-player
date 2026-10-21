@@ -9,6 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from core.subtitle import SubtitleSegment
+from core.subtitle_translation import source_text
 
 PLAIN_TEXT_FILENAME_SUFFIX = "纯文字"
 
@@ -159,7 +160,7 @@ def segments_to_paragraphs(
 
     gap = max(0.0, gap_seconds)
     paragraphs: list[str] = []
-    current_texts: list[str] = [segments[0].text]
+    current_texts: list[str] = [source_text(segments[0].text)]
 
     for index in range(1, len(segments)):
         previous = segments[index - 1]
@@ -169,9 +170,9 @@ def segments_to_paragraphs(
             paragraph = _join_segment_texts(current_texts)
             if paragraph:
                 paragraphs.append(paragraph)
-            current_texts = [current.text]
+            current_texts = [source_text(current.text)]
         else:
-            current_texts.append(current.text)
+            current_texts.append(source_text(current.text))
 
     final = _join_segment_texts(current_texts)
     if final:

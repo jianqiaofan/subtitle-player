@@ -25,7 +25,7 @@ _MAX_TAG_LENGTH = 48
 
 
 class SubtitleTagDialog(QDialog):
-    """选择标签和备注。多选时备注默认不改，勾选后才覆盖。"""
+    """选择标签和备注。多条追加时只加勾选的标签，备注默认不改。"""
 
     def __init__(
         self,
@@ -38,6 +38,7 @@ class SubtitleTagDialog(QDialog):
         notes_differ: bool,
         intro: str | None = None,
         show_note: bool = True,
+        append: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("标签")
@@ -46,13 +47,15 @@ class SubtitleTagDialog(QDialog):
         self.setStyleSheet(DARK_STYLE)
         self._checks: dict[str, QCheckBox] = {}
         self._custom_count = 0
-        selected = set(selected_tags)
+        selected = set() if append else set(selected_tags)
 
         layout = QVBoxLayout(self)
         if intro:
             layout.addWidget(QLabel(intro))
-        elif row_count > 1:
-            layout.addWidget(QLabel(f"将把所选 {row_count} 条字幕设为下面这些标签"))
+        elif append:
+            layout.addWidget(
+                QLabel(f"给所选 {row_count} 条字幕加上勾选的标签。各条原来的标签会保留。")
+            )
         else:
             layout.addWidget(QLabel("选择标签，确认后显示在这条字幕上"))
 

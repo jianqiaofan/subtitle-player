@@ -69,6 +69,7 @@ class MainWindow(ctk.CTk):
         self._row_map: dict[str, str] = {}  # task_id -> tree iid (same)
         self._last_clipboard = ""
         self._build()
+        self.queue.restore_failed()
         self.after(800, self._clipboard_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -158,9 +159,12 @@ class MainWindow(ctk.CTk):
         import tkinter.font as tkfont
         import tkinter.ttk as ttk
 
-        # 与「开始下载选中」按钮同一套缩放后的字体高度
+        # 与「开始下载选中」按钮同一套缩放后的字体高度。
+        # 字体缩放只在控件上可用，主窗口调用会触发 AssertionError。
+        if start_btn is None:
+            raise RuntimeError("开始下载按钮未创建")
         self._table_font = tkfont.Font(
-            root=self, font=self._apply_font_scaling(start_btn.cget("font"))
+            root=self, font=start_btn._apply_font_scaling(start_btn.cget("font"))
         )
         row_h = self._table_font.metrics("linespace") + 8
 
@@ -540,6 +544,7 @@ class MainWindow(ctk.CTk):
         self.after(1200, self._clipboard_tick)
 
     def _on_close(self) -> None:
+        self.queue.remember_open_failures()
         self.settings.set("window_geometry", self.geometry())
         self.settings.save()
         self.destroy()

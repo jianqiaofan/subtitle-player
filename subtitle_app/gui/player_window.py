@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import time
@@ -44,6 +45,8 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStyle,
+    QStyleOptionComboBox,
+    QStylePainter,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
@@ -103,6 +106,20 @@ from core.console_window import (
 )
 from core.transcriber import clear_model_cache, is_cuda_available
 from core.subtitle import SubtitleSegment, find_segment_index_at_time, write_subtitle_file
+from core.subtitle_translate_worker import SubtitleTranslateWorker
+from core.subtitle_translation import (
+    BATCH_SIZE,
+    collect_untranslated_rows,
+    cue_needs_translation,
+    detect_source_language,
+    language_catalog,
+    language_code,
+    onscreen_cue_text,
+    onscreen_language,
+    segment_index_at_or_after,
+    set_translation,
+    source_text,
+)
 from core.cloud_sync import (
     DEFAULT_CLOUD_SERVER,
     apply_shared_download,
@@ -221,6 +238,74 @@ from gui.translate_hotkey import HotkeyLineEdit, TranslateHotkeyHelpDialog
 from gui.vocabulary_dialog import VocabularyDialog, VocabularyProgressDialog
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".opus"}
+VIDEO_EXTENSIONS = frozenset(MEDIA_EXTENSIONS - AUDIO_EXTENSIONS)
+_NATURAL_NAME_SPLIT = re.compile(r"(\d+)")
+
+
+def natural_name_key(name: str) -> tuple:
+    folded = name.casefold()
+    pieces: list[tuple[int, object]] = []
+    for part in _NATURAL_NAME_SPLIT.split(folded):
+        if part.isdigit():
+            pieces.append((0, int(part)))
+        else:
+            pieces.append((1, part))
+    pieces.append((2, folded))
+    return tuple(pieces)
+
+
+def list_folder_videos(folder: Path | None) -> list[Path]:
+    """同目录下可播放的视频，按文件名中的数字自然顺序排列。"""
+    if folder is None or not folder.is_dir():
+        return []
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return []
+    videos = [
+        item
+        for item in entries
+        if item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS
+    ]
+    videos.sort(key=lambda item: natural_name_key(item.name))
+    return videos
+
+
+_EPISODE_BUTTON_TEXT = "选集"
+
+
+class _EpisodeComboBox(QComboBox):
+    def __init__(self, before_popup, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._before_popup = before_popup
+
+    def sizeHint(self) -> QSize:
+        text_width = self.fontMetrics().horizontalAdvance(_EPISODE_BUTTON_TEXT)
+        height = max(32, self.fontMetrics().height() + 12)
+        return QSize(max(72, text_width + 52), height)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(self.sizeHint())
+
+    def paintEvent(self, event) -> None:
+        del event
+        painter = QStylePainter(self)
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        option.currentText = _EPISODE_BUTTON_TEXT
+        painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, option)
+        painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, option)
+
+    def showPopup(self) -> None:
+        self._before_popup()
+        view = self.view()
+        if view is not None:
+            metrics = self.fontMetrics()
+            width = self.width()
+            for index in range(self.count()):
+                width = max(width, metrics.horizontalAdvance(self.itemText(index)) + 36)
+            view.setMinimumWidth(min(width, 640))
+        super().showPopup()
 
 
 class PlayerWindow(QMainWindow):
@@ -237,6 +322,13 @@ class PlayerWindow(QMainWindow):
         self._seeking = False
         self._subtitle_auto_follow = True
         self._subtitle_menu_open = False
+        self._translate_worker: SubtitleTranslateWorker | None = None
+        self._translate_job_id = 0
+        self._translate_job_target = "en"
+        self._translate_in_flight = False
+        self._translate_follow = False
+        self._translation_watch_row = -2
+        self._detected_source_lang = "en"
         self._transcribe_proc: subprocess.Popen | None = None
         self._video_download_proc: subprocess.Popen | None = None
         self._ai_notes_worker: AiNotesWorker | None = None
@@ -286,6 +378,9 @@ class PlayerWindow(QMainWindow):
         self._open_nudge_audio_overridden = False
         self._open_nudge_restore_muted = False
         self._play_after_open_pause = False
+        self._refreshing_episodes = False
+        self._episode_signature: tuple[tuple[str, ...], int, str] | None = None
+        self._pending_episode_switch: tuple[Path, bool] | None = None
         self._open_pause_ui_done = True
         self._open_frame_seen = False
         self._open_nudge_timer = QTimer(self)
@@ -421,8 +516,8 @@ class PlayerWindow(QMainWindow):
         self._screenshot_preview_btn.clicked.connect(self._open_screenshot_preview)
         bar.addWidget(self._screenshot_preview_btn)
 
-        onscreen_btn = QPushButton("画面字幕")
-        onscreen_btn.setToolTip("调整画面叠加字幕的显示、字号、颜色、底条透明度、宽度与位置")
+        onscreen_btn = QPushButton("字幕设置")
+        onscreen_btn.setToolTip("调整画面字幕的显示、字号、颜色、底条透明度、宽度与位置")
         onscreen_btn.clicked.connect(self._open_onscreen_subtitle_settings)
         bar.addWidget(onscreen_btn)
 
@@ -431,6 +526,8 @@ class PlayerWindow(QMainWindow):
         action_transcribe.triggered.connect(self._open_transcribe_tool)
         action_download = tools_menu.addAction("视频下载")
         action_download.triggered.connect(self._open_video_download_tool)
+        action_concat = tools_menu.addAction("视频拼接")
+        action_concat.triggered.connect(self._open_video_concat)
         tools_menu.addSeparator()
         self._action_ai_notes = tools_menu.addAction("AI笔记")
         self._action_ai_notes.triggered.connect(self._generate_ai_notes)
@@ -466,7 +563,7 @@ class PlayerWindow(QMainWindow):
         tools_btn = self._create_toolbar_menu_button(
             "工具",
             style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
-            "转写、下载、笔记与字幕工具",
+            "转写、下载、拼接、笔记与字幕工具",
         )
         tools_btn.setMenu(tools_menu)
         bar.addWidget(tools_btn)
@@ -1044,6 +1141,17 @@ class PlayerWindow(QMainWindow):
         self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         bar.addWidget(self.speed_combo)
 
+        self.episode_combo = _EpisodeComboBox(self._refresh_episode_list)
+        self.episode_combo.setMinimumWidth(72)
+        self.episode_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.episode_combo.setMinimumContentsLength(2)
+        self.episode_combo.setToolTip("切换当前文件夹里的其他视频")
+        self.episode_combo.activated[int].connect(self._on_episode_selected)
+        self._refresh_episode_list()
+        bar.addWidget(self.episode_combo)
+
         self.study_countdown_btn = QPushButton("倒计时")
         self.study_countdown_btn.setMinimumWidth(72)
         self.study_countdown_btn.setToolTip(
@@ -1051,6 +1159,22 @@ class PlayerWindow(QMainWindow):
         )
         self.study_countdown_btn.clicked.connect(self._on_study_countdown_clicked)
         bar.addWidget(self.study_countdown_btn)
+
+        self.onscreen_visibility_btn = QPushButton("显示字幕")
+        self.onscreen_visibility_btn.setMinimumWidth(84)
+        self.onscreen_visibility_btn.clicked.connect(self._toggle_onscreen_subtitle)
+        bar.addWidget(self.onscreen_visibility_btn)
+
+        self._subtitle_language_combo = QComboBox()
+        self._subtitle_language_combo.setObjectName("subtitleLanguageCombo")
+        self._subtitle_language_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._subtitle_language_combo.setMinimumWidth(84)
+        self._subtitle_language_combo.currentIndexChanged.connect(
+            self._on_onscreen_language_selected
+        )
+        bar.addWidget(self._subtitle_language_combo)
+        self._sync_subtitle_language_combo()
+        self._sync_onscreen_visibility_button()
 
         self.mute_btn = QPushButton()
         self._configure_icon_button(self.mute_btn, "静音")
@@ -1107,6 +1231,33 @@ class PlayerWindow(QMainWindow):
         self._study_countdown_timer.stop()
         self._study_countdown_remaining = 0
         self._update_study_countdown_button()
+
+    def _sync_onscreen_visibility_button(self, enabled: bool | None = None) -> None:
+        button = getattr(self, "onscreen_visibility_btn", None)
+        if button is None:
+            return
+        if enabled is None:
+            enabled = bool(getattr(self._config, "onscreen_subtitle_enabled", True))
+        showing = bool(enabled)
+        button.setText("显示字幕" if showing else "隐藏字幕")
+        combo = getattr(self, "_subtitle_language_combo", None)
+        if combo is not None:
+            combo.setEnabled(showing)
+            combo.setCursor(
+                Qt.CursorShape.PointingHandCursor if showing else Qt.CursorShape.ArrowCursor
+            )
+
+    def _toggle_onscreen_subtitle(self) -> None:
+        style = OnScreenSubtitleStyle.from_config(self._config)
+        style.enabled = not style.enabled
+        if hasattr(self, "_immersive_list_width_percent"):
+            style.immersive_list_width_percent = int(self._immersive_list_width_percent)
+        apply_onscreen_style_to_config(self._config, style)
+        if hasattr(self, "_onscreen_overlay"):
+            self._onscreen_overlay.set_style(style)
+            self._update_onscreen_subtitle(self._player.position() / 1000.0)
+            self._media_viewport.refresh_stacking()
+        self._sync_onscreen_visibility_button(style.enabled)
 
     def _on_study_countdown_clicked(self) -> None:
         default_minutes = 10
@@ -1234,6 +1385,7 @@ class PlayerWindow(QMainWindow):
         self._persist_last_media_dir(media_path)
         self.media_label.setText(media_path.name)
         self._open_dir_btn.setEnabled(True)
+        self._refresh_episode_list()
         self._pending_seek_ms = resume_ms
         self._pending_play_after_seek = False
         self._awaiting_reload_seek = False
@@ -1315,6 +1467,7 @@ class PlayerWindow(QMainWindow):
     def _enter_timeline_mode(self) -> None:
         if self._media_path is None:
             return
+        self._cancel_translation_run()
         self._timeline_mode = True
         self._subtitle_panel_title.setText("时间线（点击跳转）")
         self._timeline_step_combo.show()
@@ -1609,6 +1762,7 @@ class PlayerWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(notes_path.resolve())))
 
     def _select_subtitle_path(self, path: Path) -> None:
+        self._cancel_translation_run()
         if (
             self._media_path is not None
             and path == timeline_virtual_path(self._media_path)
@@ -1630,10 +1784,12 @@ class PlayerWindow(QMainWindow):
         except Exception as exc:
             self._error_box("字幕加载失败", str(exc))
             self._segments = []
+        self._remember_subtitle_language()
         self._reset_tag_filter()
         self._tag_path = tag_path_for_subtitle(path)
         self._tag_document = load_tag_document(self._tag_path, path.name)
         self._populate_subtitle_list()
+        self._maybe_request_translation()
 
     def _refresh_subtitle_options(self) -> None:
         self.subtitle_combo.blockSignals(True)
@@ -1693,11 +1849,13 @@ class PlayerWindow(QMainWindow):
             return
         self._leave_timeline_mode()
         self._absorb_timeline_tags()
+        self._cancel_translation_run()
         try:
             self._segments = load_subtitles(path)
         except Exception as exc:
             self._error_box("字幕加载失败", str(exc))
             self._segments = []
+        self._remember_subtitle_language()
         self._load_tag_document_for_current_subtitle()
         self._populate_subtitle_list()
         preview_seconds = self._player.position() / 1000.0
@@ -1706,6 +1864,7 @@ class PlayerWindow(QMainWindow):
         if self._segments and (self._player.duration() > 0 or self._holding_open_pause):
             self._sync_subtitle_highlight(preview_seconds, force=True)
         self._update_onscreen_subtitle(preview_seconds)
+        self._maybe_request_translation()
 
     def _populate_subtitle_list(self) -> None:
         self._bind_subtitle_tags()
@@ -1755,6 +1914,234 @@ class PlayerWindow(QMainWindow):
         )
         save_config(self._config)
         self._apply_subtitle_list_density(persist=False)
+
+    def _subtitle_onscreen_lang(self) -> str:
+        return language_code(getattr(self._config, "subtitle_onscreen_lang", "")) or ""
+
+    def _selected_onscreen_lang(self) -> str:
+        return onscreen_language(self._subtitle_onscreen_lang(), self._subtitle_source_lang())
+
+    def _subtitle_source_lang(self) -> str:
+        path = self._current_subtitle_save_path()
+        overrides = getattr(self._config, "subtitle_source_overrides", {}) or {}
+        if path is not None and isinstance(overrides, dict):
+            saved = language_code(str(overrides.get(str(path.resolve()), "")))
+            if saved:
+                return saved
+        detected = language_code(getattr(self, "_detected_source_lang", ""))
+        return detected or "en"
+
+    def _list_subtitle_text(self, text: str) -> str:
+        return source_text(text)
+
+    def _onscreen_subtitle_text(self, text: str) -> str:
+        return onscreen_cue_text(
+            text,
+            self._subtitle_source_lang(),
+            self._subtitle_onscreen_lang(),
+        )
+
+    def _remember_subtitle_language(self) -> None:
+        self._detected_source_lang = detect_source_language(
+            [segment.text for segment in self._segments]
+        )
+        self._sync_subtitle_language_combo()
+
+    def _sync_subtitle_language_combo(self) -> None:
+        combo = getattr(self, "_subtitle_language_combo", None)
+        if combo is None:
+            return
+        source = self._subtitle_source_lang()
+        selected = self._subtitle_onscreen_lang()
+        if selected == source:
+            selected = ""
+        combo.blockSignals(True)
+        combo.clear()
+        for code, label in language_catalog.choices(source):
+            combo.addItem(label, code)
+        index = combo.findData(selected)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+        self._sync_onscreen_visibility_button()
+
+    def _on_onscreen_language_selected(self, index: int) -> None:
+        combo = getattr(self, "_subtitle_language_combo", None)
+        if combo is None or index < 0:
+            return
+        code = str(combo.itemData(index) or "")
+        if code == self._subtitle_onscreen_lang():
+            return
+        self._config.subtitle_onscreen_lang = code
+        save_config(self._config)
+        self._apply_subtitle_language_view()
+
+    def _apply_subtitle_language_view(self) -> None:
+        self._sync_subtitle_language_combo()
+        if hasattr(self, "subtitle_list"):
+            self._refresh_subtitle_list_texts()
+            self._refresh_subtitle_list_item_layout()
+        if hasattr(self, "_player"):
+            self._update_onscreen_subtitle(self._player.position() / 1000.0)
+        self._maybe_request_translation(continue_run=True)
+
+    def _set_translate_status(self, message: str) -> None:
+        label = getattr(self, "live_status_label", None)
+        if label is None:
+            return
+        current = label.text()
+        if message:
+            if not current or current.startswith("翻译"):
+                self._update_live_status(message)
+            return
+        if current.startswith("翻译"):
+            self._update_live_status("")
+
+    def _cancel_translation_run(self) -> None:
+        self._translate_job_id += 1
+        self._translate_in_flight = False
+        self._translate_follow = False
+        self._translation_watch_row = -2
+        self._set_translate_status("")
+
+    def _playback_seconds(self) -> float:
+        return self._player.position() / 1000.0
+
+    def _note_playback_cue(self) -> None:
+        """播放换到另一条字幕时才看要不要翻译。同一条里的进度上报直接返回。"""
+        if not self._segments or self._timeline_mode:
+            return
+        seconds = self._playback_seconds()
+        row = find_segment_index_at_time(self._segments, seconds)
+        cue_row = -1
+        if 0 <= row < len(self._segments):
+            segment = self._segments[row]
+            if segment.start <= seconds <= segment.end:
+                cue_row = row
+        if cue_row == self._translation_watch_row:
+            return
+        self._translation_watch_row = cue_row
+        if cue_row >= 0:
+            self._maybe_request_translation()
+
+    def _current_cue_needs_translation(self) -> bool:
+        if not self._segments:
+            return False
+        seconds = self._playback_seconds()
+        row = find_segment_index_at_time(self._segments, seconds)
+        if row < 0 or row >= len(self._segments):
+            return False
+        segment = self._segments[row]
+        if not (segment.start <= seconds <= segment.end):
+            return False
+        return cue_needs_translation(segment.text or "", self._selected_onscreen_lang())
+
+    def _maybe_request_translation(self, *, continue_run: bool = False) -> None:
+        if self._translate_in_flight or self._timeline_mode or not self._segments:
+            return
+        if self._selected_onscreen_lang() == self._subtitle_source_lang():
+            self._translate_follow = False
+            self._set_translate_status("")
+            return
+        if not continue_run and not self._current_cue_needs_translation():
+            return
+        if not self._subtitle_editing_allowed():
+            return
+        if not is_deepseek_configured(self._config):
+            self._set_translate_status("翻译：未配置 DeepSeek")
+            self._translate_follow = False
+            return
+        start = segment_index_at_or_after(self._segments, self._playback_seconds())
+        rows = collect_untranslated_rows(
+            self._segments,
+            start,
+            self._selected_onscreen_lang(),
+            BATCH_SIZE,
+        )
+        if not rows:
+            self._translate_follow = False
+            self._set_translate_status("")
+            return
+        self._start_translation_batch(rows)
+
+    def _start_translation_batch(self, rows: list[int]) -> None:
+        target = self._selected_onscreen_lang()
+        items: list[dict[str, object]] = []
+        for row in rows:
+            source = source_text(self._segments[row].text or "")
+            if source.strip():
+                items.append({"row": row, "source": source})
+        if not items:
+            return
+        self._translate_job_id += 1
+        job_id = self._translate_job_id
+        self._translate_job_target = target
+        self._translate_in_flight = True
+        self._translate_follow = True
+        self._set_translate_status(f"翻译：正在翻译 {len(items)} 句")
+        worker = SubtitleTranslateWorker(job_id, items, target, self._config)
+        worker.succeeded.connect(self._on_translation_batch)
+        worker.failed.connect(self._on_translation_failed)
+        worker.finished.connect(lambda worker=worker: self._release_translate_worker(worker))
+        self._translate_worker = worker
+        worker.start()
+
+    def _release_translate_worker(self, worker: SubtitleTranslateWorker) -> None:
+        if self._translate_worker is worker:
+            self._translate_worker = None
+
+    def _on_translation_failed(self, job_id: int, message: str) -> None:
+        if job_id != self._translate_job_id:
+            return
+        self._translate_in_flight = False
+        self._translate_follow = False
+        self._set_translate_status(f"翻译：{message}")
+
+    def _on_translation_batch(self, job_id: int, payload: object) -> None:
+        if job_id != self._translate_job_id:
+            return
+        items = payload if isinstance(payload, list) else []
+        target = self._translate_job_target
+        applied_rows: list[int] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                row = int(item.get("row"))
+            except (TypeError, ValueError):
+                continue
+            if row < 0 or row >= len(self._segments):
+                continue
+            expected = str(item.get("source") or "")
+            translation = str(item.get("translation") or "").strip()
+            if not translation:
+                continue
+            segment = self._segments[row]
+            if source_text(segment.text or "") != expected:
+                continue
+            new_text = set_translation(segment.text or "", target, translation)
+            if new_text == (segment.text or ""):
+                continue
+            self._segments[row] = SubtitleSegment(
+                segment.index,
+                segment.start,
+                segment.end,
+                new_text,
+            )
+            applied_rows.append(row)
+        self._translate_in_flight = False
+        if applied_rows:
+            for row in applied_rows:
+                list_row = self._list_row_for_segment(row)
+                list_item = self.subtitle_list.item(list_row) if list_row >= 0 else None
+                if list_item is not None:
+                    self._apply_subtitle_item_payload(list_item, self._segments[row], row)
+            self._refresh_subtitle_list_item_layout()
+            self._update_onscreen_subtitle(self._playback_seconds())
+            self._persist_subtitle_edits()
+            self._maybe_request_translation(continue_run=True)
+            return
+        self._translate_follow = False
+        self._set_translate_status("翻译：这一组没有写回")
 
     def _apply_subtitle_list_density(self, *, persist: bool = True) -> None:
         if persist:
@@ -1835,7 +2222,7 @@ class PlayerWindow(QMainWindow):
         tags = list(entry.tags) if entry is not None else []
         note = entry.note if entry is not None else ""
         compact = self._is_subtitle_list_compact()
-        body = (seg.text or "").replace("\r\n", "\n").strip()
+        body = self._list_subtitle_text(seg.text or "")
         start = self._format_clock(seg.start)
         end = self._format_clock(seg.end)
         return {
@@ -2072,7 +2459,7 @@ class PlayerWindow(QMainWindow):
         nearest = -1
         nearest_gap: float | None = None
         for index, segment in enumerate(self._segments):
-            text = " ".join((segment.text or "").replace("\r\n", "\n").split())
+            text = " ".join(self._list_subtitle_text(segment.text or "").split())
             if not text:
                 continue
             if segment.start <= seconds <= segment.end:
@@ -2095,7 +2482,7 @@ class PlayerWindow(QMainWindow):
         picks: list[tuple[str, str, bool]] = []
         for index in range(start, end):
             segment = self._segments[index]
-            text = " ".join((segment.text or "").replace("\r\n", "\n").split())
+            text = " ".join(self._list_subtitle_text(segment.text or "").split())
             if not text:
                 continue
             picks.append((self._format_clock(segment.start), text, index == row))
@@ -2625,30 +3012,47 @@ class PlayerWindow(QMainWindow):
         rows = [row for row in rows if 0 <= row < len(self._segments)]
         if not rows or not self._subtitle_editing_allowed():
             return
+        append = len(rows) > 1
         entries = [self._tag_by_row.get(row) for row in rows]
-        tag_sets = [list(entry.tags) if entry is not None else [] for entry in entries]
-        shared = [tag for tag in tag_sets[0] if all(tag in tags for tags in tag_sets)]
+        if append:
+            selected: list[str] = []
+        else:
+            selected = list(entries[0].tags) if entries[0] is not None else []
         notes = [entry.note if entry is not None else "" for entry in entries]
         notes_differ = len(set(notes)) > 1
         dialog = SubtitleTagDialog(
             self,
-            selected_tags=shared,
+            selected_tags=selected,
             note="" if notes_differ else notes[0],
             custom_tags=self._custom_tags_for_current_media(),
             row_count=len(rows),
             notes_differ=notes_differ,
+            append=append,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
-        new_tags = dialog.tags()
+        chosen = dialog.tags()
         new_note = dialog.note()
+        if append and not chosen and new_note is None:
+            return
+        changed = False
         for row in rows:
             segment = self._segments[row]
             entry = self._tag_by_row.get(row)
+            existing = list(entry.tags) if entry is not None else []
+            new_tags = order_tags(existing + chosen) if append else chosen
             note = new_note if new_note is not None else (entry.note if entry is not None else "")
+            if (
+                append
+                and entry is not None
+                and set(new_tags) == set(existing)
+                and (new_note is None or new_note == (entry.note or "").strip())
+            ):
+                continue
             if not new_tags and not note.strip():
                 if entry is not None:
                     retire_tag_entry(entry)
+                    changed = True
                 continue
             if entry is None:
                 entry = entry_from_segment(segment, new_tags, note)
@@ -2659,6 +3063,9 @@ class PlayerWindow(QMainWindow):
                 set_entry_tags(entry, new_tags)
                 if new_note is not None:
                     set_entry_note(entry, note)
+            changed = True
+        if not changed:
+            return
         self._save_subtitle_tags()
         self._bind_subtitle_tags()
         self._refresh_subtitle_list_texts()
@@ -3099,9 +3506,7 @@ class PlayerWindow(QMainWindow):
         texts: list[str] = []
         for row in rows:
             if 0 <= row < len(self._segments):
-                texts.append(
-                    (self._segments[row].text or "").replace("\r\n", "\n").strip()
-                )
+                texts.append(self._list_subtitle_text(self._segments[row].text or ""))
         return "\n".join(texts)
 
     def _on_subtitle_context_menu(self, pos) -> None:
@@ -3143,7 +3548,7 @@ class PlayerWindow(QMainWindow):
                 edit_action = menu.addAction("编辑")
                 edit_action.setEnabled(not multi)
             if tag_allowed:
-                tag_action = menu.addAction("标签")
+                tag_action = menu.addAction("追加标签" if multi else "标签")
                 clear_tag_action = menu.addAction("清除标签")
                 clear_tag_action.setEnabled(self._rows_have_tags(selected_rows))
             copy_action = menu.addAction("复制")
@@ -3321,7 +3726,15 @@ class PlayerWindow(QMainWindow):
             )
             return
         seg = self._segments[row]
-        result = SubtitleEditDialog.edit_segment(seg, self, config=self._config)
+        target_lang = self._selected_onscreen_lang()
+        if target_lang == self._subtitle_source_lang():
+            target_lang = None
+        result = SubtitleEditDialog.edit_segment(
+            seg,
+            self,
+            config=self._config,
+            target_lang=target_lang,
+        )
         if result is None:
             return
         new_start, new_end, new_text = result
@@ -3336,12 +3749,14 @@ class PlayerWindow(QMainWindow):
             self._persist_subtitle_edits()
             self._populate_subtitle_list()
             self._sync_subtitle_highlight(self._player.position() / 1000.0, force=True)
+            self._maybe_request_translation()
             return
         list_row = self._list_row_for_segment(row)
         item = self.subtitle_list.item(list_row if list_row >= 0 else row)
         if item is not None:
             self._apply_subtitle_item_payload(item, self._segments[row], row)
         self._persist_subtitle_edits()
+        self._maybe_request_translation()
 
     def _current_subtitle_save_path(self) -> Path | None:
         if not self._media_path:
@@ -3492,6 +3907,7 @@ class PlayerWindow(QMainWindow):
         self._update_time_label(position_ms, self._player.duration())
         self._sync_subtitle_highlight(position_ms / 1000.0)
         self._update_onscreen_subtitle(position_ms / 1000.0)
+        self._note_playback_cue()
 
     def _update_time_label(self, position_ms: int, duration_ms: int) -> None:
         self.time_label.setText(
@@ -3537,7 +3953,7 @@ class PlayerWindow(QMainWindow):
         if row < 0:
             overlay.set_text("")
             return
-        overlay.set_text(self._segments[row].text)
+        overlay.set_text(self._onscreen_subtitle_text(self._segments[row].text or ""))
 
     def eventFilter(self, obj, event) -> bool:
         handle = getattr(self, "_immersive_resize_handle", None)
@@ -3653,6 +4069,100 @@ class PlayerWindow(QMainWindow):
     def _on_slider_moved(self, value: int) -> None:
         if self._seeking:
             self._update_time_label(value, self._player.duration())
+
+    def _refresh_episode_list(self) -> None:
+        combo = self.episode_combo
+        current: Path | None = None
+        if self._media_path is not None:
+            try:
+                current = self._media_path.resolve()
+            except OSError:
+                current = self._media_path
+        videos = list_folder_videos(current.parent if current is not None else None)
+        resolved: list[Path] = []
+        selected = -1
+        for path in videos:
+            try:
+                item = path.resolve()
+            except OSError:
+                item = path
+            if current is not None and item == current:
+                selected = len(resolved)
+            resolved.append(item)
+        signature = (
+            tuple(str(path) for path in resolved),
+            selected,
+            str(current) if current is not None else "",
+        )
+        if signature == self._episode_signature:
+            return
+        self._episode_signature = signature
+        self._refreshing_episodes = True
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            for index, path in enumerate(resolved):
+                combo.addItem(path.name, str(path))
+                combo.setItemData(index, str(path), Qt.ItemDataRole.ToolTipRole)
+            if resolved:
+                combo.setEnabled(True)
+                combo.setCurrentIndex(selected)
+                if selected >= 0 and current is not None:
+                    combo.setToolTip(str(current))
+                else:
+                    combo.setToolTip("选择同文件夹中的视频")
+            else:
+                combo.setEnabled(False)
+                if current is None:
+                    combo.setToolTip("打开视频后，可在此切换同文件夹里的视频")
+                else:
+                    combo.setToolTip("这个文件夹里没有可播放的视频")
+        finally:
+            combo.blockSignals(False)
+            self._refreshing_episodes = False
+
+    def _on_episode_selected(self, index: int) -> None:
+        if self._refreshing_episodes or index < 0:
+            return
+        raw = self.episode_combo.itemData(index)
+        if not raw:
+            return
+        target = Path(str(raw))
+        if self._media_path is not None:
+            try:
+                if target.resolve() == self._media_path.resolve():
+                    return
+            except OSError:
+                return
+        was_playing = (
+            self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            or self._play_after_open_pause
+        )
+        self._pending_episode_switch = (target, was_playing)
+        QTimer.singleShot(0, self._apply_episode_switch)
+
+    def _apply_episode_switch(self) -> None:
+        pending = self._pending_episode_switch
+        self._pending_episode_switch = None
+        if pending is None:
+            return
+        target, was_playing = pending
+        if not target.is_file():
+            QMessageBox.information(self, "选集", f"找不到文件：\n{target}")
+            self._refresh_episode_list()
+            return
+        try:
+            same = (
+                self._media_path is not None
+                and target.resolve() == self._media_path.resolve()
+            )
+        except OSError:
+            same = False
+        if same:
+            return
+        self.load_media(target)
+        if was_playing:
+            self._play_after_open_pause = True
 
     def _on_speed_changed(self, index: int) -> None:
         if index < 0:
@@ -4707,6 +5217,14 @@ class PlayerWindow(QMainWindow):
             self._error_box("无法启动", f"启动视频下载工具失败：\n{exc}")
             return
 
+    def _open_video_concat(self) -> None:
+        from gui.video_concat_dialog import start_video_concat
+
+        initial = ""
+        if self._media_path is not None:
+            initial = str(self._media_path.parent)
+        start_video_concat(self, initial)
+
     def _on_transcription_finished(self) -> None:
         if self._media_path:
             self._refresh_subtitle_options()
@@ -4768,6 +5286,7 @@ class PlayerWindow(QMainWindow):
             style.immersive_list_width_percent = int(self._immersive_list_width_percent)
             self._onscreen_overlay.set_style(style)
             self._apply_immersive_from_style(style)
+            self._sync_onscreen_visibility_button(style.enabled)
 
         result = OnScreenSubtitleSettingsDialog.edit_style(
             current, self, on_preview=on_preview
@@ -4775,11 +5294,13 @@ class PlayerWindow(QMainWindow):
         if result is None:
             self._onscreen_overlay.set_style(previous)
             self._apply_immersive_from_style(previous)
+            self._sync_onscreen_visibility_button(previous.enabled)
             return
         result.immersive_list_width_percent = int(self._immersive_list_width_percent)
         apply_onscreen_style_to_config(self._config, result)
         self._onscreen_overlay.set_style(result)
         self._apply_immersive_from_style(result)
+        self._sync_onscreen_visibility_button(result.enabled)
         self._update_onscreen_subtitle(self._player.position() / 1000.0)
         self._media_viewport.refresh_stacking()
 

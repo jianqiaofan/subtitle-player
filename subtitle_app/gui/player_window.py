@@ -10,6 +10,7 @@ from PyQt6.QtCore import QEvent, QSize, Qt, QTimer, QUrl
 from PyQt6.QtGui import (
     QAction,
     QColor,
+    QCursor,
     QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
@@ -765,6 +766,7 @@ class PlayerWindow(QMainWindow):
         self.subtitle_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.subtitle_list.customContextMenuRequested.connect(self._on_subtitle_context_menu)
         self.subtitle_list.itemClicked.connect(self._on_subtitle_clicked)
+        self.subtitle_list.itemDoubleClicked.connect(self._on_subtitle_double_clicked)
         self._subtitle_delegate = SubtitleListDelegate(self.subtitle_list)
         self._subtitle_delegate.noteActivated.connect(
             lambda index: self._open_note_from_list(self.subtitle_list, index)
@@ -790,6 +792,8 @@ class PlayerWindow(QMainWindow):
         self._note_preview.installEventFilter(self)
         self._note_hover_entry_id = ""
         self._ignore_note_row_click = False
+        # 双击会再发一次 itemClicked；记下这次单击也要开始播放。
+        self._play_subtitle_after_click = False
         self._note_preview_hide_timer = QTimer(self)
         self._note_preview_hide_timer.setSingleShot(True)
         self._note_preview_hide_timer.setInterval(250)
@@ -859,7 +863,7 @@ class PlayerWindow(QMainWindow):
                 if len(sizes) >= 2 and sizes[1] > 0:
                     self._splitter_sizes_before_list_hidden = list(sizes)
             self._subtitle_panel.hide()
-            self._immersive_resize_handle.hide()
+            self._hide_immersive_resize_handle()
             if not self._immersive_list_active:
                 total = max(self._content_splitter.width(), 1)
                 self._content_splitter.setSizes([total, 0])
@@ -869,6 +873,7 @@ class PlayerWindow(QMainWindow):
         if self._immersive_list_active:
             self._layout_immersive_list_panel()
             return
+        self._hide_immersive_resize_handle()
         self._subtitle_panel.show()
         restored = self._splitter_sizes_before_list_hidden
         if restored and len(restored) >= 2 and sum(restored) > 0:
@@ -911,7 +916,7 @@ class PlayerWindow(QMainWindow):
             elif enabled:
                 self._apply_immersive_list_chrome(True, opacity)
                 self._subtitle_panel.hide()
-                self._immersive_resize_handle.hide()
+                self._hide_immersive_resize_handle()
                 self._sync_onscreen_immersive_metrics()
             return
 
@@ -929,16 +934,16 @@ class PlayerWindow(QMainWindow):
                 self._immersive_resize_handle.raise_()
             else:
                 self._subtitle_panel.hide()
-                self._immersive_resize_handle.hide()
+                self._hide_immersive_resize_handle()
                 self._sync_onscreen_immersive_metrics()
         else:
-            self._immersive_resizing = False
-            if QWidget.mouseGrabber() is self._immersive_resize_handle:
-                self._immersive_resize_handle.releaseMouse()
-            self._immersive_resize_handle.hide()
+            # 先关掉沉浸状态，再把列表放回分割条。放回去会同步触发布局，
+            # 若此时仍视为沉浸模式，画面上的拖动边会被重新显示出来。
+            self._immersive_list_active = False
+            self._hide_immersive_resize_handle()
             self._apply_immersive_list_chrome(False)
             self._content_splitter.addWidget(self._subtitle_panel)
-            self._immersive_list_active = False
+            self._hide_immersive_resize_handle()
             if self._subtitle_list_visible:
                 restored = self._splitter_sizes_before_immersive
                 if restored and len(restored) >= 2 and sum(restored) > 0:
@@ -990,12 +995,28 @@ class PlayerWindow(QMainWindow):
             self.subtitle_list.update()
         self._sync_subtitle_density_button()
 
+    def _hide_immersive_resize_handle(self) -> None:
+        """收起沉浸模式叠在画面上的字幕区边线。"""
+        handle = getattr(self, "_immersive_resize_handle", None)
+        if handle is None:
+            return
+        if self._immersive_resizing and QWidget.mouseGrabber() is handle:
+            handle.releaseMouse()
+        self._immersive_resizing = False
+        if not handle.isVisible() and not handle.styleSheet():
+            return
+        handle.hide()
+        handle.setStyleSheet("")
+        host = getattr(self, "_media_host", None)
+        if host is not None:
+            host.update()
+
     def _layout_immersive_list_panel(self) -> None:
         if not self._immersive_list_active:
             return
         if not self._subtitle_list_visible:
             self._subtitle_panel.hide()
-            self._immersive_resize_handle.hide()
+            self._hide_immersive_resize_handle()
             self._sync_onscreen_immersive_metrics()
             return
         host = self._media_host
@@ -3466,26 +3487,61 @@ class PlayerWindow(QMainWindow):
         return f"{minutes:02d}:{secs:02d}"
 
     def _on_subtitle_clicked(self, item: QListWidgetItem) -> None:
+        play = True if self._play_subtitle_after_click else None
+        self._play_subtitle_after_click = False
+        self._activate_subtitle_item(item, play=play)
+
+    def _on_subtitle_double_clicked(self, item: QListWidgetItem) -> None:
+        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            return
+        if self._subtitle_pointer_on_note(item):
+            return
+        # 双击的松开还会再触发一次单击；让那次单击继续播放，而不是停在暂停。
+        self._play_subtitle_after_click = True
+        self._activate_subtitle_item(item, play=True)
+
+    def _subtitle_pointer_on_note(self, item: QListWidgetItem) -> bool:
+        delegate = getattr(self, "_subtitle_delegate", None)
+        if not isinstance(delegate, SubtitleListDelegate):
+            return False
+        row = self.subtitle_list.row(item)
+        if row < 0:
+            return False
+        viewport = self.subtitle_list.viewport()
+        pos = viewport.mapFromGlobal(QCursor.pos())
+        item_rect = self.subtitle_list.visualRect(self.subtitle_list.model().index(row, 0))
+        rect = delegate.note_rect(
+            item_rect,
+            self.subtitle_list.font(),
+            item.data(PAYLOAD_ROLE),
+        )
+        return rect is not None and rect.contains(pos)
+
+    def _activate_subtitle_item(self, item: QListWidgetItem, *, play: bool | None) -> None:
         if self._ignore_note_row_click:
             self._ignore_note_row_click = False
+            self._play_subtitle_after_click = False
             return
         modifiers = QGuiApplication.keyboardModifiers()
         if modifiers & (
             Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
         ):
             # Multi-select: do not seek.
+            self._play_subtitle_after_click = False
             return
         row = self.subtitle_list.row(item)
         payload = self._item_payload(item)
         if payload.get("kind") == "screenshot":
+            self._play_subtitle_after_click = False
             return
         segment_row = self._segment_row_from_item(item)
         if segment_row is None:
             if row < 0 or row >= len(self._segments):
+                self._play_subtitle_after_click = False
                 return
             segment_row = row
         self._stop_subtitle_repeat()
-        self._seek_to(self._segments[segment_row].start)
+        self._seek_to(self._segments[segment_row].start, play=play)
 
     def _selected_subtitle_rows(self) -> list[int]:
         rows = []
@@ -3998,6 +4054,8 @@ class PlayerWindow(QMainWindow):
             if event.type() == QEvent.Type.Resize:
                 if self._immersive_list_active:
                     self._layout_immersive_list_panel()
+                else:
+                    self._hide_immersive_resize_handle()
                 self._layout_screenshot_viewer()
             return super().eventFilter(obj, event)
         if obj in (self._audio_placeholder,):
